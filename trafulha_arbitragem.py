@@ -977,6 +977,17 @@ def iniciar_servidor_web():
 # 17. ARRANQUE
 # ============================================================
 
+print("===== TESTE DE CONFIGURACAO =====")
+print("TELEGRAM_TOKEN:", bool(os.getenv("TELEGRAM_TOKEN")))
+print("CHAT_ID:", bool(os.getenv("CHAT_ID")))
+print("ODDS_API_KEY:", bool(os.getenv("ODDS_API_KEY")))
+print("=================================")
+
+
+if __name__ == "__main__":
+
+    if not ODDS_API_KEY:
+        logger.warning("ODDS_API_KEY nao configurada.")
 if __name__ == "__main__":
 
     if not ODDS_API_KEY:
