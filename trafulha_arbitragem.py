@@ -139,6 +139,10 @@ class SimpleHandler(BaseHTTPRequestHandler):
     self.end_headers()
     self.wfile.write(b"Robo Hibrido a funcionar 24/7!")
 
+  def do_HEAD(self):
+    self.send_response(200)
+    self.end_headers()
+
 
 def iniciar_servidor_web():
   port = int(os.environ.get("PORT", 10000))
