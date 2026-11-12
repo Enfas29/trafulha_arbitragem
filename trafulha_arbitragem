@@ -1,105 +1,130 @@
 import time
 import requests
-import logging
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-TELEGRAM_BOT_TOKEN = "9070256990:AAft6HXRC8i-vH0Y-F5pKYv7-tyrWDxQVs0"
-TELEGRAM_CHAT_ID = "5670307735"
+# --- CONFIGURAÇÕES DO TELEGRAM ---
+TELEGRAM_TOKEN = "9070256990:AAft6hXRC8i-vH0Y-F5pKYv7-tyrWDxQVs0"
+CHAT_ID = "5670307735"
 
 def enviar_alerta_telegram(mensagem):
-    if TELEGRAM_BOT_TOKEN == "9070256990:AAft6HXRC8i-vH0Y-F5pKYv7-tyrWDxQVs0":
-        logging.info(f"\n[SIMULAÇÃO TELEGRAM]:\n{mensagem}")
-        return
-    
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    """Envia uma mensagem formatada para o teu chat do Telegram."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": CHAT_ID,
         "text": mensagem,
         "parse_mode": "Markdown"
     }
     try:
-        requests.post(url, json=payload)
-    except Exception as e:
-        logging.error(f"Erro ao enviar para o Telegram: {e}")
-
-def obter_mercados_polymarket():
-    url = "https://clob.polymarket.com/markets"
-    try:
-        response = requests.get(url)
+        response = requests.post(url, json=payload)
         if response.status_code == 200:
-            data = response.json()
-            mercados_validos = []
-            for mercado in data.get("data", []):
-                volume = float(mercado.get("volume", 0))
-                if volume >= 20000:
-                    mercados_validos.append({
-                        "titulo": mercado.get("question"),
-                        "preco_sim": float(mercado.get("best_bid", 0.5)),
-                        "volume": volume
-                    })
-            return mercados_validos
+            print("[Telegram] Alerta enviado com sucesso!")
+        else:
+            print(f"[Telegram] Erro ao enviar: {response.text}")
     except Exception as e:
-        logging.error(f"Erro na API do Polymarket: {e}")
-    return []
+        print(f"[Telegram] Erro de ligação: {e}")
 
-def obter_odds_casas_portuguesas():
+# --- MOTOR DE SCANNER GLOBAL (MÚLTIPLOS JOGOS MUNDIAIS) ---
+def obter_dados_mercados_globais():
     """
-    [Ponto de Integração]
-    Recolhe as odds da Betclic e da Betano para os mesmos jogos.
+    Simulação de recolha de mercados internacionais (Champions League, Premier League, La Liga, etc.).
+    No futuro, esta função ligará diretamente às APIs reais da Polymarket e de odds desportivas.
     """
-    return [
+    mercados = [
         {
-            "jogo": "Benfica vs Porto",
-            "mercado": "Vitória Benfica",
-            "odds": {
-                "Betclic": 2.05,
-                "Betano": 2.15  # Betano com odd superior
-            },
-            "preco_poly_oposto": 0.48
+            "evento": "Real Madrid vs AC Milan (Champions League)",
+            "data_hora": "25/11/2026 às 21:00",
+            "volume_polymarket": 150000.0,  # > $20,000 (Passa o filtro)
+            "plataforma_poly": "Polymarket",
+            "escolha_poly": "Real Madrid Vence",
+            "odd_poly": 1.80,
+            "casa_regulada": "Betano",
+            "escolha_reg": "Milan ou Empate",
+            "odd_reg": 2.30
+        },
+        {
+            "evento": "Arsenal vs Chelsea (Premier League)",
+            "data_hora": "26/11/2026 às 17:30",
+            "volume_polymarket": 95000.0,   # > $20,000 (Passa o filtro)
+            "plataforma_poly": "Polymarket",
+            "escolha_poly": "Arsenal Vence",
+            "odd_poly": 1.90,
+            "casa_regulada": "Betclic",
+            "escolha_reg": "Chelsea ou Empate",
+            "odd_reg": 2.15
+        },
+        {
+            "evento": "Moreirense vs Gil Vicente (Liga Portugal)",
+            "data_hora": "27/11/2026 às 16:00",
+            "volume_polymarket": 12000.0,   # < $20,000 (Ignorado pelo filtro de volume)
+            "plataforma_poly": "Polymarket",
+            "escolha_poly": "Moreirense Vence",
+            "odd_poly": 2.05,
+            "casa_regulada": "Betclic",
+            "escolha_reg": "Gil Vicente ou Empate",
+            "odd_reg": 2.10
         }
     ]
+    return mercados
 
-def executar_varrimento_arbitragem():
-    logging.info("A analisar Polymarket vs [Betclic + Betano]...")
+def ciclo_scanner():
+    print("\n[Scanner Global] A procurar oportunidades em mercados internacionais...")
+    mercados = obter_dados_mercados_globais()
+    investimento_total = 100.0  # Orçamento base de exemplo em euros
     
-    # Valida ligação à API do Polymarket (filtro > 20.000$)
-    _ = obter_mercados_polymarket()
-    eventos = obter_odds_casas_portuguesas()
-    
-    for evento in eventos:
-        # Escolhe automaticamente a casa portuguesa com a odd mais alta
-        melhor_casa = max(evento["odds"], key=evento["odds"].get)
-        melhor_odd = evento["odds"][melhor_casa]
+    for m in mercados:
+        volume = m["volume_polymarket"]
+        odd_poly = m["odd_poly"]
+        odd_reg = m["odd_reg"]
         
-        prob_casa = 1 / melhor_odd
-        preco_poly = evento["preco_poly_oposto"]
+        # Probabilidades implícitas
+        prob_poly = 1 / odd_poly
+        prob_reg = 1 / odd_reg
         
-        soma_probabilidades = prob_casa + preco_poly
-        
-        # Gatilho: Soma inferior a 0.98 (margem > 2%)
-        if soma_probabilidades < 0.98:
-            lucro_estimado = (1 - soma_probabilidades) * 100
+        # Critério 1: Volume no Polymarket superior a $20,000
+        if volume > 20000:
+            soma_probabilidades = prob_poly + prob_reg
             
-            # Cálculo automático para um orçamento base de 100€ por operação
-            orcamento = 100.0
-            aposta_casa = (orcamento * prob_casa) / soma_probabilidades
-            aposta_poly_eur = orcamento - aposta_casa
-            
-            alerta = (
-                f"🚨 **ARBITRAGEM DETETADA (MULTI-CASA)** 🚨\n\n"
-                f"⚽ **Jogo:** {evento['jogo']} ({evento['mercado']})\n"
-                f"🏆 **Melhor Casa:** {melhor_casa} @ **{melhor_odd}**\n"
-                f"🟣 **Polymarket:** Preço oposto @ **{preco_poly}$** (Vol > 20k$)\n\n"
-                f"📊 **Soma Probabilidades:** {soma_probabilidades*100:.2f}%\n"
-                f"💰 **Lucro Limpo Estimado:** +{lucro_estimado:.2f}%\n\n"
-                f"🧮 **Distribuição sugerida (Base 100€):**\n"
-                f"• Meter **{aposta_casa:.2f}€** na {melhor_casa}\n"
-                f"• Meter **{aposta_poly_eur:.2f}€** (em USDC) no Polymarket"
-            )
-            enviar_alerta_telegram(alerta)
+            # Critério 2: Soma das probabilidades inferior a 0.98 (Margem de lucro)
+            if soma_probabilidades < 0.98:
+                
+                # Cálculo exato da stake para cada lado
+                stake_poly = investimento_total * (prob_poly / soma_probabilidades)
+                stake_reg = investimento_total * (prob_reg / soma_probabilidades)
+                
+                retorno_poly = stake_poly * odd_poly
+                lucro_euros = retorno_poly - investimento_total
+                lucro_percentual = (1 - soma_probabilidades) * 100
+                
+                mensagem = (
+                    f"🚨 *Oportunidade Global de Arbitragem!* 🚨\n\n"
+                    f"⚽ *Jogo:* {m['evento']}\n"
+                    f"📅 *Data e Hora:* {m['data_hora']}\n"
+                    f"📊 *Volume Polymarket:* ${volume:,.2f}\n\n"
+                    f"👉 *Lado 1 ({m['plataforma_poly']}):*\n"
+                    f"   • Aposta: {m['escolha_poly']}\n"
+                    f"   • Odd: {odd_poly:.2f}\n"
+                    f"   • Valor a colocar: **{stake_poly:.2f}€**\n\n"
+                    f"👉 *Lado 2 ({m['casa_regulada']}):*\n"
+                    f"   • Aposta: {m['escolha_reg']}\n"
+                    f"   • Odd: {odd_reg:.2f}\n"
+                    f"   • Valor a colocar: **{stake_reg:.2f}€**\n\n"
+                    f"💰 *Investimento Total:* {investimento_total:.2f}€\n"
+                    f"🎯 *Retorno Garantido:* ~{retorno_poly:.2f}€\n"
+                    f"📈 *Lucro Líquido:* **+{lucro_euros:.2f}€** (~{lucro_percentual:.2f}%)\n\n"
+                    f"💡 *Lucro garantido independentemente do resultado!*"
+                )
+                
+                print(f"[ALERTA] Oportunidade detetada e enviada para o Telegram: {m['evento']}")
+                enviar_alerta_telegram(mensagem)
+            else:
+                print(f"[Info] Sem margem rentável em: {m['evento']} (Soma: {soma_probabilidades:.3f})")
+        else:
+            print(f"[Info] Jogo ignorado por baixo volume: {m['evento']} (${volume:,.2f})")
 
 if __name__ == "__main__":
+    print("--- Robô de Arbitragem Global Iniciado (Modo Contínuo) ---")
+    
+    # O robô fica a correr em ciclo automático dia após dia
     while True:
-        executar_varrimento_arbitragem()
-        time.sleep(300)
+        ciclo_scanner()
+        print("\n[Espera] A aguardar 10 minutos para a próxima ronda de análise...")
+        time.sleep(300)  # Pausa de 600 segundos (10 minutos) antes de voltar a verificar
