@@ -15,9 +15,9 @@ import requests
 # 1. CONFIGURACOES
 # ============================================================
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-CHAT_ID = os.getenv("CHAT_ID", "")
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
+TELEGRAM_TOKEN = os.getenv("9070256990:AAft6hXRC8i-vH0Y-F5pKYv7-tyrWDxQVs0", "")
+CHAT_ID = os.getenv("5670307735", "")
+ODDS_API_KEY = os.getenv("7c5a2bb44a562ce579413131318b1534", "")
 
 # Banca separada por moeda
 BANKROLL_EUR = float(os.getenv("BANKROLL_EUR", "100"))
