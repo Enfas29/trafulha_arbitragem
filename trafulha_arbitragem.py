@@ -1,4 +1,3 @@
-
 import os
 import json
 import time
@@ -184,7 +183,7 @@ def gerar_chave_alerta(texto):
 
 
 # ============================================================
-# 5. DESCOBRIR COMPETICOES
+# 5. DESCOBRIR COMPETICOES (TODOS OS DESPORTOS)
 # ============================================================
 
 def descobrir_desportos():
@@ -196,63 +195,19 @@ def descobrir_desportos():
         return CUSTOM_SPORT_KEYS
 
     try:
-
         sports = http_get(
             f"{ODDS_BASE}/sports",
             params={"apiKey": ODDS_API_KEY}
         )
 
-        encontrados = []
+        # Recolhe a key de absolutamente todos os desportos ativos na API
+        encontrados = [
+            sport["key"]
+            for sport in sports
+            if sport.get("active")
+        ]
 
-        prioridades = {
-            "football": [
-                "soccer_uefa_champs_league",
-                "soccer_epl",
-                "soccer_spain_la_liga"
-            ],
-            "tennis": [
-                "tennis_atp",
-                "tennis_wta"
-            ],
-            "basketball": [
-                "basketball_nba",
-                "basketball_euroleague"
-            ],
-            "hockey": [
-                "icehockey_nhl"
-            ],
-            "baseball": [
-                "baseball_mlb"
-            ]
-        }
-
-        for category, prefixes in SPORT_PREFIXES.items():
-
-            matches = [
-                sport["key"]
-                for sport in sports
-                if sport.get("active")
-                and any(
-                    sport["key"].startswith(prefix)
-                    for prefix in prefixes
-                )
-            ]
-
-            ordered = []
-
-            for preferred in prioridades[category]:
-                if preferred in matches:
-                    ordered.append(preferred)
-
-            for item in matches:
-                if item not in ordered:
-                    ordered.append(item)
-
-            encontrados.extend(
-                ordered[:SPORT_LIMIT_PER_CATEGORY]
-            )
-
-        logger.info("Competicoes: %s", encontrados)
+        logger.info("Competicoes (Todos os desportos): %s", encontrados)
 
         return encontrados
 
