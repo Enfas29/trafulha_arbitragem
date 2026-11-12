@@ -988,8 +988,6 @@ if __name__ == "__main__":
 
     if not ODDS_API_KEY:
         logger.warning("ODDS_API_KEY nao configurada.")
-        
-if __name__ == "__main__":
 
     if not TELEGRAM_TOKEN or not CHAT_ID:
         logger.warning("Telegram nao configurado.")
