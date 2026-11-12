@@ -10,7 +10,7 @@ TELEGRAM_TOKEN = "9070256990:AAft6hXRC8i-vH0Y-F5pKYv7-tyrWDxQVs0"
 CHAT_ID = "5670307735"
 
 # Insere aqui a tua chave gratuita obtida em the-odds-api.com
-ODDS_API_KEY = "A_TUA_CHAVE_DA_ODDS_API_AQUI"
+ODDS_API_KEY = "7c5a2bb44a562ce579413131318b1534"
 
 
 def enviar_alerta_telegram(mensagem):
