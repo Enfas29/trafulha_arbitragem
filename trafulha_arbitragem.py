@@ -109,7 +109,7 @@ def correr_robo_continuo():
   )
   while True:
     ciclo_scanner()
-    time.sleep(600)  # Aguarda 10 minutos entre rondas
+    time.sleep(300)  # Aguarda 5 minutos entre rondas
 
 
 # --- PEQUENO SERVIDOR WEB PARA O RENDER ---
