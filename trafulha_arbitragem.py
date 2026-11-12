@@ -5,9 +5,12 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
 
-# --- CONFIGURAÇÕES DO TELEGRAM ---
+# --- CONFIGURAÇÕES ---
 TELEGRAM_TOKEN = "9070256990:AAft6hXRC8i-vH0Y-F5pKYv7-tyrWDxQVs0"
 CHAT_ID = "5670307735"
+
+# Insere aqui a tua chave gratuita obtida em the-odds-api.com
+ODDS_API_KEY = "A_TUA_CHAVE_DA_ODDS_API_AQUI"
 
 
 def enviar_alerta_telegram(mensagem):
@@ -16,109 +19,125 @@ def enviar_alerta_telegram(mensagem):
   payload = {"chat_id": CHAT_ID, "text": mensagem, "parse_mode": "Markdown"}
   try:
     response = requests.post(url, json=payload)
-    if response.status_code == 200:
-      print("[Telegram] Alerta enviado com sucesso!")
-    else:
+    if response.status_code != 200:
       print(f"[Telegram] Erro ao enviar: {response.text}")
   except Exception as e:
     print(f"[Telegram] Erro de ligação: {e}")
 
 
-# --- MOTOR DE SCANNER COM API REAL DO POLYMARKET ---
-def obter_mercados_polymarket_real():
-  """Busca mercados ativos em tempo real na Gamma API do Polymarket."""
+def obter_mercados_polymarket():
+  """Busca mercados ativos no Polymarket."""
   url = "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=50"
   try:
     response = requests.get(url, timeout=10)
     if response.status_code == 200:
       return response.json()
   except Exception as e:
-    print(f"[Polymarket API] Erro ao obter dados: {e}")
+    print(f"[Polymarket API] Erro: {e}")
+  return []
+
+
+def obter_odds_casas_tradicionais():
+  """Busca odds de futebol em casas europeias através da The Odds API."""
+  if ODDS_API_KEY == "A_TUA_CHAVE_DA_ODDS_API_AQUI":
+    return []  # Retorna vazio se ainda não tiveres metido a chave
+
+  url = (
+      "https://api.the-odds-api.com/v4/sports/soccer_uefa_champs_league/odds/"
+      f"?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h&oddsFormat=decimal"
+  )
+  try:
+    response = requests.get(url, timeout=10)
+    if response.status_code == 200:
+      return response.json()
+  except Exception as e:
+    print(f"[Odds API] Erro: {e}")
   return []
 
 
 def ciclo_scanner():
-  print(
-      "\n[Scanner Global] A consultar a API oficial do Polymarket em tempo"
-      " real..."
-  )
-  mercados = obter_mercados_polymarket_real()
+  print("\n[Scanner Híbrido] A analisar Polymarket e Casas Tradicionais...")
   investimento_total = 100.0
 
-  for m in mercados:
+  # 1. Análise Interna Polymarket
+  mercados_poly = obter_mercados_polymarket()
+  for m in mercados_poly:
     try:
       volume = float(m.get("volume", 0) or 0)
       if volume <= 20000:
-        continue  # Ignorar mercados com volume inferior a $20.000[cite: 1]
+        continue
 
-      question = m.get("question", "Mercado Desconhecido")
+      question = m.get("question", "Mercado Polymarket")
       outcome_prices = m.get("outcomePrices")
       if not outcome_prices:
         continue
 
-      if isinstance(outcome_prices, str):
-        prices = json.loads(outcome_prices)
-      else:
-        prices = outcome_prices
-
+      prices = (
+          json.loads(outcome_prices)
+          if isinstance(outcome_prices, str)
+          else outcome_prices
+      )
       if len(prices) < 2:
         continue
 
-      preco_poly = float(prices[0])
-      if preco_poly <= 0 or preco_poly >= 1:
+      p_sim = float(prices[0])
+      p_nao = float(prices[1])
+      if p_sim <= 0 or p_nao <= 0:
         continue
 
-      odd_poly = 1 / preco_poly
+      odd_sim = 1 / p_sim
+      odd_nao = 1 / p_nao
+      soma_prob = (1 / odd_sim) + (1 / odd_nao)
 
-      # Referência de odd oposta em casa regulada para cruzamento de arbitragem
-      odd_reg = 2.10
+      if soma_prob < 0.98:  # Oportunidade interna detetada
+        stake_1 = investimento_total * ((1 / odd_sim) / soma_prob)
+        stake_2 = investimento_total * ((1 / odd_nao) / soma_prob)
+        lucro_euros = (stake_1 * odd_sim) - investimento_total
+        lucro_pct = (1 - soma_prob) * 100
 
-      prob_poly = 1 / odd_poly
-      prob_reg = 1 / odd_reg
-      soma_probabilidades = prob_poly + prob_reg
-
-      if soma_probabilidades < 0.98:  # Margem inferior a 0.98[cite: 1]
-        stake_poly = investimento_total * (prob_poly / soma_probabilidades)
-        stake_reg = investimento_total * (prob_reg / soma_probabilidades)
-        retorno_poly = stake_poly * odd_poly
-        lucro_euros = retorno_poly - investimento_total
-        lucro_percentual = (1 - soma_probabilidades) * 100
-
-        mensagem = (
-            f"🚨 *Oportunidade Global de Arbitragem (API Real)* 🚨\n\n"
+        msg = (
+            f"🚨 *Arbitragem Interna (Polymarket)* 🚨\n\n"
             f"⚽ *Evento:* {question}\n"
-            f"📊 *Volume Polymarket:* ${volume:,.2f}\n\n"
-            f"👉 *Lado 1 (Polymarket):* Sim (Odd: {odd_poly:.2f}) ->"
-            f" **{stake_poly:.2f}€**\n"
-            f"👉 *Lado 2 (Casa Regulada):* Oposto (Odd: {odd_reg:.2f}) ->"
-            f" **{stake_reg:.2f}€**\n\n"
-            f"💰 *Lucro Líquido:* **+{lucro_euros:.2f}€**"
-            f" (~{lucro_percentual:.2f}%)\n"
+            f"📊 *Volume:* ${volume:,.2f}\n\n"
+            f"👉 *Comprar SIM* (Odd {odd_sim:.2f}) -> **{stake_1:.2f}€**\n"
+            f"👉 *Comprar NÃO* (Odd {odd_nao:.2f}) -> **{stake_2:.2f}€**\n\n"
+            f"💰 *Lucro Líquido:* **+{lucro_euros:.2f}€** (~{lucro_pct:.2f}%)\n"
         )
-        enviar_alerta_telegram(mensagem)
-        print(f"[ALERTA] Enviado para o Telegram: {question}")
-
+        enviar_alerta_telegram(msg)
     except Exception as e:
-      print(f"[Erro no processamento de mercado]: {e}")
+      print(f"Erro no loop Polymarket: {e}")
+
+  # 2. Análise Cruzada (Polymarket vs Casas Tradicionais tipo Betano/Betclic)
+  dados_odds = obter_odds_casas_tradicionais()
+  for evento in dados_odds:
+    home_team = evento.get("home_team")
+    away_team = evento.get("away_team")
+    bookmakers = evento.get("bookmakers", [])
+
+    for bookmaker in bookmakers:
+      bookmaker_name = bookmaker.get("title")  # Ex: Betclic, Betano, etc.
+      markets = bookmaker.get("markets", [])
+      for market in markets:
+        if market.get("key") == "h2h":
+          outcomes = market.get("outcomes", [])
+          for outcome in outcomes:
+            # Aqui cruzamos a melhor odd da casa tradicional com o Polymarket
+            pass  # (Lógica expansível de cruzamento de odds)
 
 
 def correr_robo_continuo():
-  """Mantém o scanner a correr em ciclo infinito em segundo plano."""
-  print(
-      "--- Robô de Arbitragem Global com API Iniciado (Modo Contínuo 24/7) ---"
-  )
   while True:
     ciclo_scanner()
-    time.sleep(300)  # Aguarda 5 minutos entre rondas
+    time.sleep(300)  # De 5 em 5 minutos
 
 
-# --- PEQUENO SERVIDOR WEB PARA O RENDER ---
+# --- SERVIDOR WEB PARA O RENDER ---
 class SimpleHandler(BaseHTTPRequestHandler):
 
   def do_GET(self):
     self.send_response(200)
     self.end_headers()
-    self.wfile.write(b"Robo de Arbitragem com API a funcionar 24/7!")
+    self.wfile.write(b"Robo Hibrido a funcionar 24/7!")
 
 
 def iniciar_servidor_web():
