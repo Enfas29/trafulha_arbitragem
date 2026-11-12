@@ -1,9 +1,9 @@
 import requests
 
 def testar_telegram():
-    token = "9070256990:AAFt6hXRC8i-vH0Y-F5pKYv7-tyrWDxQVs0"
+    token = "9070256990:AAft6HXRC8i-vH0Y-F5pKYv7-tyrWDxQVs0"
     chat_id = "5670307735"
-    mensagem = "🚨 **Teste do Robô Trafulha:** Canal do Telegram ligado com sucesso! Pronto para caçar arbitragens."
+    mensagem = "🚨 *Teste do Robô Trafulha:* Canal do Telegram ligado com sucesso! Pronto para caçar arbitragens."
     
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
