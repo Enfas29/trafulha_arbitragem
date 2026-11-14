@@ -13,7 +13,7 @@ import requests
 
 
 # ============================================================
-# 1. CONFIGURACOES (PAPER TRADING V7.6 - LIVE SYNC STRICT)
+# 1. CONFIGURACOES (PAPER TRADING V7.7 - CLOB DIRECT STRICT)
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -51,10 +51,14 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("ArbitragePaperBotV76")
+logger = logging.getLogger("ArbitragePaperBotV77")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "TrafulhaPaperBot/7.6"})
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache"
+})
 if SX_API_KEY:
     session.headers.update({"x-sx-api-key": SX_API_KEY})
 
@@ -90,7 +94,7 @@ scanner_status = {
     "best_margin_pct": None,
     "opportunities": 0,
     "sx_odds_endpoint": None,
-    "mode": "WEB3_PAPER_TRADING_LIVE_SYNC_V7.6"
+    "mode": "WEB3_PAPER_TRADING_CLOB_DIRECT_V7.7"
 }
 
 diagnostico_inicial_feito = False
@@ -297,7 +301,7 @@ def registar_aposta_virtual(m_hash, jogo_nome, stake_poly, stake_sx, lucro_esper
 
 
 # ============================================================
-# 5. POLYMARKET CLOB ORDERBOOK (LIVE SYNC STRICT)
+# 5. POLYMARKET CLOB ORDERBOOK (LEITURA DIRETA DO TOPO)
 # ============================================================
 
 SPORT_KEYWORDS = [
@@ -315,7 +319,7 @@ def parece_evento_desportivo(texto):
 
 
 def obter_preco_real_clob(token_id):
-    """Lê estritamente o topo exato do orderbook da Polymarket (equivalente ao botão do site)"""
+    """Lê estritamente o topo exato do book da Polymarket, ignorando ordens residuais < $5"""
     try:
         book = http_get(
             f"{POLY_CLOB}/book",
@@ -326,14 +330,20 @@ def obter_preco_real_clob(token_id):
         if not asks:
             return None
         
+        # Ordenar por preço de venda (ask) ascendente
         asks_ordenados = sorted(asks, key=lambda x: float(x["price"]))
-        melhor_ask = asks_ordenados[0]
         
-        price = float(melhor_ask["price"])
-        size = float(melhor_ask["size"])
-        
-        if 0.01 < price < 0.99 and size > 0:
-            return {"price": price, "size": size}
+        # Apanhar a primeira ordem válida que tenha liquidez real no topo
+        for ask in asks_ordenados:
+            try:
+                price = float(ask["price"])
+                size = float(ask["size"])
+            except (ValueError, TypeError, KeyError):
+                continue
+            
+            if 0.01 < price < 0.99 and size > 0:
+                return {"price": price, "size": size}
+                
         return None
     except requests.RequestException:
         return None
@@ -667,7 +677,7 @@ def obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=False):
 
 
 # ============================================================
-# 7. MOTOR DE CRUZAMENTO E SINCRONIZACAO AO VIVO
+# 7. MOTOR DE CRUZAMENTO
 # ============================================================
 
 def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
@@ -751,7 +761,7 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 if opt_sx["liquidity_usdc"] < MIN_LIQUIDITY_USD:
                     continue
 
-                # CHAMADA DIRETA AO ORDERBOOK EM TEMPO REAL
+                # CHAMADA DIRETA AO CLOB EXATO
                 ask = obter_preco_real_clob(opt_p["token_id"])
                 if not ask:
                     continue
@@ -808,13 +818,13 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 registar_aposta_virtual(m_hash, f"{team1} vs {team2}", stake_poly, stake_sx, lucro_usd_liquido)
 
                 mensagem = (
-                    "🛡️ [PAPER TRADING - LIVE SYNC V7.6]\n\n"
+                    "🛡️ [PAPER TRADING - CLOB DIRECT V7.7]\n\n"
                     f"Jogo: {team1} vs {team2}\n"
                     f"Competicao: {sx_m['sport']} - {sx_m['league']}\n"
                     f"Data e Hora: {formatar_data_pt(dt_sx or dt_poly)}\n\n"
                     f"Lado 1 (Polymarket - USDC):\n"
                     f"- Aposta: {opt_p['label']}\n"
-                    f"- Preco Real Clob: {preco_cents}¢ (Odd Bruta: {odd_bruta_poly:.2f} | Liq: {odd_liq_poly:.2f})\n"
+                    f"- Preco Clob Direto: {preco_cents}¢ (Odd Bruta: {odd_bruta_poly:.2f} | Liq: {odd_liq_poly:.2f})\n"
                     f"- Valor investido: ${stake_poly:.2f} USDC\n\n"
                     f"Lado 2 (SX Bet - USDC):\n"
                     f"- Aposta: Not {opt_p['label'].replace(' (Yes)', '')}\n"
@@ -848,7 +858,7 @@ def ciclo_scanner():
         banca_poly = paper_wallet["poly"]["available"]
         banca_sx = paper_wallet["sx"]["available"]
 
-    logger.info("A iniciar scanner Paper Trading V7.6 (Poly Disp: $%.2f | SX Disp: $%.2f).", banca_poly, banca_sx)
+    logger.info("A iniciar scanner Paper Trading V7.7 (Poly Disp: $%.2f | SX Disp: $%.2f).", banca_poly, banca_sx)
 
     stats = {
         "jogos_casados": 0,
@@ -933,7 +943,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 s_disp = paper_wallet["sx"]["available"]
                 s_inv = paper_wallet["sx"]["invested"]
             body = (
-                "ROBO ARBITRAGEM PAPER TRADING V7.6 ONLINE (LIVE SYNC)\n"
+                "ROBO ARBITRAGEM PAPER TRADING V7.7 ONLINE (CLOB DIRECT)\n"
                 f"Polymarket Disp: ${p_disp:.2f} | Investido: ${p_inv:.2f}\n"
                 f"SX Bet Disp: ${s_disp:.2f} | Investido: ${s_inv:.2f}\n"
                 "Health / Wallet: /health\n"
