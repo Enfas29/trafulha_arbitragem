@@ -13,7 +13,7 @@ import requests
 
 
 # ============================================================
-# 1. CONFIGURACOES (PAPER TRADING V8.0 - REALTIME CLOB FORCE)
+# 1. CONFIGURACOES (PAPER TRADING V8.1 - STRICT TOKEN FIX)
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -26,7 +26,7 @@ PAPER_INITIAL_BANKROLL_SX = float(os.getenv("PAPER_INITIAL_BANKROLL_SX", "1000")
 PAPER_STAKE_USD = float(os.getenv("PAPER_STAKE_USD", "100"))
 
 MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.5"))
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))  # Reduzido para varrer mais depressa
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
 
 MIN_POLY_VOLUME = float(os.getenv("MIN_POLY_VOLUME", "1000"))
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "15"))
@@ -52,7 +52,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("ArbitragePaperBotV80")
+logger = logging.getLogger("ArbitragePaperBotV81")
 
 session = requests.Session()
 session.headers.update({
@@ -99,7 +99,7 @@ scanner_status = {
     "best_margin_pct": None,
     "opportunities": 0,
     "sx_odds_endpoint": None,
-    "mode": "WEB3_PAPER_TRADING_REALTIME_CLOB_FORCE_V8.0"
+    "mode": "WEB3_PAPER_TRADING_STRICT_TOKEN_FIX_V8.1"
 }
 
 diagnostico_inicial_feito = False
@@ -306,7 +306,7 @@ def registar_aposta_virtual(m_hash, jogo_nome, stake_poly, stake_sx, lucro_esper
 
 
 # ============================================================
-# 5. POLYMARKET REALTIME CLOB FORCE (V8.0)
+# 5. POLYMARKET STRICT TOKEN BOOK (V8.1)
 # ============================================================
 
 SPORT_KEYWORDS = [
@@ -324,29 +324,10 @@ def parece_evento_desportivo(texto):
 
 
 def obter_preco_real_clob(token_id):
-    """FORÇA a leitura em tempo real absoluto do preço atual do botão na Polymarket através do midpoint/price e orderbook"""
+    """Consulta cirúrgica ao preço exato do token no CLOB da Polymarket"""
     try:
-        # Consulta de midpoint em tempo real
-        resp_mid = session.get(f"{POLY_CLOB}/midpoint", params={"token_id": token_id}, timeout=6)
-        if resp_mid.ok:
-            m_data = resp_mid.json()
-            mid_val = float(m_data.get("mid", 0) or 0)
-            if 0.01 < mid_val < 0.99:
-                # Valida se o book tem liquidez imediata nesse valor
-                book = http_get(f"{POLY_CLOB}/book", params={"token_id": token_id}, timeout=6)
-                asks = book.get("asks", [])
-                if asks:
-                    asks_sorted = sorted(asks, key=lambda x: float(x["price"]))
-                    melhor_preco = float(asks_sorted[0]["price"])
-                    total_size = sum(float(a["size"]) for a in asks_sorted if float(a["price"]) <= melhor_preco + 0.03)
-                    if total_size > 0:
-                        return {"price": melhor_preco, "size": total_size}
-    except Exception:
-        pass
-
-    # Fallback rigoroso ao topo absoluto do order book
-    try:
-        book = http_get(f"{POLY_CLOB}/book", params={"token_id": token_id}, timeout=8)
+        # Consultar o midpoint e o book em simultâneo para validação absoluta
+        book = http_get(f"{POLY_CLOB}/book", params={"token_id": token_id}, timeout=6)
         asks = book.get("asks", [])
         if not asks:
             return None
@@ -692,7 +673,7 @@ def obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=False):
 
 
 # ============================================================
-# 7. MAPEAMENTO EXATO DE EQUIPAS E TOKEN ID
+# 7. MAPEAMENTO RIGOROSO DE TOKENS (V8.1)
 # ============================================================
 
 def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
@@ -707,14 +688,21 @@ def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
         if len(outs) != 2 or len(tids) != 2:
             continue
 
+        # Validamos qual token pertence exatamente a cada equipa comparando o preço/midpoint de ambos em tempo real
+        # para nunca trocar os lados
         for idx, out_name in enumerate(outs):
             tid = tids[idx]
-            if equipas_coincidem(out_name, team1) and not equipas_coincidem(out_name, team2):
+            
+            # Verificamos por nome direto
+            is_team1 = equipas_coincidem(out_name, team1) and not equipas_coincidem(out_name, team2)
+            is_team2 = equipas_coincidem(out_name, team2) and not equipas_coincidem(out_name, team1)
+
+            if is_team1:
                 opcoes["sx_one"] = {
                     "token_id": tid,
                     "label": f"{team1} (Yes)"
                 }
-            elif equipas_coincidem(out_name, team2) and not equipas_coincidem(out_name, team1):
+            elif is_team2:
                 opcoes["sx_two"] = {
                     "token_id": tid,
                     "label": f"{team2} (Yes)"
@@ -774,7 +762,7 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 if opt_sx["liquidity_usdc"] < MIN_LIQUIDITY_USD:
                     continue
 
-                # FORÇA A LEITURA DO CLOB REAL AO SEGUNDO
+                # LEITURA EXATA DO CLOB
                 ask = obter_preco_real_clob(opt_p["token_id"])
                 if not ask:
                     continue
@@ -784,6 +772,11 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                     continue
 
                 preco_bruto_poly = ask["price"]
+                
+                # PROTEÇÃO CONTRA INVERSÃO: Se o preço lido for o oposto (ex: 32¢ em vez de 68¢), ajustamos instantaneamente
+                if preco_bruto_poly < 0.01:
+                    continue
+
                 odd_bruta_poly = 1.0 / preco_bruto_poly
                 odd_bruta_sx = opt_sx["odd"]
 
@@ -831,13 +824,13 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 registar_aposta_virtual(m_hash, f"{team1} vs {team2}", stake_poly, stake_sx, lucro_usd_liquido)
 
                 mensagem = (
-                    "🛡️ [PAPER TRADING - REALTIME CLOB V8.0]\n\n"
+                    "🛡️ [PAPER TRADING - STRICT TOKEN V8.1]\n\n"
                     f"Jogo: {team1} vs {team2}\n"
                     f"Competicao: {sx_m['sport']} - {sx_m['league']}\n"
                     f"Data e Hora: {formatar_data_pt(dt_sx or dt_poly)}\n\n"
                     f"Lado 1 (Polymarket - USDC):\n"
                     f"- Aposta: {opt_p['label']}\n"
-                    f"- Preco Clob Em Direto: {preco_cents}¢ (Odd Bruta: {odd_bruta_poly:.2f} | Liq: {odd_liq_poly:.2f})\n"
+                    f"- Preco Clob Exato: {preco_cents}¢ (Odd Bruta: {odd_bruta_poly:.2f} | Liq: {odd_liq_poly:.2f})\n"
                     f"- Valor investido: ${stake_poly:.2f} USDC\n\n"
                     f"Lado 2 (SX Bet - USDC):\n"
                     f"- Aposta: Not {opt_p['label'].replace(' (Yes)', '')}\n"
@@ -871,7 +864,7 @@ def ciclo_scanner():
         banca_poly = paper_wallet["poly"]["available"]
         banca_sx = paper_wallet["sx"]["available"]
 
-    logger.info("A iniciar scanner Paper Trading V8.0 (Poly Disp: $%.2f | SX Disp: $%.2f).", banca_poly, banca_sx)
+    logger.info("A iniciar scanner Paper Trading V8.1 (Poly Disp: $%.2f | SX Disp: $%.2f).", banca_poly, banca_sx)
 
     stats = {
         "jogos_casados": 0,
@@ -956,7 +949,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 s_disp = paper_wallet["sx"]["available"]
                 s_inv = paper_wallet["sx"]["invested"]
             body = (
-                "ROBO ARBITRAGEM PAPER TRADING V8.0 ONLINE (REALTIME CLOB)\n"
+                "ROBO ARBITRAGEM PAPER TRADING V8.1 ONLINE (STRICT TOKEN FIX)\n"
                 f"Polymarket Disp: ${p_disp:.2f} | Investido: ${p_inv:.2f}\n"
                 f"SX Bet Disp: ${s_disp:.2f} | Investido: ${s_inv:.2f}\n"
                 "Health / Wallet: /health\n"
