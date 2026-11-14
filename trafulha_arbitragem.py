@@ -20,7 +20,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 
 BANKROLL_USD = float(os.getenv("BANKROLL_USD", "100"))
-MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "1.0"))
+MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.5"))
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 
 MIN_POLY_VOLUME = float(os.getenv("MIN_POLY_VOLUME", "2000"))
@@ -51,7 +51,7 @@ logging.basicConfig(
 logger = logging.getLogger("ArbitrageWeb3Bot")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "TrafulhaArbitrageWeb3/5.5"})
+session.headers.update({"User-Agent": "TrafulhaArbitrageWeb3/5.6"})
 
 state_lock = threading.Lock()
 scanner_status = {
@@ -60,6 +60,7 @@ scanner_status = {
     "last_error": None,
     "poly_games_checked": 0,
     "sx_markets_checked": 0,
+    "name_matched_games": 0,
     "matched_games": 0,
     "best_margin_pct": None,
     "opportunities": 0,
@@ -69,7 +70,7 @@ scanner_status = {
 
 alert_history = {}
 sx_usdc_token_cache = None
-sx_schema_logged = False
+diagnostico_inicial_feito = False
 
 
 # ============================================================
@@ -418,7 +419,7 @@ def _procurar_endereco_usdc(obj):
             if "usdc" in str(k).lower() and isinstance(v, str) and v.startswith("0x") and len(v) == 42:
                 return v
             if "usdc" in str(k).lower() and isinstance(v, dict):
-                for sub_k, sub_v in v.items():
+                for sub_v in v.values():
                     if isinstance(sub_v, str) and sub_v.startswith("0x") and len(sub_v) == 42:
                         return sub_v
 
@@ -451,7 +452,7 @@ def obter_usdc_token_sx():
     if sx_usdc_token_cache:
         return sx_usdc_token_cache
 
-    for meta_path in ("/metadata/token", "/metadata", "/metadata/obv3"):
+    for meta_path in ("/metadata/obv3", "/metadata/token", "/metadata"):
         try:
             resp = http_get(f"{SX_BASE}{meta_path}", timeout=12)
             addr = _procurar_endereco_usdc(resp)
@@ -461,11 +462,10 @@ def obter_usdc_token_sx():
                 with state_lock:
                     scanner_status["sx_usdc_token"] = addr
                 return addr
-        except Exception as e:
-            logger.debug("Falha ao ler %s: %s", meta_path, e)
+        except Exception:
+            continue
 
     sx_usdc_token_cache = "0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B"
-    logger.warning("A usar USDC baseToken de fallback: %s", sx_usdc_token_cache)
     return sx_usdc_token_cache
 
 
@@ -535,16 +535,13 @@ def _normalizar_odd_sx(raw_val):
     if v <= 0:
         return None
 
-    # Formato 20 decimais da SX Bet (ex: 48500000000000000000 -> prob 0.485 -> odd 2.06)
     if v > 1e12:
         prob = v / 1e20
         if not (0.01 < prob < 0.99):
             return None
         odd_bruta = 1.0 / prob
-    # Formato decimal direto (ex: 2.06)
     elif 1.01 <= v <= 100.0:
         odd_bruta = v
-    # Formato probabilidade direta (ex: 0.485)
     elif 0.01 < v < 1.0:
         odd_bruta = 1.0 / v
     else:
@@ -561,7 +558,6 @@ def _normalizar_liquidez_usdc(raw_val):
         return 0.0
     if v <= 0:
         return 0.0
-    # USDC tem 6 decimais (ex: 25000000 -> 25.00 USDC)
     return (v / 1e6) if v >= 10000 else v
 
 
@@ -586,7 +582,6 @@ def _extrair_lado_summary(bloco):
             if liq_val > 0:
                 break
 
-    # Se o summary confirmar a odd mas nao discriminar liquidez por lado, assume liquidez minima valida
     if liq_val <= 0:
         liq_val = max(MIN_LIQUIDITY_USD, 25.0)
 
@@ -594,10 +589,6 @@ def _extrair_lado_summary(bloco):
 
 
 def _varrer_summaries_sx(obj, melhores_por_mercado, mapa_eventos):
-    """
-    Percorre a arvore JSON devolvida pelos endpoints /summary/... da SX Bet
-    e extrai odds + liquidez para cada marketHash.
-    """
     if isinstance(obj, list):
         for item in obj:
             _varrer_summaries_sx(item, melhores_por_mercado, mapa_eventos)
@@ -608,7 +599,6 @@ def _varrer_summaries_sx(obj, melhores_por_mercado, mapa_eventos):
 
     m_hash = obj.get("marketHash")
 
-    # Se nao vier marketHash direto, tenta associar por sportXeventId + type
     if not m_hash:
         ev_id = str(obj.get("sportXeventId") or obj.get("eventId") or "")
         m_type = obj.get("type")
@@ -618,7 +608,6 @@ def _varrer_summaries_sx(obj, melhores_por_mercado, mapa_eventos):
     if m_hash:
         lados = melhores_por_mercado.setdefault(m_hash, {})
 
-        # Caso 1: Sub-objetos outcomeOne / outcomeTwo
         if isinstance(obj.get("outcomeOne"), dict):
             res1 = _extrair_lado_summary(obj["outcomeOne"])
             if res1:
@@ -628,7 +617,6 @@ def _varrer_summaries_sx(obj, melhores_por_mercado, mapa_eventos):
             if res2:
                 lados["outcome_two"] = res2
 
-        # Caso 2: Campos planos no proprio objeto
         for k_odd in ("outcomeOnePercentageOdds", "outcomeOneOdds", "bestOutcomeOneOdds"):
             if obj.get(k_odd) is not None and "outcome_one" not in lados:
                 o1 = _normalizar_odd_sx(obj[k_odd])
@@ -667,8 +655,7 @@ def _varrer_summaries_sx(obj, melhores_por_mercado, mapa_eventos):
             _varrer_summaries_sx(v, melhores_por_mercado, mapa_eventos)
 
 
-def obter_melhores_odds_sx(mercados_relevantes):
-    global sx_schema_logged
+def obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=False):
     melhores_por_mercado = {}
     if not mercados_relevantes:
         return melhores_por_mercado
@@ -680,49 +667,59 @@ def obter_melhores_odds_sx(mercados_relevantes):
         if m.get("event_id")
     }
 
-    amostra_estrutura = None
+    amostras_log = []
 
-    # 1) Consulta global rapida dos jogos futuros com odds em USDC
-    for summary_path in (f"/summary/upcoming/{base_token}", f"/summary/popular/{base_token}"):
+    # 1) Consulta global dos jogos futuros e populares em USDC
+    for summary_path in (f"/summary/upcoming/{base_token}", f"/summary/popular/{base_token}", f"/summary/inplay/{base_token}"):
         try:
-            resp = http_get(f"{SX_BASE}{summary_path}", timeout=20)
-            data = resp.get("data", resp) if isinstance(resp, dict) else resp
-            if amostra_estrutura is None and data:
-                amostra_estrutura = (summary_path, data)
-            _varrer_summaries_sx(data, melhores_por_mercado, mapa_eventos)
+            resp = session.get(f"{SX_BASE}{summary_path}", timeout=20)
+            if resp.ok:
+                payload = resp.json()
+                data = payload.get("data", payload) if isinstance(payload, dict) else payload
+                _varrer_summaries_sx(data, melhores_por_mercado, mapa_eventos)
+                if log_diagnostico and len(amostras_log) < 2:
+                    amostras_log.append(f"{summary_path} -> HTTP 200: {json.dumps(data, ensure_ascii=False)[:260]}")
+            elif log_diagnostico and len(amostras_log) < 2:
+                amostras_log.append(f"{summary_path} -> HTTP {resp.status_code}: {resp.text[:140]}")
         except Exception as e:
-            logger.debug("Erro em %s: %s", summary_path, e)
+            if log_diagnostico and len(amostras_log) < 2:
+                amostras_log.append(f"{summary_path} -> ERR: {e}")
 
-    # 2) Para jogos casados que ainda nao tenham odds, consulta o resumo individual do evento
+    # 2) Consulta por evento individual para mercados relevantes ainda sem odds
     eventos_em_falta = []
     vistos_ev = set()
     for m in mercados_relevantes:
         ev_id = m.get("event_id")
         if ev_id and ev_id not in vistos_ev and m["market_hash"] not in melhores_por_mercado:
             vistos_ev.add(ev_id)
-            eventos_em_falta.append(ev_id)
+            eventos_em_falta.append(m)
 
-    for ev_id in eventos_em_falta[:25]:
-        for ev_path in (
+    for m_item in eventos_em_falta[:25]:
+        ev_id = m_item["event_id"]
+        b_group = m_item.get("bet_group") or "1X2"
+        rotas_evento = [
             f"/summary/event/summary/{ev_id}/{base_token}",
-            f"/summary/birdseye/{ev_id}/{base_token}"
-        ):
+            f"/summary/birdseye/{ev_id}/{base_token}",
+            f"/summary/event/{ev_id}/{b_group}/{base_token}"
+        ]
+        for ev_path in rotas_evento:
             try:
-                resp = http_get(f"{SX_BASE}{ev_path}", timeout=12)
-                data = resp.get("data", resp) if isinstance(resp, dict) else resp
-                if amostra_estrutura is None and data:
-                    amostra_estrutura = (ev_path, data)
-                _varrer_summaries_sx(data, melhores_por_mercado, mapa_eventos)
-                break
+                resp = session.get(f"{SX_BASE}{ev_path}", timeout=12)
+                if resp.ok:
+                    payload = resp.json()
+                    data = payload.get("data", payload) if isinstance(payload, dict) else payload
+                    _varrer_summaries_sx(data, melhores_por_mercado, mapa_eventos)
+                    if log_diagnostico and len(amostras_log) < 3:
+                        amostras_log.append(f"{ev_path} -> HTTP 200: {json.dumps(data, ensure_ascii=False)[:260]}")
+                    break
+                elif log_diagnostico and len(amostras_log) < 3:
+                    amostras_log.append(f"{ev_path} -> HTTP {resp.status_code}: {resp.text[:120]}")
             except Exception:
                 continue
 
-    if not melhores_por_mercado and amostra_estrutura and not sx_schema_logged:
-        sx_schema_logged = True
-        rota_amostra, dados_amostra = amostra_estrutura
-        primeiro_item = dados_amostra[0] if isinstance(dados_amostra, list) and dados_amostra else dados_amostra
-        chaves = list(primeiro_item.keys())[:15] if isinstance(primeiro_item, dict) else type(primeiro_item).__name__
-        logger.info("Diagnostico SX Bet (%s) | Chaves recebidas: %s", rota_amostra, chaves)
+    if log_diagnostico:
+        for linha in amostras_log:
+            logger.info("Diagnostico API SX | %s", linha)
 
     return melhores_por_mercado
 
@@ -962,7 +959,8 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
 # ============================================================
 
 def ciclo_scanner():
-    logger.info("A iniciar scanner Web3 V5.5 (Polymarket x SX Bet | MIN_PROFIT = %s%%).", MIN_PROFIT_PCT)
+    global diagnostico_inicial_feito
+    logger.info("A iniciar scanner Web3 V5.6 (Polymarket x SX Bet | MIN_PROFIT = %s%%).", MIN_PROFIT_PCT)
 
     stats = {
         "jogos_casados": 0,
@@ -972,20 +970,40 @@ def ciclo_scanner():
     jogos_poly = obter_jogos_polymarket()
     mercados_sx = obter_mercados_sx()
 
-    mercados_relevantes = [
-        sx_m for sx_m in mercados_sx
-        if any(jogo_coincide_com_titulo(sx_m["team_one"], sx_m["team_two"], jp["title"]) for jp in jogos_poly)
-    ]
+    mercados_relevantes = []
+    exemplo_par = None
+    for sx_m in mercados_sx:
+        for jp in jogos_poly:
+            if jogo_coincide_com_titulo(sx_m["team_one"], sx_m["team_two"], jp["title"]):
+                mercados_relevantes.append(sx_m)
+                if exemplo_par is None:
+                    exemplo_par = (sx_m, jp)
+                break
 
-    odds_sx = obter_melhores_odds_sx(mercados_relevantes) if mercados_relevantes else {}
+    fazer_diag = not diagnostico_inicial_feito
+    odds_sx = obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=fazer_diag) if mercados_relevantes else {}
+
+    if fazer_diag:
+        diagnostico_inicial_feito = True
+        ex_str = (
+            f"SX[{exemplo_par[0]['team_one']} vs {exemplo_par[0]['team_two']} | out: {exemplo_par[0]['outcome_one']}/{exemplo_par[0]['outcome_two']} | ev:{exemplo_par[0]['event_id']} | bg:{exemplo_par[0]['bet_group']}] "
+            f"<-> Poly[{exemplo_par[1]['title']}]"
+        ) if exemplo_par else "Nenhum"
+        logger.info(
+            "Diagnostico Cruzamento | Pares por nome: %s | Mercados SX com odds: %s | Exemplo: %s",
+            len(mercados_relevantes),
+            len(odds_sx),
+            ex_str
+        )
 
     total_alertas = analisar_cruzamento_web3(jogos_poly, mercados_relevantes, odds_sx, stats)
 
     melhor_str = f"{stats['melhor_margem']:.2f}%" if stats["melhor_margem"] is not None else "N/A"
     logger.info(
-        "Ciclo concluido | Jogos Polymarket: %s | Mercados SX Bet: %s | Jogos casados: %s | Melhor margem: %s | Alertas: %s",
+        "Ciclo concluido | Jogos Polymarket: %s | Mercados SX Bet: %s | Pares nome: %s | Jogos casados: %s | Melhor margem: %s | Alertas: %s",
         len(jogos_poly),
         len(mercados_sx),
+        len(mercados_relevantes),
         stats["jogos_casados"],
         melhor_str,
         total_alertas
@@ -995,6 +1013,7 @@ def ciclo_scanner():
         scanner_status["last_scan"] = datetime.now(timezone.utc).isoformat()
         scanner_status["poly_games_checked"] = len(jogos_poly)
         scanner_status["sx_markets_checked"] = len(mercados_sx)
+        scanner_status["name_matched_games"] = len(mercados_relevantes)
         scanner_status["matched_games"] = stats["jogos_casados"]
         scanner_status["best_margin_pct"] = stats["melhor_margem"]
         scanner_status["opportunities"] += total_alertas
@@ -1030,7 +1049,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         else:
             body = (
-                "ROBO ARBITRAGEM WEB3 V5.5 ONLINE\n"
+                "ROBO ARBITRAGEM WEB3 V5.6 ONLINE\n"
                 "Plataformas: Polymarket x SX Bet V3 (USDC)\n"
                 "Mode: SCAN ONLY\n"
                 "Health: /health\n"
