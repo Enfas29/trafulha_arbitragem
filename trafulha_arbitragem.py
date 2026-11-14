@@ -13,7 +13,7 @@ import requests
 
 
 # ============================================================
-# 1. CONFIGURACOES (PAPER TRADING V7.2 - RESET & CLOB EXACT)
+# 1. CONFIGURACOES (PAPER TRADING V7.3 - LOG FIX)
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -44,17 +44,17 @@ SX_BASE = "https://api.sx.bet"
 
 
 # ============================================================
-# 2. LOGGING E ESTADO DA CARTEIRA DUPLA (RESETADO)
+# 2. LOGGING E ESTADO DA CARTEIRA DUPLA
 # ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("ArbitragePaperBotV72Reset")
+logger = logging.getLogger("ArbitragePaperBotV73")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "TrafulhaPaperBot/7.2-Reset"})
+session.headers.update({"User-Agent": "TrafulhaPaperBot/7.3"})
 if SX_API_KEY:
     session.headers.update({"x-sx-api-key": SX_API_KEY})
 
@@ -90,7 +90,7 @@ scanner_status = {
     "best_margin_pct": None,
     "opportunities": 0,
     "sx_odds_endpoint": None,
-    "mode": "WEB3_PAPER_TRADING_RESET_V7.2"
+    "mode": "WEB3_PAPER_TRADING_LOGFIX_V7.3"
 }
 
 diagnostico_inicial_feito = False
@@ -292,9 +292,8 @@ def registar_aposta_virtual(m_hash, jogo_nome, stake_poly, stake_sx, lucro_esper
             "expected_profit": lucro_esperado
         }
         paper_wallet["history"].append(registo)
-        logger.info("PAPER TRADING | Aposta #${} registada para {} | Investido Poly: ${:.2f} | Investido SX: ${:.2f}".format(
-            registo["id"], jogo_nome, stake_poly, stake_sx
-        ))
+        logger.info("PAPER TRADING | Aposta #%s registada para %s | Investido Poly: $%.2f | Investido SX: $%.2f",
+                    registo["id"], jogo_nome, stake_poly, stake_sx)
 
 
 # ============================================================
@@ -811,7 +810,7 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                     total_geral = poly_tot + sx_tot
 
                 mensagem = (
-                    "🛡️ [PAPER TRADING - RESET V7.2]\n\n"
+                    "🛡️ [PAPER TRADING - V7.3 LOG FIX]\n\n"
                     f"Jogo: {team1} vs {team2}\n"
                     f"Competicao: {sx_m['sport']} - {sx_m['league']}\n"
                     f"Data e Hora: {formatar_data_pt(dt_sx or dt_poly)}\n\n"
@@ -857,7 +856,7 @@ def ciclo_scanner():
         banca_poly = paper_wallet["poly"]["available"]
         banca_sx = paper_wallet["sx"]["available"]
 
-    logger.info("A iniciar scanner Paper Trading Reset V7.2 (Poly Disp: $%s | SX Disp: $%s).", banca_poly, banca_sx)
+    logger.info("A iniciar scanner Paper Trading V7.3 (Poly Disp: $%.2f | SX Disp: $%.2f).", banca_poly, banca_sx)
 
     stats = {
         "jogos_casados": 0,
@@ -887,7 +886,7 @@ def ciclo_scanner():
 
     melhor_str = f"{stats['melhor_margem']:.2f}%" if stats["melhor_margem"] is not None else "N/A"
     logger.info(
-        "Ciclo concluido | Poly Disp: ${:.2f} | SX Disp: ${:.2f} | Casados: {} | Melhor margem: {} | Alertas: {}",
+        "Ciclo concluido | Poly Disp: $%.2f | SX Disp: $%.2f | Casados: %d | Melhor margem: %s | Alertas: %d",
         paper_wallet["poly"]["available"],
         paper_wallet["sx"]["available"],
         stats["jogos_casados"],
@@ -942,7 +941,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 s_disp = paper_wallet["sx"]["available"]
                 s_inv = paper_wallet["sx"]["invested"]
             body = (
-                "ROBO ARBITRAGEM PAPER TRADING V7.2 ONLINE (RESET)\n"
+                "ROBO ARBITRAGEM PAPER TRADING V7.3 ONLINE (LOG FIX)\n"
                 f"Polymarket Disp: ${p_disp:.2f} | Investido: ${p_inv:.2f}\n"
                 f"SX Bet Disp: ${s_disp:.2f} | Investido: ${s_inv:.2f}\n"
                 "Health / Wallet: /health\n"
