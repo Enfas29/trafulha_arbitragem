@@ -13,7 +13,7 @@ import requests
 
 
 # ============================================================
-# 1. CONFIGURACOES (USA AS VARIAVEIS JA DEFINIDAS NO RENDER)
+# 1. CONFIGURACOES
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -24,7 +24,7 @@ BANKROLL_EUR = float(os.getenv("BANKROLL_EUR", "100"))
 BANKROLL_USD = float(os.getenv("BANKROLL_USD", "100"))
 EUR_USD_RATE = float(os.getenv("EUR_USD_RATE", "1.08"))
 
-MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.5"))
+MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "1.0"))
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "14400"))
 
 MIN_POLY_VOLUME = float(os.getenv("MIN_POLY_VOLUME", "2000"))
@@ -32,7 +32,7 @@ POLY_FEE_BUFFER_PCT = float(os.getenv("POLY_FEE_BUFFER_PCT", "1.0"))
 
 BOOKMAKER_FILTER = [
     x.strip().lower()
-    for x in os.getenv("BOOKMAKER_FILTER", "betano,betclic").split(",")
+    for x in os.getenv("BOOKMAKER_FILTER", "").split(",")
     if x.strip()
 ]
 
@@ -43,7 +43,7 @@ CUSTOM_SPORT_KEYS = [
 ]
 
 MAX_POLY_PAGES = int(os.getenv("MAX_POLY_PAGES", "10"))
-MAX_POLY_MARKETS = int(os.getenv("MAX_POLY_MARKETS", "250"))
+MAX_POLY_MARKETS = int(os.getenv("MAX_POLY_MARKETS", "300"))
 
 ALERT_COOLDOWN = 3600
 AUTO_BET = False
@@ -64,7 +64,7 @@ logging.basicConfig(
 logger = logging.getLogger("ArbitrageBot")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "TrafulhaArbitrage/4.0"})
+session.headers.update({"User-Agent": "TrafulhaArbitrage/4.1"})
 
 state_lock = threading.Lock()
 scanner_status = {
@@ -73,6 +73,8 @@ scanner_status = {
     "last_error": None,
     "events_checked": 0,
     "poly_games_checked": 0,
+    "matched_games": 0,
+    "best_margin_pct": None,
     "opportunities": 0,
     "sports": [],
     "mode": "HYBRID_POLY_BOOKMAKERS"
@@ -201,7 +203,7 @@ def formatar_data_pt(dt_str):
 
 def enviar_alerta_telegram(mensagem, alert_key=None):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.warning("Telegram nao configurado.")
+        logger.warning("Telegram nao configurado (TELEGRAM_TOKEN ou CHAT_ID em falta).")
         return False
 
     now = time.time()
@@ -219,13 +221,15 @@ def enviar_alerta_telegram(mensagem, alert_key=None):
 
     try:
         response = session.post(url, json=payload, timeout=15)
-        response.raise_for_status()
+        if not response.ok:
+            logger.error("Falha Telegram (%s): %s", response.status_code, response.text)
+            return False
         if alert_key:
             alert_history[alert_key] = now
-        logger.info("Alerta enviado para Telegram.")
+        logger.info("Alerta enviado para Telegram com sucesso!")
         return True
     except requests.RequestException as e:
-        logger.error("Erro Telegram: %s", e)
+        logger.error("Erro de rede Telegram: %s", e)
         return False
 
 
@@ -234,7 +238,7 @@ def gerar_chave_alerta(texto):
 
 
 # ============================================================
-# 5. THE ODDS API (BETANO / BETCLIC)
+# 5. THE ODDS API
 # ============================================================
 
 def descobrir_desportos():
@@ -271,12 +275,7 @@ def obter_odds_desporto(sport_key):
         return []
 
 
-def extrair_melhores_odds_tradicionais(evento):
-    """
-    Devolve um dicionario com as melhores odds na Betano/Betclic:
-    - Para 2-way (NBA, MMA, Tenis): {'home': {...}, 'away': {...}}
-    - Para Futebol (1X2): {'home': {...}, 'away': {...}, 'draw': {...}}
-    """
+def extrair_melhores_odds_tradicionais(evento, casas_vistas):
     sport = evento.get("sport_key", "")
     home_raw = evento.get("home_team", "")
     away_raw = evento.get("away_team", "")
@@ -289,6 +288,8 @@ def extrair_melhores_odds_tradicionais(evento):
     for bookmaker in evento.get("bookmakers", []):
         bk_key = bookmaker.get("key", "").lower()
         bk_name = bookmaker.get("title", bk_key)
+        casas_vistas.add(bk_key)
+
         if BOOKMAKER_FILTER and bk_key not in BOOKMAKER_FILTER:
             continue
 
@@ -373,10 +374,6 @@ def obter_melhor_ask_clob(token_id):
 
 
 def obter_jogos_polymarket():
-    """
-    Recolhe eventos e mercados ativos na Polymarket e estrutura-os
-    para cruzamento rapido com as casas tradicionais.
-    """
     jogos_poly = []
     vistos = set()
 
@@ -387,6 +384,8 @@ def obter_jogos_polymarket():
                 params={
                     "active": "true",
                     "closed": "false",
+                    "order": "volume24hr",
+                    "ascending": "false",
                     "limit": 100,
                     "offset": page * 100
                 },
@@ -473,17 +472,10 @@ def obter_jogos_polymarket():
 
 
 # ============================================================
-# 7. MOTOR DE CRUZAMENTO: POLYMARKET x BETANO/BETCLIC
+# 7. MOTOR DE CRUZAMENTO: POLYMARKET x CASAS DE APOSTAS
 # ============================================================
 
 def extrair_opcoes_poly_para_jogo(jogo_poly, home_team, away_team, is_soccer):
-    """
-    Identifica quais opcoes do jogo existem na Polymarket:
-    - 'home': comprar vitoria da equipa da casa
-    - 'away': comprar vitoria da equipa visitante
-    - 'draw': comprar empate (apenas futebol)
-    Cada entrada guarda o token_id, preco indicativo e volume.
-    """
     opcoes = {}
 
     for m in jogo_poly["markets"]:
@@ -496,7 +488,6 @@ def extrair_opcoes_poly_para_jogo(jogo_poly, home_team, away_team, is_soccer):
 
         outs_norm = [normalizar_texto(o) for o in outs]
 
-        # Caso 1: Mercado direto "Team A vs Team B" com outcomes ["Team A", "Team B"]
         if "yes" not in outs_norm and "no" not in outs_norm:
             for idx, out_name in enumerate(outs):
                 if equipas_coincidem(out_name, home_team):
@@ -514,12 +505,10 @@ def extrair_opcoes_poly_para_jogo(jogo_poly, home_team, away_team, is_soccer):
                         "label": f"{away_team} Vence"
                     }
 
-        # Caso 2: Mercado binario Yes/No ("Will Benfica win?", groupItemTitle="Benfica" ou "Draw")
         elif "yes" in outs_norm:
             yes_idx = outs_norm.index("yes")
             alvo_texto = g if g else q
 
-            # Ignorar mercados de handicap/spread ou over/under
             if any(w in alvo_texto.lower() for w in ["spread", "over", "under", "total", "goals", "points", "handicap", "o/u"]):
                 continue
 
@@ -556,40 +545,43 @@ def calcular_odd_liquida_poly(ask_price):
     return 1.0 / preco_com_taxa
 
 
-def cruzar_evento_hibrido(evento, jogos_poly):
+def cruzar_evento_hibrido(evento, jogos_poly, stats):
     home = evento.get("home_team", "")
     away = evento.get("away_team", "")
     sport = evento.get("sport_key", "")
     commence_time = evento.get("commence_time", "")
     is_soccer = sport.startswith("soccer_")
 
-    melhores_trad = extrair_melhores_odds_tradicionais(evento)
+    melhores_trad = extrair_melhores_odds_tradicionais(evento, stats["casas_vistas"])
     if not melhores_trad:
         return False
+
+    # Limite maximo de soma de probabilidades ajustado ao MIN_PROFIT_PCT configurado
+    fator_min = max(0.5, 1.0 + (MIN_PROFIT_PCT / 100.0))
+    max_soma_prob = 1.0 / fator_min
+    limite_prefiltro = max_soma_prob + 0.03
 
     dt_evento = parse_iso_datetime(commence_time)
     alertas_enviados = 0
 
     for jogo_poly in jogos_poly:
         titulo_poly = jogo_poly["title"]
-        # Confirma que ambas as equipas pertencem ao mesmo evento na Polymarket
         if not (equipas_coincidem(home, titulo_poly) and equipas_coincidem(away, titulo_poly)):
             continue
 
-        # Evita cruzar jogos de datas completamente diferentes (ex: jogos separados por > 4 dias)
         dt_poly = parse_iso_datetime(jogo_poly.get("end_date"))
         if dt_evento and dt_poly:
             diff_horas = abs((dt_poly - dt_evento).total_seconds()) / 3600.0
-            if diff_horas > 96:
+            if diff_horas > 120:
                 continue
 
         opcoes_poly = extrair_opcoes_poly_para_jogo(jogo_poly, home, away, is_soccer)
         if not opcoes_poly:
             continue
 
-        # ====================================================
+        stats["jogos_casados"] += 1
+
         # CENARIO A: DESPORTOS 2-WAY (NBA, EUROLIGA, MMA, TENIS)
-        # ====================================================
         if not is_soccer:
             pares = [
                 ("home", "away", f"{home} Vence", f"{away} Vence"),
@@ -603,13 +595,11 @@ def cruzar_evento_hibrido(evento, jogos_poly):
                 opt_p = opcoes_poly[lado_poly]
                 opt_t = melhores_trad[lado_trad]
 
-                # Pre-filtro rapido com preco indicativo
                 if opt_p["indicative_price"] > 0:
                     odd_ind = calcular_odd_liquida_poly(opt_p["indicative_price"])
-                    if odd_ind and (1.0 / odd_ind + 1.0 / opt_t["odd"]) >= 1.02:
+                    if odd_ind and (1.0 / odd_ind + 1.0 / opt_t["odd"]) > limite_prefiltro:
                         continue
 
-                # Confirmacao real no livro de ordens CLOB
                 ask = obter_melhor_ask_clob(opt_p["token_id"])
                 if not ask:
                     continue
@@ -620,11 +610,11 @@ def cruzar_evento_hibrido(evento, jogos_poly):
 
                 odd_trad = opt_t["odd"]
                 soma_prob = (1.0 / odd_poly) + (1.0 / odd_trad)
-
-                if soma_prob >= 1.0:
-                    continue
-
                 lucro_pct = ((1.0 / soma_prob) - 1.0) * 100.0
+
+                if stats["melhor_margem"] is None or lucro_pct > stats["melhor_margem"]:
+                    stats["melhor_margem"] = lucro_pct
+
                 if lucro_pct < MIN_PROFIT_PCT:
                     continue
 
@@ -632,9 +622,8 @@ def cruzar_evento_hibrido(evento, jogos_poly):
                 stake_trad_eur = BANKROLL_EUR * (1.0 / odd_trad) / soma_prob
                 stake_poly_usd = stake_poly_eur * EUR_USD_RATE
 
-                # Verifica se ha liquidez suficiente no topo do livro CLOB
                 liquidez_usd = ask["size"] * ask["price"]
-                if liquidez_usd < 15.0:
+                if liquidez_usd < 10.0:
                     continue
 
                 retorno_eur = BANKROLL_EUR / soma_prob
@@ -655,17 +644,14 @@ def cruzar_evento_hibrido(evento, jogos_poly):
                     f"- Valor a colocar: {stake_trad_eur:.2f} EUR\n\n"
                     f"Investimento Total: {BANKROLL_EUR:.2f} EUR\n"
                     f"Retorno Garantido: ~{retorno_eur:.2f} EUR\n"
-                    f"Lucro Liquido: +{lucro_eur:.2f} EUR (~{lucro_pct:.2f}%)\n\n"
-                    "Independente de quem ganhe, o lucro e garantido!"
+                    f"Lucro Liquido: {lucro_eur:+.2f} EUR (~{lucro_pct:.2f}%)"
                 )
 
                 key = gerar_chave_alerta(f"hyb2_{evento.get('id')}_{lado_poly}_{round(odd_poly,2)}_{round(odd_trad,2)}")
                 if enviar_alerta_telegram(mensagem, key):
                     alertas_enviados += 1
 
-        # ====================================================
         # CENARIO B: FUTEBOL (POLYMARKET x HIPOTESE DUPLA)
-        # ====================================================
         else:
             combinacoes_futebol = [
                 ("home", "draw", "away", f"{home} Vence", f"{away} ou Empate (Hipotese Dupla)"),
@@ -685,12 +671,11 @@ def cruzar_evento_hibrido(evento, jogos_poly):
                 bk_t1 = melhores_trad[t1]["bookmaker"]
                 bk_t2 = melhores_trad[t2]["bookmaker"]
 
-                # Odd equivalente da Hipotese Dupla combinada
                 odd_dupla = 1.0 / ((1.0 / odd_t1) + (1.0 / odd_t2))
 
                 if opt_p["indicative_price"] > 0:
                     odd_ind = calcular_odd_liquida_poly(opt_p["indicative_price"])
-                    if odd_ind and (1.0 / odd_ind + 1.0 / odd_dupla) >= 1.02:
+                    if odd_ind and (1.0 / odd_ind + 1.0 / odd_dupla) > limite_prefiltro:
                         continue
 
                 ask = obter_melhor_ask_clob(opt_p["token_id"])
@@ -702,15 +687,16 @@ def cruzar_evento_hibrido(evento, jogos_poly):
                     continue
 
                 soma_prob = (1.0 / odd_poly) + (1.0 / odd_t1) + (1.0 / odd_t2)
-                if soma_prob >= 1.0:
-                    continue
-
                 lucro_pct = ((1.0 / soma_prob) - 1.0) * 100.0
+
+                if stats["melhor_margem"] is None or lucro_pct > stats["melhor_margem"]:
+                    stats["melhor_margem"] = lucro_pct
+
                 if lucro_pct < MIN_PROFIT_PCT:
                     continue
 
                 liquidez_usd = ask["size"] * ask["price"]
-                if liquidez_usd < 15.0:
+                if liquidez_usd < 10.0:
                     continue
 
                 stake_poly_eur = BANKROLL_EUR * (1.0 / odd_poly) / soma_prob
@@ -739,8 +725,7 @@ def cruzar_evento_hibrido(evento, jogos_poly):
                     f"  * {melhores_trad[t2]['label']} ({bk_t2}): {stake_t2_eur:.2f} EUR @ {odd_t2:.2f}\n\n"
                     f"Investimento Total: {BANKROLL_EUR:.2f} EUR\n"
                     f"Retorno Garantido: ~{retorno_eur:.2f} EUR\n"
-                    f"Lucro Liquido: +{lucro_eur:.2f} EUR (~{lucro_pct:.2f}%)\n\n"
-                    "Independente de quem ganhe, o lucro e garantido!"
+                    f"Lucro Liquido: {lucro_eur:+.2f} EUR (~{lucro_pct:.2f}%)"
                 )
 
                 key = gerar_chave_alerta(f"hyb3_{evento.get('id')}_{lado_poly}_{round(odd_poly,2)}_{round(odd_dupla,2)}")
@@ -751,66 +736,19 @@ def cruzar_evento_hibrido(evento, jogos_poly):
 
 
 # ============================================================
-# 8. MOTOR TRADICIONAL (BETANO x BETCLIC) COMO EXTRA
-# ============================================================
-
-def calcular_arbitragem_tradicional(evento):
-    melhores = extrair_melhores_odds_tradicionais(evento)
-    if not melhores:
-        return False
-
-    casas = {info["bookmaker"] for info in melhores.values()}
-    if len(casas) < 2:
-        return False
-
-    soma_prob = sum(1.0 / info["odd"] for info in melhores.values())
-    if soma_prob >= 1.0:
-        return False
-
-    lucro_pct = ((1.0 / soma_prob) - 1.0) * 100.0
-    if lucro_pct < MIN_PROFIT_PCT:
-        return False
-
-    home = evento.get("home_team", "?")
-    away = evento.get("away_team", "?")
-    commence_time = evento.get("commence_time", "")
-
-    linhas = [
-        "Arbitragem Tradicional (Betano x Betclic)!",
-        "",
-        f"Jogo: {home} vs {away}",
-        f"Data e Hora: {formatar_data_pt(commence_time)}",
-        ""
-    ]
-
-    for slot, info in melhores.items():
-        stake = BANKROLL_EUR * (1.0 / info["odd"]) / soma_prob
-        linhas.append(f"- {info['label']} ({info['bookmaker']}): {stake:.2f} EUR @ {info['odd']:.2f}")
-
-    retorno_eur = BANKROLL_EUR / soma_prob
-    lucro_eur = retorno_eur - BANKROLL_EUR
-
-    linhas.extend([
-        "",
-        f"Investimento Total: {BANKROLL_EUR:.2f} EUR",
-        f"Retorno Garantido: ~{retorno_eur:.2f} EUR",
-        f"Lucro Liquido: +{lucro_eur:.2f} EUR (~{lucro_pct:.2f}%)"
-    ])
-
-    mensagem = "\n".join(linhas)
-    key = gerar_chave_alerta(f"trad_{evento.get('id')}_{round(lucro_pct, 2)}")
-    return enviar_alerta_telegram(mensagem, key)
-
-
-# ============================================================
-# 9. CICLO PRINCIPAL
+# 8. CICLO PRINCIPAL
 # ============================================================
 
 def ciclo_scanner():
-    logger.info("A iniciar scanner Hibrido V4 (Polymarket x Betano/Betclic).")
+    logger.info("A iniciar scanner Hibrido V4.1 (MIN_PROFIT_PCT = %s%%).", MIN_PROFIT_PCT)
 
     total_eventos = 0
     total_alertas = 0
+    stats = {
+        "casas_vistas": set(),
+        "jogos_casados": 0,
+        "melhor_margem": None
+    }
 
     jogos_poly = obter_jogos_polymarket()
     logger.info("Polymarket: %s eventos desportivos carregados.", len(jogos_poly))
@@ -826,17 +764,25 @@ def ciclo_scanner():
         for evento in eventos:
             evento["sport_key"] = sport
             try:
-                if cruzar_evento_hibrido(evento, jogos_poly):
-                    total_alertas += 1
-                if calcular_arbitragem_tradicional(evento):
+                if cruzar_evento_hibrido(evento, jogos_poly, stats):
                     total_alertas += 1
             except Exception:
                 logger.exception("Erro ao analisar evento.")
+
+    melhor_str = f"{stats['melhor_margem']:.2f}%" if stats["melhor_margem"] is not None else "N/A"
+    logger.info(
+        "Diagnostico | Casas API: %s | Jogos casados: %s | Melhor margem: %s",
+        sorted(list(stats["casas_vistas"]))[:10],
+        stats["jogos_casados"],
+        melhor_str
+    )
 
     with state_lock:
         scanner_status["last_scan"] = datetime.now(timezone.utc).isoformat()
         scanner_status["events_checked"] = total_eventos
         scanner_status["poly_games_checked"] = len(jogos_poly)
+        scanner_status["matched_games"] = stats["jogos_casados"]
+        scanner_status["best_margin_pct"] = stats["melhor_margem"]
         scanner_status["opportunities"] += total_alertas
         scanner_status["last_error"] = None
 
@@ -860,7 +806,7 @@ def correr_robo_continuo():
 
 
 # ============================================================
-# 10. SERVIDOR WEB RENDER
+# 9. SERVIDOR WEB RENDER
 # ============================================================
 
 class SimpleHandler(BaseHTTPRequestHandler):
@@ -877,8 +823,8 @@ class SimpleHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         else:
             body = (
-                "ROBO HIBRIDO V4 ONLINE\n"
-                "Cruzamento: Polymarket x Betano/Betclic\n"
+                "ROBO HIBRIDO V4.1 ONLINE\n"
+                "Cruzamento: Polymarket x Casas Europeias\n"
                 "Mode: SCAN ONLY\n"
                 "Health: /health\n"
             ).encode("utf-8")
