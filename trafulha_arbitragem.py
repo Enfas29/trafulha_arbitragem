@@ -32,7 +32,7 @@ SX_FEE_BUFFER_PCT = float(os.getenv("SX_FEE_BUFFER_PCT", "0.0"))
 MAX_POLY_PAGES = int(os.getenv("MAX_POLY_PAGES", "10"))
 MAX_POLY_MARKETS = int(os.getenv("MAX_POLY_MARKETS", "300"))
 
-ALERT_COOLDOWN = 1800  # 30 minutos para nao repetir o mesmo alerta
+ALERT_COOLDOWN = 1800
 AUTO_BET = False
 
 POLY_GAMMA = "https://gamma-api.polymarket.com"
@@ -51,7 +51,7 @@ logging.basicConfig(
 logger = logging.getLogger("ArbitrageWeb3Bot")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "TrafulhaArbitrageWeb3/5.0"})
+session.headers.update({"User-Agent": "TrafulhaArbitrageWeb3/5.1"})
 
 state_lock = threading.Lock()
 scanner_status = {
@@ -102,6 +102,7 @@ STOPWORDS_EQUIPAS = {
 }
 
 ALIASES_EQUIPAS = {
+    # Futebol Europeu
     "sporting lisbon": "sporting cp",
     "sporting clube de portugal": "sporting cp",
     "sl benfica": "benfica",
@@ -120,19 +121,39 @@ ALIASES_EQUIPAS = {
     "atletico madrid": "atletico",
     "bayern munich": "bayern",
     "borussia dortmund": "dortmund",
-    "los angeles lakers": "lakers",
-    "la lakers": "lakers",
+    # Todas as 30 equipas da NBA (SX Bet -> Polymarket)
+    "atlanta hawks": "hawks",
+    "boston celtics": "celtics",
+    "brooklyn nets": "nets",
+    "charlotte hornets": "hornets",
+    "chicago bulls": "bulls",
+    "cleveland cavaliers": "cavaliers",
+    "dallas mavericks": "mavericks",
+    "denver nuggets": "nuggets",
+    "detroit pistons": "pistons",
+    "golden state warriors": "warriors",
+    "houston rockets": "rockets",
+    "indiana pacers": "pacers",
     "los angeles clippers": "clippers",
     "la clippers": "clippers",
-    "golden state warriors": "warriors",
-    "boston celtics": "celtics",
-    "new york knicks": "knicks",
-    "brooklyn nets": "nets",
-    "philadelphia 76ers": "76ers",
+    "los angeles lakers": "lakers",
+    "la lakers": "lakers",
+    "memphis grizzlies": "grizzlies",
+    "miami heat": "heat",
     "milwaukee bucks": "bucks",
-    "denver nuggets": "nuggets",
+    "minnesota timberwolves": "timberwolves",
+    "new orleans pelicans": "pelicans",
+    "new york knicks": "knicks",
+    "oklahoma city thunder": "thunder",
+    "orlando magic": "magic",
+    "philadelphia 76ers": "76ers",
     "phoenix suns": "suns",
-    "dallas mavericks": "mavericks"
+    "portland trail blazers": "trail blazers",
+    "sacramento kings": "kings",
+    "san antonio spurs": "spurs",
+    "toronto raptors": "raptors",
+    "utah jazz": "jazz",
+    "washington wizards": "wizards"
 }
 
 
@@ -165,6 +186,22 @@ def equipas_coincidem(nome_a, nome_b):
         return False
     intersecao = tok_a.intersection(tok_b)
     return len(intersecao) >= min(len(tok_a), len(tok_b))
+
+
+def jogo_coincide_com_titulo(team1, team2, titulo_poly):
+    """
+    Separa titulos no formato 'Equipa A vs Equipa B' para comparar cada lado
+    individualmente e evitar falhas quando uma plataforma usa o nome completo
+    e a outra apenas o nome curto.
+    """
+    partes = re.split(r"\s+(?:vs\.?|v\.?|@)\s+", str(titulo_poly), maxsplit=1, flags=re.IGNORECASE)
+    if len(partes) == 2:
+        lado_a, lado_b = partes[0], partes[1]
+        direto = equipas_coincidem(team1, lado_a) and equipas_coincidem(team2, lado_b)
+        invertido = equipas_coincidem(team1, lado_b) and equipas_coincidem(team2, lado_a)
+        if direto or invertido:
+            return True
+    return equipas_coincidem(team1, titulo_poly) and equipas_coincidem(team2, titulo_poly)
 
 
 def parse_timestamp_utc(valor):
@@ -378,9 +415,6 @@ def obter_jogos_polymarket():
 # ============================================================
 
 def obter_mercados_sx():
-    """
-    Recolhe mercados ativos de vencedor de jogo (Moneyline / 1X2) na SX Bet.
-    """
     mercados = []
     next_key = None
 
@@ -404,7 +438,6 @@ def obter_mercados_sx():
             if m.get("status") != "ACTIVE":
                 continue
 
-            # Tipos de vencedor direto na SX Bet: 1 (1X2 / Moneyline), 52 (12), 226 (Game Winner)
             m_type = m.get("type")
             if m_type not in (1, 52, 226):
                 continue
@@ -436,76 +469,85 @@ def obter_mercados_sx():
     return mercados
 
 
+def _consultar_lote_ordens_sx(lote):
+    resp = session.get(
+        f"{SX_BASE}/orders",
+        params={"marketHashes": ",".join(lote)},
+        timeout=20
+    )
+    if not resp.ok:
+        raise ValueError(f"HTTP {resp.status_code}: {resp.text[:180]}")
+    payload = resp.json()
+    ordens = payload.get("data", [])
+    if isinstance(ordens, dict):
+        ordens = ordens.get("orders", [])
+    return ordens
+
+
 def obter_melhores_odds_sx(market_hashes):
     """
-    Consulta o livro de ordens da SX Bet e calcula a melhor odd e liquidez
-    disponivel para o Taker em outcomeOne e outcomeTwo.
+    Consulta o livro de ordens da SX Bet em lotes pequenos de 5 hashes
+    para evitar limites de comprimento de URL (HTTP 400).
     """
     melhores_por_mercado = {}
-    hashes_unicos = list(set(market_hashes))
+    hashes_unicos = list(dict.fromkeys(market_hashes))
+    todas_ordens = []
 
-    for i in range(0, len(hashes_unicos), 30):
-        lote = hashes_unicos[i:i + 30]
+    for i in range(0, len(hashes_unicos), 5):
+        lote = hashes_unicos[i:i + 5]
         try:
-            resp = http_get(
-                f"{SX_BASE}/orders",
-                params={"marketHashes": ",".join(lote)},
-                timeout=20
-            )
-        except requests.RequestException as e:
-            logger.error("Erro ao ler ordens SX Bet: %s", e)
+            todas_ordens.extend(_consultar_lote_ordens_sx(lote))
+        except Exception:
+            for h_unico in lote:
+                try:
+                    todas_ordens.extend(_consultar_lote_ordens_sx([h_unico]))
+                except Exception as e_ind:
+                    logger.warning("Hash SX Bet ignorado (%s): %s", h_unico[:12], e_ind)
+
+    for o in todas_ordens:
+        if o.get("orderStatus") != "ACTIVE":
             continue
 
-        ordens = resp.get("data", [])
-        if isinstance(ordens, dict):
-            ordens = ordens.get("orders", [])
+        m_hash = o.get("marketHash", "")
+        if not m_hash:
+            continue
 
-        for o in ordens:
-            if o.get("orderStatus") != "ACTIVE":
-                continue
+        try:
+            maker_prob = int(o["percentageOdds"]) / 1e20
+            total_bet = int(o["totalBetSize"])
+            fill_amount = int(o.get("fillAmount", 0))
+        except (ValueError, TypeError, KeyError):
+            continue
 
-            m_hash = o.get("marketHash", "")
-            if not m_hash:
-                continue
+        if not (0.01 < maker_prob < 0.99):
+            continue
 
-            try:
-                maker_prob = int(o["percentageOdds"]) / 1e20
-                total_bet = int(o["totalBetSize"])
-                fill_amount = int(o.get("fillAmount", 0))
-            except (ValueError, TypeError, KeyError):
-                continue
+        maker_rem_usdc = (total_bet - fill_amount) / 1e6
+        if maker_rem_usdc <= 0:
+            continue
 
-            if not (0.01 < maker_prob < 0.99):
-                continue
+        taker_prob = 1.0 - maker_prob
+        taker_odd_bruta = 1.0 / taker_prob
+        fator_taxa_sx = 1.0 - (SX_FEE_BUFFER_PCT / 100.0)
+        taker_odd = 1.0 + (taker_odd_bruta - 1.0) * fator_taxa_sx
 
-            maker_rem_usdc = (total_bet - fill_amount) / 1e6
-            if maker_rem_usdc <= 0:
-                continue
+        taker_liq_usdc = maker_rem_usdc * (taker_prob / maker_prob)
+        if taker_liq_usdc < 5.0:
+            continue
 
-            # Na SX Bet, o Taker aposta no lado OPOSTO ao do Maker
-            taker_prob = 1.0 - maker_prob
-            taker_odd_bruta = 1.0 / taker_prob
-            fator_taxa_sx = 1.0 - (SX_FEE_BUFFER_PCT / 100.0)
-            taker_odd = 1.0 + (taker_odd_bruta - 1.0) * fator_taxa_sx
+        taker_slot = "outcome_two" if o.get("isMakerBettingOutcomeOne") else "outcome_one"
 
-            # Liquidez maxima que o Taker pode colocar nesta ordem (em USDC)
-            taker_liq_usdc = maker_rem_usdc * (taker_prob / maker_prob)
-            if taker_liq_usdc < 5.0:
-                continue
+        if m_hash not in melhores_por_mercado:
+            melhores_por_mercado[m_hash] = {}
 
-            taker_slot = "outcome_two" if o.get("isMakerBettingOutcomeOne") else "outcome_one"
-
-            if m_hash not in melhores_por_mercado:
-                melhores_por_mercado[m_hash] = {}
-
-            atual = melhores_por_mercado[m_hash].get(taker_slot)
-            if not atual or taker_odd > atual["odd"]:
-                melhores_por_mercado[m_hash][taker_slot] = {
-                    "odd": taker_odd,
-                    "liquidity_usdc": taker_liq_usdc
-                }
-            elif abs(taker_odd - atual["odd"]) < 0.002:
-                atual["liquidity_usdc"] += taker_liq_usdc
+        atual = melhores_por_mercado[m_hash].get(taker_slot)
+        if not atual or taker_odd > atual["odd"]:
+            melhores_por_mercado[m_hash][taker_slot] = {
+                "odd": taker_odd,
+                "liquidity_usdc": taker_liq_usdc
+            }
+        elif abs(taker_odd - atual["odd"]) < 0.002:
+            atual["liquidity_usdc"] += taker_liq_usdc
 
     return melhores_por_mercado
 
@@ -515,11 +557,6 @@ def obter_melhores_odds_sx(market_hashes):
 # ============================================================
 
 def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
-    """
-    Mapeia as opcoes da Polymarket para os lados exactos do mercado da SX Bet:
-    - 'sx_one': corresponde a sx_market['outcome_one']
-    - 'sx_two': corresponde a sx_market['outcome_two']
-    """
     out1_sx = sx_market["outcome_one"]
     out2_sx = sx_market["outcome_two"]
     team1 = sx_market["team_one"]
@@ -537,7 +574,6 @@ def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
 
         outs_norm = [normalizar_texto(o) for o in outs]
 
-        # Caso 1: Mercado direto "Team A vs Team B" na Polymarket
         if "yes" not in outs_norm and "no" not in outs_norm:
             for idx, out_name in enumerate(outs):
                 if equipas_coincidem(out_name, out1_sx) and not equipas_coincidem(out_name, out2_sx):
@@ -555,13 +591,11 @@ def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
                         "label": out_name
                     }
 
-        # Caso 2: Mercado binario Yes/No na Polymarket (ex: "Will Benfica win?" -> Yes = Benfica, No = Not Benfica)
         elif "yes" in outs_norm and "no" in outs_norm:
             yes_idx = outs_norm.index("yes")
             no_idx = outs_norm.index("no")
             alvo_texto = g if g else q
 
-            # Se SX Bet tem outcomeOne="Benfica" e outcomeTwo="Not Benfica"
             if normalizar_texto(out2_sx).startswith("not ") and equipas_coincidem(alvo_texto, out1_sx):
                 opcoes["sx_one"] = {
                     "token_id": tids[yes_idx],
@@ -576,7 +610,6 @@ def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
                     "label": f"{out2_sx} (No)"
                 }
 
-            # Se SX Bet tem outcomeOne="Tie" e outcomeTwo="Not Tie"
             elif normalizar_texto(out1_sx) in ("tie", "draw") and ("draw" in normalizar_texto(alvo_texto) or "tie" in normalizar_texto(alvo_texto)):
                 opcoes["sx_one"] = {
                     "token_id": tids[yes_idx],
@@ -591,7 +624,6 @@ def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
                     "label": "Sem Empate (No)"
                 }
 
-            # Se SX Bet e 2-way (Team 1 vs Team 2) e Polymarket pergunta "Will Team 1 win?"
             elif equipas_coincidem(alvo_texto, team1) and not equipas_coincidem(alvo_texto, team2):
                 if equipas_coincidem(team1, out1_sx):
                     opcoes["sx_one"] = {
@@ -651,8 +683,7 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
         dt_sx = sx_m["game_time"]
 
         for jogo_poly in jogos_poly:
-            titulo_poly = jogo_poly["title"]
-            if not (equipas_coincidem(team1, titulo_poly) and equipas_coincidem(team2, titulo_poly)):
+            if not jogo_coincide_com_titulo(team1, team2, jogo_poly["title"]):
                 continue
 
             dt_poly = jogo_poly["end_date"]
@@ -667,9 +698,6 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
 
             stats["jogos_casados"] += 1
 
-            # Cruzamentos possiveis:
-            # 1) Polymarket aposta no lado 1 (sx_one) vs SX Bet aposta no lado 2 (outcome_two)
-            # 2) Polymarket aposta no lado 2 (sx_two) vs SX Bet aposta no lado 1 (outcome_one)
             pares = [
                 ("sx_one", "outcome_two", sx_m["outcome_two"]),
                 ("sx_two", "outcome_one", sx_m["outcome_one"])
@@ -712,7 +740,6 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 if lucro_pct < MIN_PROFIT_PCT:
                     continue
 
-                # Calcula banca ajustada a liquidez disponivel nos dois livros de ordens
                 prop_poly = (1.0 / odd_poly) / soma_prob
                 prop_sx = (1.0 / odd_sx) / soma_prob
 
@@ -760,7 +787,7 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
 # ============================================================
 
 def ciclo_scanner():
-    logger.info("A iniciar scanner Web3 V5 (Polymarket x SX Bet | MIN_PROFIT = %s%%).", MIN_PROFIT_PCT)
+    logger.info("A iniciar scanner Web3 V5.1 (Polymarket x SX Bet | MIN_PROFIT = %s%%).", MIN_PROFIT_PCT)
 
     stats = {
         "jogos_casados": 0,
@@ -770,13 +797,10 @@ def ciclo_scanner():
     jogos_poly = obter_jogos_polymarket()
     mercados_sx = obter_mercados_sx()
 
-    # Filtra previamente mercados da SX Bet cujas equipas existem na Polymarket
-    mercados_relevantes = []
-    for sx_m in mercados_sx:
-        for jp in jogos_poly:
-            if equipas_coincidem(sx_m["team_one"], jp["title"]) and equipas_coincidem(sx_m["team_two"], jp["title"]):
-                mercados_relevantes.append(sx_m)
-                break
+    mercados_relevantes = [
+        sx_m for sx_m in mercados_sx
+        if any(jogo_coincide_com_titulo(sx_m["team_one"], sx_m["team_two"], jp["title"]) for jp in jogos_poly)
+    ]
 
     hashes_relevantes = [m["market_hash"] for m in mercados_relevantes]
     odds_sx = obter_melhores_odds_sx(hashes_relevantes) if hashes_relevantes else {}
@@ -832,7 +856,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         else:
             body = (
-                "ROBO ARBITRAGEM WEB3 V5 ONLINE\n"
+                "ROBO ARBITRAGEM WEB3 V5.1 ONLINE\n"
                 "Plataformas: Polymarket x SX Bet (USDC)\n"
                 "Mode: SCAN ONLY\n"
                 "Health: /health\n"
