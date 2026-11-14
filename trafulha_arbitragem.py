@@ -403,68 +403,81 @@ def parece_evento_desportivo(texto):
     return any(k in t for k in SPORT_KEYWORDS)
 
 
+
 def obter_preco_real_clob(token_id):
     """
-    Obtém o preço BUY e compara-o com o melhor ASK do livro.
-
-    Se as duas cotações forem diferentes, rejeita a oportunidade.
+    Obtém o melhor ASK real da Polymarket.
+    O ASK mais baixo representa o custo de comprar
+    imediatamente o token.
+    Não utiliza /price BUY como preço de compra.
     """
 
     try:
         book = http_get(
             f"{POLY_CLOB}/book",
             params={"token_id": token_id},
-            timeout=6
+            timeout=10
         )
 
         asks = book.get("asks", [])
 
         if not asks:
-            return None
-
-        asks_ordenados = sorted(
-            asks,
-            key=lambda x: float(x["price"])
-        )
-
-        melhor_ask = asks_ordenados[0]
-
-        book_price = float(melhor_ask["price"])
-        size = float(melhor_ask["size"])
-
-        # Consulta independente do preço BUY.
-        buy_quote = http_get(
-            f"{POLY_CLOB}/price",
-            params={
-                "token_id": token_id,
-                "side": "BUY"
-            },
-            timeout=6
-        )
-
-        api_buy_price = float(buy_quote["price"])
-
-        # Rejeitar se o preço BUY não coincidir com o livro.
-        if abs(api_buy_price - book_price) > 0.000001:
             logger.warning(
-                "Cotacao Polymarket instavel para token %s: "
-                "book=%.4f / BUY=%.4f",
-                token_id,
-                book_price,
-                api_buy_price
+                "Sem liquidez ASK para token %s",
+                token_id
             )
             return None
 
-        if 0.01 < api_buy_price < 0.99 and size > 0:
-            return {
-                "price": api_buy_price,
-                "size": size,
-                "liquidity_usd": size * api_buy_price,
-                "checked_at": datetime.now(timezone.utc).isoformat(),
-                "book_hash": book.get("hash")
-            }
+        asks_validos = []
 
-        return None
+        for nivel in asks:
+            try:
+                preco = float(nivel["price"])
+                quantidade = float(nivel["size"])
+
+                if 0 < preco < 1 and quantidade > 0:
+                    asks_validos.append({
+                        "price": preco,
+                        "size": quantidade
+                    })
+
+            except (ValueError, TypeError, KeyError):
+                continue
+
+        if not asks_validos:
+            return None
+
+        # Melhor preço de compra: ASK mais baixo.
+        melhor_ask = min(
+            asks_validos,
+            key=lambda x: x["price"]
+        )
+
+        book_price = melhor_ask["price"]
+        book_size = melhor_ask["size"]
+
+        resultado = {
+            "price": book_price,
+            "size": book_size,
+            "liquidity_usd": book_price * book_size,
+            "checked_at": datetime.now(
+                timezone.utc
+            ).isoformat(),
+            "book_hash": book.get("hash")
+        }
+
+        logger.info(
+            "POLY BUY ASK VALIDADO | Token: %s | "
+            "Preco: %.4f USDC (%.2f cents) | "
+            "Shares: %.4f | Liquidez: $%.2f",
+            token_id,
+            book_price,
+            book_price * 100,
+            book_size,
+            book_price * book_size
+        )
+
+        return resultado
 
     except (
         requests.RequestException,
@@ -473,12 +486,13 @@ def obter_preco_real_clob(token_id):
         ValueError
     ) as e:
 
-        logger.warning(
-            "Nao foi possivel validar a cotacao Polymarket: %s",
+        logger.error(
+            "Erro ao consultar livro Polymarket: %s",
             e
         )
 
         return None
+
 
 
 # ============================================================
