@@ -13,7 +13,7 @@ import requests
 
 
 # ============================================================
-# 1. CONFIGURACOES (PAPER TRADING V7.2 - CLOB PRICE FIX)
+# 1. CONFIGURACOES (PAPER TRADING V7.2 - RESET & CLOB EXACT)
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -44,17 +44,17 @@ SX_BASE = "https://api.sx.bet"
 
 
 # ============================================================
-# 2. LOGGING E ESTADO DA CARTEIRA DUPLA
+# 2. LOGGING E ESTADO DA CARTEIRA DUPLA (RESETADO)
 # ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("ArbitragePaperBotV72")
+logger = logging.getLogger("ArbitragePaperBotV72Reset")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "TrafulhaPaperBot/7.2"})
+session.headers.update({"User-Agent": "TrafulhaPaperBot/7.2-Reset"})
 if SX_API_KEY:
     session.headers.update({"x-sx-api-key": SX_API_KEY})
 
@@ -90,7 +90,7 @@ scanner_status = {
     "best_margin_pct": None,
     "opportunities": 0,
     "sx_odds_endpoint": None,
-    "mode": "WEB3_PAPER_TRADING_CLOB_EXACT_V7.2"
+    "mode": "WEB3_PAPER_TRADING_RESET_V7.2"
 }
 
 diagnostico_inicial_feito = False
@@ -316,7 +316,6 @@ def parece_evento_desportivo(texto):
 
 
 def obter_preco_real_clob(token_id):
-    """Lê diretamente o melhor preço de compra (ask) no order book oficial da Polymarket"""
     try:
         book = http_get(
             f"{POLY_CLOB}/book",
@@ -393,7 +392,6 @@ def obter_jogos_polymarket():
                 q_lower = str(m.get("question", "")).lower()
                 g_lower = str(m.get("groupItemTitle", "")).lower()
 
-                # Apenas mercado principal de vencedor
                 is_moneyline = any(w in q_lower for w in ["win the match", "winner", "vence", "vs"]) and not any(
                     w in f"{q_lower} {g_lower}" for w in ["spread", "over", "under", "total", "goals", "points", "handicap", "o/u", "half", "map", "set", "quarter"]
                 )
@@ -686,10 +684,6 @@ def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
         if len(outs) != 2 or len(tids) != 2:
             continue
 
-        out0_norm = normalizar_texto(outs[0])
-        out1_norm = normalizar_texto(outs[1])
-
-        # Mapeamento direto por nome da equipa na Polymarket vs SX Bet
         for idx, out_name in enumerate(outs):
             tid = tids[idx]
             if equipas_coincidem(out_name, team1) and not equipas_coincidem(out_name, team2):
@@ -765,7 +759,6 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 if opt_sx["liquidity_usdc"] < MIN_LIQUIDITY_USD:
                     continue
 
-                # CONSULTA EXATA AO ORDER BOOK CLOB DA POLYMARKET
                 ask = obter_preco_real_clob(opt_p["token_id"])
                 if not ask:
                     continue
@@ -818,7 +811,7 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                     total_geral = poly_tot + sx_tot
 
                 mensagem = (
-                    "🛡️ [PAPER TRADING - CLOB EXATO V7.2]\n\n"
+                    "🛡️ [PAPER TRADING - RESET V7.2]\n\n"
                     f"Jogo: {team1} vs {team2}\n"
                     f"Competicao: {sx_m['sport']} - {sx_m['league']}\n"
                     f"Data e Hora: {formatar_data_pt(dt_sx or dt_poly)}\n\n"
@@ -864,7 +857,7 @@ def ciclo_scanner():
         banca_poly = paper_wallet["poly"]["available"]
         banca_sx = paper_wallet["sx"]["available"]
 
-    logger.info("A iniciar scanner Paper Trading V7.2 (Poly Disp: $%s | SX Disp: $%s).", banca_poly, banca_sx)
+    logger.info("A iniciar scanner Paper Trading Reset V7.2 (Poly Disp: $%s | SX Disp: $%s).", banca_poly, banca_sx)
 
     stats = {
         "jogos_casados": 0,
@@ -949,7 +942,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 s_disp = paper_wallet["sx"]["available"]
                 s_inv = paper_wallet["sx"]["invested"]
             body = (
-                "ROBO ARBITRAGEM PAPER TRADING V7.2 ONLINE (CLOB EXACT)\n"
+                "ROBO ARBITRAGEM PAPER TRADING V7.2 ONLINE (RESET)\n"
                 f"Polymarket Disp: ${p_disp:.2f} | Investido: ${p_inv:.2f}\n"
                 f"SX Bet Disp: ${s_disp:.2f} | Investido: ${s_inv:.2f}\n"
                 "Health / Wallet: /health\n"
@@ -975,7 +968,7 @@ def iniciar_servidor_web():
     server.serve_forever()
 
 
-if __name__ ==- "__main__":
+if __name__ == "__main__":
     if not TELEGRAM_TOKEN or not CHAT_ID:
         logger.warning("Telegram nao configurado.")
 
