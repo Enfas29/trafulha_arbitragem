@@ -13,7 +13,7 @@ import requests
 
 
 # ============================================================
-# 1. CONFIGURACOES (PAPER TRADING V8.5 - STRICT MARKET ID)
+#  1. CONFIGURACOES (PAPER TRADING V8.6 - EXACT PRICE SYNC)
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -45,14 +45,14 @@ SX_BASE = "https://api.sx.bet"
 
 
 # ============================================================
-# 2. LOGGING E ESTADO DA CARTEIRA DUPLA
+#  2. LOGGING E ESTADO DA CARTEIRA DUPLA
 # ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("ArbitragePaperBotV85")
+logger = logging.getLogger("ArbitragePaperBotV86")
 
 session = requests.Session()
 session.headers.update({
@@ -99,14 +99,14 @@ scanner_status = {
     "best_margin_pct": None,
     "opportunities": 0,
     "sx_odds_endpoint": None,
-    "mode": "WEB3_PAPER_TRADING_STRICT_ID_V8.5"
+    "mode": "WEB3_PAPER_TRADING_EXACT_SYNC_V8.6"
 }
 
 diagnostico_inicial_feito = False
 
 
 # ============================================================
-# 3. UTILITARIOS HTTP E NORMALIZACAO
+#  3. UTILITARIOS HTTP E NORMALIZACAO
 # ============================================================
 
 def http_get(url, params=None, timeout=20):
@@ -254,7 +254,7 @@ def formatar_data_pt(dt_obj):
 
 
 # ============================================================
-# 4. TELEGRAM E GESTAO DA CARTEIRA
+#  4. TELEGRAM E GESTAO DA CARTEIRA
 # ============================================================
 
 def enviar_alerta_telegram(mensagem):
@@ -306,7 +306,7 @@ def registar_aposta_virtual(m_hash, jogo_nome, stake_poly, stake_sx, lucro_esper
 
 
 # ============================================================
-# 5. POLYMARKET - LEITURA CLOB V8.5
+#  5. POLYMARKET - LEITURA CLOB V8.6 (COM LOG DE PERGUNTAS)
 # ============================================================
 
 SPORT_KEYWORDS = [
@@ -355,7 +355,7 @@ def obter_preco_real_clob(token_id):
 
 
 # ============================================================
-# 6. RECOLHA DE JOGOS E MERCADOS (COM FILTRO MONEYLINE RIGOROSO)
+#  6. RECOLHA DE JOGOS E MERCADOS (FILTRO DE MONEYLINE EXATO)
 # ============================================================
 
 def obter_jogos_polymarket():
@@ -411,12 +411,11 @@ def obter_jogos_polymarket():
                 q_lower = str(m.get("question", "")).lower()
                 g_lower = str(m.get("groupItemTitle", "")).lower()
 
-                # FILTRO RIGOROSO: Garantir que é o mercado vencedor principal (Moneyline/Winner)
-                is_moneyline = any(w in q_lower for w in ["win the match", "winner", "vence", "vs"]) and not any(
-                    w in f"{q_lower} {g_lower}" for w in ["spread", "over", "under", "total", "goals", "points", "handicap", "o/u", "half", "map", "set", "quarter", "corners", "cards", "winner of"]
+                # FILTRO EXTREMO: Apenas aceitar mercados cujo título/pergunta indique claramente vencedor da partida principal
+                is_moneyline = any(w in q_lower for w in ["win the match", "winner", "vence", "moneyline", "match winner"]) or (
+                    " vs " in q_lower and not any(w in q_lower for w in ["spread", "over", "under", "total", "handicap", "map", "set", "quarter", "half", "period"])
                 )
-                
-                # Se houver múltiplos mercados mas nenhum for claramente o moneyline principal, rejeita secundários
+
                 if not is_moneyline and len(mercados_ev) > 1:
                     continue
 
@@ -518,7 +517,7 @@ def obter_mercados_sx():
 
 
 # ============================================================
-# 7. LEITURA DAS ODDS SX BET
+#  7. LEITURA DAS ODDS SX BET
 # ============================================================
 
 def _extrair_niveis_lado_obv3(lado_raw):
@@ -693,7 +692,7 @@ def obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=False):
 
 
 # ============================================================
-# 8. MAPEAMENTO E CRUZAMENTO
+#  8. MAPEAMENTO E CRUZAMENTO
 # ============================================================
 
 def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
@@ -710,15 +709,15 @@ def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
         for idx, out_name in enumerate(outs):
             tid = tids[idx]
             if equipas_coincidem(out_name, team1) and not equipas_coincidem(out_name, team2):
-                opcoes["sx_one"] = {"token_id": tid, "label": f"{team1} (Yes)"}
+                opcoes["sx_one"] = {"token_id": tid, "label": f"{team1} (Yes)", "question": m.get("question", "")}
             elif equipas_coincidem(out_name, team2) and not equipas_coincidem(out_name, team1):
-                opcoes["sx_two"] = {"token_id": tid, "label": f"{team2} (Yes)"}
+                opcoes["sx_two"] = {"token_id": tid, "label": f"{team2} (Yes)", "question": m.get("question", "")}
 
     return opcoes
 
 
 # ============================================================
-# 9. ANALISE DE ARBITRAGEM V8.5
+#  9. ANALISE DE ARBITRAGEM V8.6
 # ============================================================
 
 def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
@@ -780,9 +779,12 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
 
                 preco_bruto_poly = ask["price"]
                 
-                # FILTRO DE SANIDADE: Rejeitar preços absurdos abaixo de 0.05 ou acima de 0.95 se forem margens falsas
                 if not (0.01 < preco_bruto_poly < 0.99):
                     continue
+
+                # LOG DE DIAGNÓSTICO PARA VERIFICAR A PERGUNTA E PREÇO LIDO
+                logger.info("POLY CHECK | Jogo: %s vs %s | Pergunta: %s | Token ID: %s | Preço CLOB: %.2f¢",
+                            team1, team2, opt_p['question'], opt_p['token_id'], preco_bruto_poly * 100)
 
                 odd_bruta_poly = 1.0 / preco_bruto_poly
                 odd_bruta_sx = opt_sx["odd"]
@@ -837,8 +839,9 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 )
 
                 mensagem = (
-                    "🛡️ [PAPER TRADING - STRICT ID V8.5]\n\n"
+                    "🛡️ [PAPER TRADING - EXACT SYNC V8.6]\n\n"
                     f"Jogo: {team1} vs {team2}\n"
+                    f"Mercado Poly: {opt_p['question']}\n"
                     f"Competicao: {sx_m['sport']} - {sx_m['league']}\n"
                     f"Data e Hora: {formatar_data_pt(dt_sx or dt_poly)}\n\n"
                     "Lado 1 (Polymarket - USDC):\n"
@@ -871,7 +874,7 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
 
 
 # ============================================================
-# 10. CICLO PRINCIPAL DO SCANNER
+#  10. CICLO PRINCIPAL DO SCANNER
 # ============================================================
 
 def ciclo_scanner():
@@ -880,7 +883,7 @@ def ciclo_scanner():
         banca_poly = paper_wallet["poly"]["available"]
         banca_sx = paper_wallet["sx"]["available"]
 
-    logger.info("A iniciar scanner Paper Trading V8.5 (Poly Disp: $%.2f | SX Disp: $%.2f).", banca_poly, banca_sx)
+    logger.info("A iniciar scanner Paper Trading V8.6 (Poly Disp: $%.2f | SX Disp: $%.2f).", banca_poly, banca_sx)
 
     stats = {"jogos_casados": 0, "melhor_margem": None}
     jogos_poly = obter_jogos_polymarket()
@@ -933,7 +936,7 @@ def correr_robo_continuo():
 
 
 # ============================================================
-# 11. SERVIDOR WEB RENDER
+#  11. SERVIDOR WEB RENDER
 # ============================================================
 
 class SimpleHandler(BaseHTTPRequestHandler):
@@ -957,7 +960,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 s_disp = paper_wallet["sx"]["available"]
                 s_inv = paper_wallet["sx"]["invested"]
             body = (
-                "ROBO ARBITRAGEM PAPER TRADING V8.5 ONLINE (STRICT ID)\n"
+                "ROBO ARBITRAGEM PAPER TRADING V8.6 ONLINE (EXACT SYNC)\n"
                 f"Polymarket Disp: ${p_disp:.2f} | Investido: ${p_inv:.2f}\n"
                 f"SX Bet Disp: ${s_disp:.2f} | Investido: ${s_inv:.2f}\n"
                 "Health / Wallet: /health\n"
