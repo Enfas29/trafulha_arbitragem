@@ -13,7 +13,7 @@ import requests
 
 
 # ============================================================
-# 1. CONFIGURACOES (PAPER TRADING V8.3)
+# 1. CONFIGURACOES (PAPER TRADING V8.4 - CLEAN DIRECT CLOB)
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -26,7 +26,7 @@ PAPER_INITIAL_BANKROLL_SX = float(os.getenv("PAPER_INITIAL_BANKROLL_SX", "1000")
 PAPER_STAKE_USD = float(os.getenv("PAPER_STAKE_USD", "100"))
 
 MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.5"))
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "20"))
 
 MIN_POLY_VOLUME = float(os.getenv("MIN_POLY_VOLUME", "1000"))
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "15"))
@@ -52,11 +52,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-
-logger = logging.getLogger("ArbitragePaperBotV83")
+logger = logging.getLogger("ArbitragePaperBotV84")
 
 session = requests.Session()
-
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     "Cache-Control": "no-store, no-cache, must-revalidate",
@@ -101,7 +99,7 @@ scanner_status = {
     "best_margin_pct": None,
     "opportunities": 0,
     "sx_odds_endpoint": None,
-    "mode": "WEB3_PAPER_TRADING_PRICE_RECHECK_V8.3"
+    "mode": "WEB3_PAPER_TRADING_CLEAN_DIRECT_V8.4"
 }
 
 diagnostico_inicial_feito = False
@@ -112,11 +110,7 @@ diagnostico_inicial_feito = False
 # ============================================================
 
 def http_get(url, params=None, timeout=20):
-    response = session.get(
-        url,
-        params=params,
-        timeout=timeout
-    )
+    response = session.get(url, params=params, timeout=timeout)
     response.raise_for_status()
     return response.json()
 
@@ -127,19 +121,14 @@ def converter_lista(valor):
             return json.loads(valor)
         except json.JSONDecodeError:
             return []
-
     if isinstance(valor, list):
         return valor
-
     return []
 
 
 def remover_acentos(texto):
     nfkd = unicodedata.normalize("NFKD", str(texto))
-    return "".join(
-        c for c in nfkd
-        if not unicodedata.combining(c)
-    )
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
 STOPWORDS_EQUIPAS = {
@@ -147,7 +136,6 @@ STOPWORDS_EQUIPAS = {
     "club", "clube", "sporting", "de", "do", "da", "dos", "das", "the",
     "united", "city", "real", "atletico", "athletic", "saint", "st"
 }
-
 
 ALIASES_EQUIPAS = {
     "sporting lisbon": "sporting cp",
@@ -204,7 +192,7 @@ ALIASES_EQUIPAS = {
 
 
 def normalizar_texto(nome):
-    txt = remover_acentos(nome).lower().strip()
+    txt = remover_acentos(str(nome)).lower().strip()
     txt = re.sub(r"[^a-z0-9\s]", " ", txt)
     txt = " ".join(txt.split())
     return ALIASES_EQUIPAS.get(txt, txt)
@@ -212,87 +200,49 @@ def normalizar_texto(nome):
 
 def tokens_relevantes(nome):
     norm = normalizar_texto(nome)
-
-    tokens = [
-        t for t in norm.split()
-        if t not in STOPWORDS_EQUIPAS and len(t) > 1
-    ]
-
+    tokens = [t for t in norm.split() if t not in STOPWORDS_EQUIPAS and len(t) > 1]
     return set(tokens) if tokens else set(norm.split())
 
 
 def equipas_coincidem(nome_a, nome_b):
     norm_a = normalizar_texto(nome_a)
     norm_b = normalizar_texto(nome_b)
-
     if not norm_a or not norm_b:
         return False
-
     if norm_a == norm_b:
         return True
-
     if len(norm_a) >= 4 and len(norm_b) >= 4:
         if norm_a in norm_b or norm_b in norm_a:
             return True
-
     tok_a = tokens_relevantes(norm_a)
     tok_b = tokens_relevantes(norm_b)
-
     if not tok_a or not tok_b:
         return False
-
     intersecao = tok_a.intersection(tok_b)
-
     return len(intersecao) >= min(len(tok_a), len(tok_b))
 
 
 def jogo_coincide_com_titulo(team1, team2, titulo_poly):
-    partes = re.split(
-        r"\s+(?:vs\.?|v\.?|@)\s+",
-        str(titulo_poly),
-        maxsplit=1,
-        flags=re.IGNORECASE
-    )
-
+    partes = re.split(r"\s+(?:vs\.?|v\.?|@)\s+", str(titulo_poly), maxsplit=1, flags=re.IGNORECASE)
     if len(partes) == 2:
         lado_a, lado_b = partes[0], partes[1]
-
-        direto = (
-            equipas_coincidem(team1, lado_a)
-            and equipas_coincidem(team2, lado_b)
-        )
-
-        invertido = (
-            equipas_coincidem(team1, lado_b)
-            and equipas_coincidem(team2, lado_a)
-        )
-
+        direto = equipas_coincidem(team1, lado_a) and equipas_coincidem(team2, lado_b)
+        invertido = equipas_coincidem(team1, lado_b) and equipas_coincidem(team2, lado_a)
         if direto or invertido:
             return True
-
-    return (
-        equipas_coincidem(team1, titulo_poly)
-        and equipas_coincidem(team2, titulo_poly)
-    )
+    return equipas_coincidem(team1, titulo_poly) and equipas_coincidem(team2, titulo_poly)
 
 
 def parse_timestamp_utc(valor):
     if not valor:
         return None
-
     if isinstance(valor, (int, float)):
         try:
-            return datetime.fromtimestamp(
-                float(valor),
-                tz=timezone.utc
-            )
+            return datetime.fromtimestamp(float(valor), tz=timezone.utc)
         except (ValueError, OSError):
             return None
-
     try:
-        return datetime.fromisoformat(
-            str(valor).replace("Z", "+00:00")
-        )
+        return datetime.fromisoformat(str(valor).replace("Z", "+00:00"))
     except ValueError:
         return None
 
@@ -300,7 +250,6 @@ def parse_timestamp_utc(valor):
 def formatar_data_pt(dt_obj):
     if not dt_obj:
         return "Data por confirmar"
-
     return dt_obj.strftime("%d/%m/%Y as %H:%M UTC")
 
 
@@ -313,11 +262,7 @@ def enviar_alerta_telegram(mensagem):
         logger.warning("Telegram nao configurado.")
         return False
 
-    url = (
-        f"https://api.telegram.org/bot"
-        f"{TELEGRAM_TOKEN}/sendMessage"
-    )
-
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
         "text": mensagem,
@@ -325,35 +270,18 @@ def enviar_alerta_telegram(mensagem):
     }
 
     try:
-        response = session.post(
-            url,
-            json=payload,
-            timeout=15
-        )
-
+        response = session.post(url, json=payload, timeout=15)
         if not response.ok:
-            logger.error(
-                "Falha Telegram (%s): %s",
-                response.status_code,
-                response.text
-            )
+            logger.error("Falha Telegram (%s): %s", response.status_code, response.text)
             return False
-
         logger.info("Alerta enviado para Telegram!")
         return True
-
     except requests.RequestException as e:
         logger.error("Erro de rede Telegram: %s", e)
         return False
 
 
-def registar_aposta_virtual(
-    m_hash,
-    jogo_nome,
-    stake_poly,
-    stake_sx,
-    lucro_esperado
-):
+def registar_aposta_virtual(m_hash, jogo_nome, stake_poly, stake_sx, lucro_esperado):
     with wallet_lock:
         paper_wallet["apostas_realizadas_hashes"].add(m_hash)
         paper_wallet["bets_placed"] += 1
@@ -372,21 +300,13 @@ def registar_aposta_virtual(
             "stake_sx": stake_sx,
             "expected_profit": lucro_esperado
         }
-
         paper_wallet["history"].append(registo)
-
-        logger.info(
-            "PAPER TRADING | Aposta #%s registada para %s | "
-            "Investido Poly: $%.2f | Investido SX: $%.2f",
-            registo["id"],
-            jogo_nome,
-            stake_poly,
-            stake_sx
-        )
+        logger.info("PAPER TRADING | Aposta #%s registada para %s | Investido Poly: $%.2f | Investido SX: $%.2f",
+                    registo["id"], jogo_nome, stake_poly, stake_sx)
 
 
 # ============================================================
-# 5. POLYMARKET - VALIDACAO DO PRECO BUY V8.3
+# 5. POLYMARKET - LEITURA DIRETA DO CLOB V8.4
 # ============================================================
 
 SPORT_KEYWORDS = [
@@ -403,96 +323,39 @@ def parece_evento_desportivo(texto):
     return any(k in t for k in SPORT_KEYWORDS)
 
 
-
 def obter_preco_real_clob(token_id):
-    """
-    Obtém o melhor ASK real da Polymarket.
-    O ASK mais baixo representa o custo de comprar
-    imediatamente o token.
-    Não utiliza /price BUY como preço de compra.
-    """
-
+    """Obtém o melhor ASK instantâneo do CLOB da Polymarket com precisão total."""
     try:
-        book = http_get(
-            f"{POLY_CLOB}/book",
-            params={"token_id": token_id},
-            timeout=10
-        )
-
+        book = http_get(f"{POLY_CLOB}/book", params={"token_id": token_id}, timeout=8)
         asks = book.get("asks", [])
-
         if not asks:
-            logger.warning(
-                "Sem liquidez ASK para token %s",
-                token_id
-            )
             return None
 
         asks_validos = []
-
         for nivel in asks:
             try:
                 preco = float(nivel["price"])
                 quantidade = float(nivel["size"])
-
                 if 0 < preco < 1 and quantidade > 0:
-                    asks_validos.append({
-                        "price": preco,
-                        "size": quantidade
-                    })
-
+                    asks_validos.append({"price": preco, "size": quantidade})
             except (ValueError, TypeError, KeyError):
                 continue
 
         if not asks_validos:
             return None
 
-        # Melhor preço de compra: ASK mais baixo.
-        melhor_ask = min(
-            asks_validos,
-            key=lambda x: x["price"]
-        )
-
+        melhor_ask = min(asks_validos, key=lambda x: x["price"])
         book_price = melhor_ask["price"]
         book_size = melhor_ask["size"]
 
-        resultado = {
+        return {
             "price": book_price,
             "size": book_size,
             "liquidity_usd": book_price * book_size,
-            "checked_at": datetime.now(
-                timezone.utc
-            ).isoformat(),
-            "book_hash": book.get("hash")
+            "checked_at": datetime.now(timezone.utc).isoformat()
         }
-
-        logger.info(
-            "POLY BUY ASK VALIDADO | Token: %s | "
-            "Preco: %.4f USDC (%.2f cents) | "
-            "Shares: %.4f | Liquidez: $%.2f",
-            token_id,
-            book_price,
-            book_price * 100,
-            book_size,
-            book_price * book_size
-        )
-
-        return resultado
-
-    except (
-        requests.RequestException,
-        KeyError,
-        TypeError,
-        ValueError
-    ) as e:
-
-        logger.error(
-            "Erro ao consultar livro Polymarket: %s",
-            e
-        )
-
+    except Exception:
         return None
-
 
 
 # ============================================================
@@ -504,7 +367,6 @@ def obter_jogos_polymarket():
     vistos = set()
 
     for page in range(MAX_POLY_PAGES):
-
         try:
             eventos = http_get(
                 f"{POLY_GAMMA}/events",
@@ -518,104 +380,58 @@ def obter_jogos_polymarket():
                 },
                 timeout=20
             )
-
         except requests.RequestException as e:
-            logger.error(
-                "Erro ao ler eventos Polymarket: %s",
-                e
-            )
+            logger.error("Erro ao ler eventos Polymarket: %s", e)
             break
 
         if not eventos:
             break
 
         for ev in eventos:
-
             ev_id = str(ev.get("id", ""))
-
             if ev_id in vistos:
                 continue
-
             vistos.add(ev_id)
 
             titulo = ev.get("title", "")
             descricao = ev.get("description", "")
-
-            if not parece_evento_desportivo(
-                f"{titulo} {descricao}"
-            ):
+            if not parece_evento_desportivo(f"{titulo} {descricao}"):
                 continue
 
             try:
-                ev_volume = float(
-                    ev.get("volume", 0) or 0
-                )
+                ev_volume = float(ev.get("volume", 0) or 0)
             except (ValueError, TypeError):
                 ev_volume = 0
 
             mercados_ev = ev.get("markets", [])
-
             if not mercados_ev:
                 continue
 
             submercados = []
-
             for m in mercados_ev:
-
                 if m.get("closed") is True or m.get("active") is False:
                     continue
 
-                q_lower = str(
-                    m.get("question", "")
-                ).lower()
+                q_lower = str(m.get("question", "")).lower()
+                g_lower = str(m.get("groupItemTitle", "")).lower()
 
-                g_lower = str(
-                    m.get("groupItemTitle", "")
-                ).lower()
-
-                is_moneyline = (
-                    any(
-                        w in q_lower
-                        for w in [
-                            "win the match",
-                            "winner",
-                            "vence",
-                            "vs"
-                        ]
-                    )
-                    and not any(
-                        w in f"{q_lower} {g_lower}"
-                        for w in [
-                            "spread", "over", "under", "total",
-                            "goals", "points", "handicap", "o/u",
-                            "half", "map", "set", "quarter",
-                            "corners", "cards"
-                        ]
-                    )
+                is_moneyline = any(w in q_lower for w in ["win the match", "winner", "vence", "vs"]) and not any(
+                    w in f"{q_lower} {g_lower}" for w in ["spread", "over", "under", "total", "goals", "points", "handicap", "o/u", "half", "map", "set", "quarter", "corners", "cards"]
                 )
-
                 if not is_moneyline and len(mercados_ev) > 1:
                     continue
 
                 try:
-                    m_vol = float(
-                        m.get("volume", 0) or 0
-                    )
+                    m_vol = float(m.get("volume", 0) or 0)
                 except (ValueError, TypeError):
                     m_vol = 0
 
                 volume_efetivo = max(ev_volume, m_vol)
-
                 if volume_efetivo < MIN_POLY_VOLUME:
                     continue
 
-                outcomes = converter_lista(
-                    m.get("outcomes")
-                )
-
-                token_ids = converter_lista(
-                    m.get("clobTokenIds")
-                )
+                outcomes = converter_lista(m.get("outcomes"))
+                token_ids = converter_lista(m.get("clobTokenIds"))
 
                 if len(outcomes) != 2 or len(token_ids) != 2:
                     continue
@@ -630,14 +446,11 @@ def obter_jogos_polymarket():
                 })
 
             if submercados:
-
                 jogos_poly.append({
                     "event_id": ev_id,
                     "title": titulo,
                     "slug": ev.get("slug", ""),
-                    "end_date": parse_timestamp_utc(
-                        ev.get("endDate") or ev.get("startDate")
-                    ),
+                    "end_date": parse_timestamp_utc(ev.get("endDate") or ev.get("startDate")),
                     "volume": ev_volume,
                     "markets": submercados
                 })
@@ -653,62 +466,41 @@ def obter_mercados_sx():
     next_key = None
 
     for _ in range(8):
-
         params = {"onlyMainLine": "true"}
-
         if next_key:
             params["paginationKey"] = next_key
 
         try:
-            resp = http_get(
-                f"{SX_BASE}/markets/active",
-                params=params,
-                timeout=20
-            )
-
+            resp = http_get(f"{SX_BASE}/markets/active", params=params, timeout=20)
         except requests.RequestException as e:
-            logger.error(
-                "Erro ao ler mercados SX: %s",
-                e
-            )
+            logger.error("Erro ao ler mercados SX: %s", e)
             break
 
         data = resp.get("data", {})
         lista = data.get("markets", [])
-
         if not lista:
             break
 
         for m in lista:
-
             if m.get("status") != "ACTIVE":
                 continue
 
             m_type = m.get("type")
-
             if m_type not in (1, 52, 226):
                 continue
 
             team1 = m.get("teamOneName", "")
             team2 = m.get("teamTwoName", "")
-
             out1 = m.get("outcomeOneName", "")
             out2 = m.get("outcomeTwoName", "")
-
             m_hash = m.get("marketHash", "")
 
-            if not (
-                team1 and team2 and out1 and out2 and m_hash
-            ):
+            if not (team1 and team2 and out1 and out2 and m_hash):
                 continue
 
             mercados.append({
                 "market_hash": m_hash,
-                "event_id": str(
-                    m.get("sportXeventId")
-                    or m.get("eventId")
-                    or ""
-                ),
+                "event_id": str(m.get("sportXeventId") or m.get("eventId") or ""),
                 "type": m_type,
                 "team_one": team1,
                 "team_two": team2,
@@ -716,24 +508,21 @@ def obter_mercados_sx():
                 "outcome_two": out2,
                 "sport": m.get("sportLabel", ""),
                 "league": m.get("leagueLabel", ""),
-                "game_time": parse_timestamp_utc(
-                    m.get("gameTime")
-                )
+                "game_time": parse_timestamp_utc(m.get("gameTime"))
             })
 
         next_key = data.get("nextKey")
-
         if not next_key:
             break
 
     return mercados
+
 
 # ============================================================
 # 7. LEITURA DAS ODDS SX BET
 # ============================================================
 
 def _extrair_niveis_lado_obv3(lado_raw):
-
     if isinstance(lado_raw, dict):
         itens = [lado_raw]
     elif isinstance(lado_raw, list):
@@ -742,106 +531,59 @@ def _extrair_niveis_lado_obv3(lado_raw):
         return []
 
     niveis_taker = []
-
-    fator_taxa_sx = (
-        1.0 - (SX_FEE_BUFFER_PCT / 100.0)
-    )
+    fator_taxa_sx = 1.0 - (SX_FEE_BUFFER_PCT / 100.0)
 
     for item in itens:
-
         if not isinstance(item, dict):
             continue
 
         raw_odds = item.get("percentageOdds")
-
-        raw_size = (
-            item.get("size")
-            if item.get("size") is not None
-            else item.get("totalBetSize")
-        )
-
+        raw_size = item.get("size") if item.get("size") is not None else item.get("totalBetSize")
         if raw_odds is None or raw_size is None:
             continue
 
         try:
             maker_prob = float(raw_odds) / 1e20
             maker_stake_usdc = float(raw_size) / 1e6
-
         except (ValueError, TypeError):
             continue
 
-        if not (0.01 < maker_prob < 0.99):
-            continue
-
-        if maker_stake_usdc <= 0:
+        if not (0.01 < maker_prob < 0.99) or maker_stake_usdc <= 0:
             continue
 
         taker_prob = 1.0 - maker_prob
-
         taker_odd_bruta = 1.0 / taker_prob
-
-        taker_odd = (
-            1.0
-            + (taker_odd_bruta - 1.0) * fator_taxa_sx
-        )
-
-        taker_liq_usdc = (
-            maker_stake_usdc
-            * (taker_prob / maker_prob)
-        )
+        taker_odd = 1.0 + (taker_odd_bruta - 1.0) * fator_taxa_sx
+        taker_liq_usdc = maker_stake_usdc * (taker_prob / maker_prob)
 
         if taker_liq_usdc > 0:
-
             niveis_taker.append({
                 "odd": taker_odd,
                 "liquidity_usdc": taker_liq_usdc
             })
 
-    niveis_taker.sort(
-        key=lambda x: x["odd"],
-        reverse=True
-    )
-
+    niveis_taker.sort(key=lambda x: x["odd"], reverse=True)
     return niveis_taker
 
 
-def _registar_livro_mercado_obv3(
-    m_hash,
-    bloco,
-    melhores_por_mercado
-):
-
+def _registar_livro_mercado_obv3(m_hash, bloco, melhores_por_mercado):
     if not m_hash or not isinstance(bloco, dict):
         return
 
-    niveis_para_out2 = _extrair_niveis_lado_obv3(
-        bloco.get("outcomeOne")
-    )
-
-    niveis_para_out1 = _extrair_niveis_lado_obv3(
-        bloco.get("outcomeTwo")
-    )
+    niveis_para_out2 = _extrair_niveis_lado_obv3(bloco.get("outcomeOne"))
+    niveis_para_out1 = _extrair_niveis_lado_obv3(bloco.get("outcomeTwo"))
 
     if not niveis_para_out1 and not niveis_para_out2:
         return
 
-    lados = melhores_por_mercado.setdefault(
-        m_hash,
-        {}
-    )
+    lados = melhores_por_mercado.setdefault(m_hash, {})
 
     if niveis_para_out1:
-
         melhor_1 = niveis_para_out1[0]
-
         liq_topo_1 = sum(
-            n["liquidity_usdc"]
-            for n in niveis_para_out1
-            if abs(
-                n["odd"] - melhor_1["odd"]
-            ) < 0.002
+            n["liquidity_usdc"] for n in niveis_para_out1
+            if abs(n["odd"] - melhor_1["odd"]) < 0.002
         )
-
         lados["outcome_one"] = {
             "odd": melhor_1["odd"],
             "liquidity_usdc": liq_topo_1,
@@ -849,17 +591,11 @@ def _registar_livro_mercado_obv3(
         }
 
     if niveis_para_out2:
-
         melhor_2 = niveis_para_out2[0]
-
         liq_topo_2 = sum(
-            n["liquidity_usdc"]
-            for n in niveis_para_out2
-            if abs(
-                n["odd"] - melhor_2["odd"]
-            ) < 0.002
+            n["liquidity_usdc"] for n in niveis_para_out2
+            if abs(n["odd"] - melhor_2["odd"]) < 0.002
         )
-
         lados["outcome_two"] = {
             "odd": melhor_2["odd"],
             "liquidity_usdc": liq_topo_2,
@@ -867,230 +603,92 @@ def _registar_livro_mercado_obv3(
         }
 
 
-def _parsear_payload_obv3(
-    data,
-    melhores_por_mercado,
-    m_hash_fallback=None
-):
-
+def _parsear_payload_obv3(data, melhores_por_mercado, m_hash_fallback=None):
     if isinstance(data, list):
-
         for item in data:
-
             if isinstance(item, dict):
-
-                mh = (
-                    item.get("marketHash")
-                    or m_hash_fallback
-                )
-
-                _registar_livro_mercado_obv3(
-                    mh,
-                    item,
-                    melhores_por_mercado
-                )
-
+                mh = item.get("marketHash") or m_hash_fallback
+                _registar_livro_mercado_obv3(mh, item, melhores_por_mercado)
         return
 
     if not isinstance(data, dict):
         return
 
     if "outcomeOne" in data or "outcomeTwo" in data:
-
-        mh = (
-            data.get("marketHash")
-            or m_hash_fallback
-        )
-
-        _registar_livro_mercado_obv3(
-            mh,
-            data,
-            melhores_por_mercado
-        )
-
+        mh = data.get("marketHash") or m_hash_fallback
+        _registar_livro_mercado_obv3(mh, data, melhores_por_mercado)
         return
 
     for k, v in data.items():
-
-        if isinstance(v, dict) and (
-            "outcomeOne" in v
-            or "outcomeTwo" in v
-        ):
-
-            mh = (
-                v.get("marketHash")
-                or (
-                    k
-                    if str(k).startswith("0x")
-                    else m_hash_fallback
-                )
-            )
-
-            _registar_livro_mercado_obv3(
-                mh,
-                v,
-                melhores_por_mercado
-            )
+        if isinstance(v, dict) and ("outcomeOne" in v or "outcomeTwo" in v):
+            mh = v.get("marketHash") or (k if str(k).startswith("0x") else m_hash_fallback)
+            _registar_livro_mercado_obv3(mh, v, melhores_por_mercado)
 
 
-def obter_melhores_odds_sx(
-    mercados_relevantes,
-    log_diagnostico=False
-):
-
+def obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=False):
     melhores_por_mercado = {}
-
     if not mercados_relevantes:
         return melhores_por_mercado
 
-    hashes_unicos = list(
-        dict.fromkeys(
-            m["market_hash"]
-            for m in mercados_relevantes
-        )
-    )
-
+    hashes_unicos = list(dict.fromkeys(m["market_hash"] for m in mercados_relevantes))
     rota_usada = None
     diag_msg = None
 
     for i in range(0, len(hashes_unicos), 50):
-
         lote = hashes_unicos[i:i + 50]
-
         try:
-
             resp = session.get(
                 f"{SX_BASE}/orders-v3/odds/best",
-                params={
-                    "marketHashes": ",".join(lote)
-                },
+                params={"marketHashes": ",".join(lote)},
                 timeout=20
             )
-
             if resp.status_code == 400:
-
                 resp = session.get(
                     f"{SX_BASE}/orders-v3/odds/best",
-                    params=[
-                        ("marketHashes", h)
-                        for h in lote
-                    ],
+                    params=[("marketHashes", h) for h in lote],
                     timeout=20
                 )
 
             if resp.ok:
-
                 payload = resp.json()
-
-                data = (
-                    payload.get("data", payload)
-                    if isinstance(payload, dict)
-                    else payload
-                )
-
-                _parsear_payload_obv3(
-                    data,
-                    melhores_por_mercado
-                )
-
+                data = payload.get("data", payload) if isinstance(payload, dict) else payload
+                _parsear_payload_obv3(data, melhores_por_mercado)
                 rota_usada = "/orders-v3/odds/best"
-
                 if diag_msg is None:
-
-                    diag_msg = (
-                        "/orders-v3/odds/best -> HTTP 200: "
-                        + json.dumps(
-                            data,
-                            ensure_ascii=False
-                        )[:260]
-                    )
-
+                    diag_msg = f"/orders-v3/odds/best -> HTTP 200: {json.dumps(data, ensure_ascii=False)[:260]}"
             elif diag_msg is None:
-
-                diag_msg = (
-                    f"/orders-v3/odds/best -> "
-                    f"HTTP {resp.status_code}: "
-                    f"{resp.text[:160]}"
-                )
-
+                diag_msg = f"/orders-v3/odds/best -> HTTP {resp.status_code}: {resp.text[:160]}"
         except Exception as e:
-
             if diag_msg is None:
-                diag_msg = (
-                    f"/orders-v3/odds/best -> ERR: {e}"
-                )
+                diag_msg = f"/orders-v3/odds/best -> ERR: {e}"
 
     if not melhores_por_mercado:
-
         for m_hash in hashes_unicos[:40]:
-
             try:
-
                 resp = session.get(
                     f"{SX_BASE}/orderbook-v3/snapshot/market",
-                    params={
-                        "marketHash": m_hash
-                    },
+                    params={"marketHash": m_hash},
                     timeout=12
                 )
-
                 if resp.ok:
-
                     payload = resp.json()
-
-                    data = (
-                        payload.get("data", payload)
-                        if isinstance(payload, dict)
-                        else payload
-                    )
-
-                    _parsear_payload_obv3(
-                        data,
-                        melhores_por_mercado,
-                        m_hash_fallback=m_hash
-                    )
-
+                    data = payload.get("data", payload) if isinstance(payload, dict) else payload
+                    _parsear_payload_obv3(data, melhores_por_mercado, m_hash_fallback=m_hash)
                     if rota_usada is None:
-                        rota_usada = (
-                            "/orderbook-v3/snapshot/market"
-                        )
-
-                    if (
-                        diag_msg is None
-                        or "HTTP 200" not in diag_msg
-                    ):
-
-                        diag_msg = (
-                            "/orderbook-v3/snapshot/market "
-                            "-> HTTP 200: "
-                            + json.dumps(
-                                data,
-                                ensure_ascii=False
-                            )[:260]
-                        )
-
+                        rota_usada = "/orderbook-v3/snapshot/market"
+                    if diag_msg is None or "HTTP 200" not in diag_msg:
+                        diag_msg = f"/orderbook-v3/snapshot/market -> HTTP 200: {json.dumps(data, ensure_ascii=False)[:260]}"
                 elif diag_msg is None:
-
-                    diag_msg = (
-                        "/orderbook-v3/snapshot/market "
-                        f"-> HTTP {resp.status_code}: "
-                        f"{resp.text[:160]}"
-                    )
-
+                    diag_msg = f"/orderbook-v3/snapshot/market -> HTTP {resp.status_code}: {resp.text[:160]}"
             except Exception:
                 continue
 
     if rota_usada:
-
         with state_lock:
             scanner_status["sx_odds_endpoint"] = rota_usada
 
     if log_diagnostico and diag_msg:
-
-        logger.info(
-            "Diagnostico SX OBv3 | %s",
-            diag_msg
-        )
+        logger.info("Diagnostico SX OBv3 | %s", diag_msg)
 
     return melhores_por_mercado
 
@@ -1099,319 +697,134 @@ def obter_melhores_odds_sx(
 # 8. MAPEAMENTO E CRUZAMENTO
 # ============================================================
 
-def extrair_opcoes_poly_para_sx(
-    jogo_poly,
-    sx_market
-):
-
+def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
     team1 = sx_market["team_one"]
     team2 = sx_market["team_two"]
-
     opcoes = {}
 
     for m in jogo_poly["markets"]:
-
         outs = m["outcomes"]
         tids = m["token_ids"]
-
         if len(outs) != 2 or len(tids) != 2:
             continue
 
         for idx, out_name in enumerate(outs):
-
             tid = tids[idx]
-
-            if (
-                equipas_coincidem(out_name, team1)
-                and not equipas_coincidem(out_name, team2)
-            ):
-
-                opcoes["sx_one"] = {
-                    "token_id": tid,
-                    "label": f"{team1} (Yes)"
-                }
-
-            elif (
-                equipas_coincidem(out_name, team2)
-                and not equipas_coincidem(out_name, team1)
-            ):
-
-                opcoes["sx_two"] = {
-                    "token_id": tid,
-                    "label": f"{team2} (Yes)"
-                }
+            if equipas_coincidem(out_name, team1) and not equipas_coincidem(out_name, team2):
+                opcoes["sx_one"] = {"token_id": tid, "label": f"{team1} (Yes)"}
+            elif equipas_coincidem(out_name, team2) and not equipas_coincidem(out_name, team1):
+                opcoes["sx_two"] = {"token_id": tid, "label": f"{team2} (Yes)"}
 
     return opcoes
 
 
 # ============================================================
-# 9. ANALISE DE ARBITRAGEM COM REVALIDACAO FINAL
+# 9. ANALISE DE ARBITRAGEM V8.4
 # ============================================================
 
-def analisar_cruzamento_web3(
-    jogos_poly,
-    mercados_sx,
-    odds_sx,
-    stats
-):
-
+def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
     alertas_enviados = 0
-
-    fator_min = max(
-        0.5,
-        1.0 + (MIN_PROFIT_PCT / 100.0)
-    )
-
+    fator_min = max(0.5, 1.0 + (MIN_PROFIT_PCT / 100.0))
     max_soma_prob = 1.0 / fator_min
 
     for sx_m in mercados_sx:
-
         m_hash = sx_m["market_hash"]
-
         if m_hash not in odds_sx:
             continue
 
         with wallet_lock:
-
-            if m_hash in paper_wallet[
-                "apostas_realizadas_hashes"
-            ]:
+            if m_hash in paper_wallet["apostas_realizadas_hashes"]:
                 continue
 
         lados_sx = odds_sx[m_hash]
-
         team1 = sx_m["team_one"]
         team2 = sx_m["team_two"]
-
         dt_sx = sx_m["game_time"]
 
         for jogo_poly in jogos_poly:
-
-            if not jogo_coincide_com_titulo(
-                team1,
-                team2,
-                jogo_poly["title"]
-            ):
+            if not jogo_coincide_com_titulo(team1, team2, jogo_poly["title"]):
                 continue
 
             dt_poly = jogo_poly["end_date"]
-
             if dt_sx and dt_poly:
-
-                diff_horas = abs(
-                    (dt_poly - dt_sx).total_seconds()
-                ) / 3600.0
-
+                diff_horas = abs((dt_poly - dt_sx).total_seconds()) / 3600.0
                 if diff_horas > 96:
                     continue
 
-            opcoes_poly = extrair_opcoes_poly_para_sx(
-                jogo_poly,
-                sx_m
-            )
-
+            opcoes_poly = extrair_opcoes_poly_para_sx(jogo_poly, sx_m)
             if not opcoes_poly:
                 continue
 
             stats["jogos_casados"] += 1
 
             pares = [
-                (
-                    "sx_one",
-                    "outcome_two",
-                    sx_m["outcome_two"]
-                ),
-                (
-                    "sx_two",
-                    "outcome_one",
-                    sx_m["outcome_one"]
-                )
+                ("sx_one", "outcome_two", sx_m["outcome_two"]),
+                ("sx_two", "outcome_one", sx_m["outcome_one"])
             ]
 
             for poly_key, sx_key, label_sx in pares:
-
-                if (
-                    poly_key not in opcoes_poly
-                    or sx_key not in lados_sx
-                ):
+                if poly_key not in opcoes_poly or sx_key not in lados_sx:
                     continue
 
                 opt_p = opcoes_poly[poly_key]
                 opt_sx = lados_sx[sx_key]
 
-                if (
-                    opt_sx["liquidity_usdc"]
-                    < MIN_LIQUIDITY_USD
-                ):
+                if opt_sx["liquidity_usdc"] < MIN_LIQUIDITY_USD:
                     continue
 
-                # PRIMEIRA LEITURA DO PRECO POLYMARKET
-
-                ask = obter_preco_real_clob(
-                    opt_p["token_id"]
-                )
-
+                # LEITURA DIRETA E UNICA DO ASK CLOB
+                ask = obter_preco_real_clob(opt_p["token_id"])
                 if not ask:
                     continue
 
-                liq_poly_usd = (
-                    ask["size"] * ask["price"]
-                )
-
+                liq_poly_usd = ask["size"] * ask["price"]
                 if liq_poly_usd < MIN_LIQUIDITY_USD:
                     continue
 
                 preco_bruto_poly = ask["price"]
-
-                odd_bruta_poly = (
-                    1.0 / preco_bruto_poly
-                )
-
+                odd_bruta_poly = 1.0 / preco_bruto_poly
                 odd_bruta_sx = opt_sx["odd"]
 
-                soma_prob_bruta = (
-                    (1.0 / odd_bruta_poly)
-                    + (1.0 / odd_bruta_sx)
-                )
+                soma_prob_bruta = (1.0 / odd_bruta_poly) + (1.0 / odd_bruta_sx)
+                lucro_pct_bruto = ((1.0 / soma_prob_bruta) - 1.0) * 100.0
 
-                lucro_pct_bruto = (
-                    (1.0 / soma_prob_bruta) - 1.0
-                ) * 100.0
-
-                fator_taxa_poly = (
-                    1.0 + (POLY_FEE_BUFFER_PCT / 100.0)
-                )
-
-                preco_com_taxa_poly = (
-                    preco_bruto_poly * fator_taxa_poly
-                )
-
+                fator_taxa_poly = 1.0 + (POLY_FEE_BUFFER_PCT / 100.0)
+                preco_com_taxa_poly = preco_bruto_poly * fator_taxa_poly
                 if preco_com_taxa_poly >= 1.0:
                     continue
+                odd_liq_poly = 1.0 / preco_com_taxa_poly
 
-                odd_liq_poly = (
-                    1.0 / preco_com_taxa_poly
-                )
+                fator_taxa_sx = 1.0 - (SX_FEE_BUFFER_PCT / 100.0)
+                odd_liq_sx = 1.0 + (odd_bruta_sx - 1.0) * fator_taxa_sx
 
-                fator_taxa_sx = (
-                    1.0 - (SX_FEE_BUFFER_PCT / 100.0)
-                )
+                soma_prob_liq = (1.0 / odd_liq_poly) + (1.0 / odd_liq_sx)
+                lucro_pct_liq = ((1.0 / soma_prob_liq) - 1.0) * 100.0
 
-                odd_liq_sx = (
-                    1.0
-                    + (odd_bruta_sx - 1.0)
-                    * fator_taxa_sx
-                )
-
-                soma_prob_liq = (
-                    (1.0 / odd_liq_poly)
-                    + (1.0 / odd_liq_sx)
-                )
-
-                lucro_pct_liq = (
-                    (1.0 / soma_prob_liq) - 1.0
-                ) * 100.0
-
-                if (
-                    stats["melhor_margem"] is None
-                    or lucro_pct_liq > stats["melhor_margem"]
-                ):
-
+                if stats["melhor_margem"] is None or lucro_pct_liq > stats["melhor_margem"]:
                     stats["melhor_margem"] = lucro_pct_liq
 
                 if lucro_pct_liq < MIN_PROFIT_PCT:
                     continue
 
-                prop_poly = (
-                    (1.0 / odd_liq_poly)
-                    / soma_prob_liq
-                )
+                prop_poly = (1.0 / odd_liq_poly) / soma_prob_liq
+                prop_sx = (1.0 / odd_liq_sx) / soma_prob_liq
 
-                prop_sx = (
-                    (1.0 / odd_liq_sx)
-                    / soma_prob_liq
-                )
-
-                banca_efetiva = min(
-                    PAPER_STAKE_USD,
-                    liq_poly_usd / prop_poly,
-                    opt_sx["liquidity_usdc"] / prop_sx
-                )
-
+                banca_efetiva = min(PAPER_STAKE_USD, liq_poly_usd / prop_poly, opt_sx["liquidity_usdc"] / prop_sx)
                 if banca_efetiva < 10.0:
                     continue
 
                 stake_poly = banca_efetiva * prop_poly
                 stake_sx = banca_efetiva * prop_sx
 
-                retorno_bruto = (
-                    banca_efetiva / soma_prob_bruta
-                )
+                retorno_bruto = banca_efetiva / soma_prob_bruta
+                lucro_usd_bruto = retorno_bruto - banca_efetiva
+                custo_taxas_estimado = banca_efetiva * ((lucro_pct_bruto - lucro_pct_liq) / 100.0)
 
-                lucro_usd_bruto = (
-                    retorno_bruto - banca_efetiva
-                )
-
-                custo_taxas_estimado = (
-                    banca_efetiva
-                    * (
-                        (lucro_pct_bruto - lucro_pct_liq)
-                        / 100.0
-                    )
-                )
-
-                retorno_liquido = (
-                    banca_efetiva / soma_prob_liq
-                )
-
-                lucro_usd_liquido = (
-                    retorno_liquido - banca_efetiva
-                )
-
-                # SEGUNDA LEITURA: CONFIRMAR O PRECO ANTES DO ALERTA
-
-                ask_final = obter_preco_real_clob(
-                    opt_p["token_id"]
-                )
-
-                if not ask_final:
-
-                    logger.info(
-                        "Oportunidade cancelada: "
-                        "cotacao final Polymarket indisponivel."
-                    )
-
-                    continue
-
-                shares_necessarias = (
-                    stake_poly / preco_bruto_poly
-                )
-
-                if (
-                    abs(
-                        ask_final["price"] - preco_bruto_poly
-                    ) > 0.000001
-                    or ask_final["size"] + 1e-9
-                    < shares_necessarias
-                ):
-
-                    logger.info(
-                        "Oportunidade cancelada por alteracao "
-                        "de preco/liquidez: inicial=%.4f "
-                        "final=%.4f",
-                        preco_bruto_poly,
-                        ask_final["price"]
-                    )
-
-                    continue
-
-                # PRECO COM PRECISAO DE DUAS CASAS EM CENTIMOS
+                retorno_liquido = banca_efetiva / soma_prob_liq
+                lucro_usd_liquido = retorno_liquido - banca_efetiva
 
                 preco_cents = preco_bruto_poly * 100
-
-                hora_cotacao = ask_final["checked_at"]
-
-                # REGISTAR A SIMULACAO APOS A VALIDACAO FINAL
+                hora_cotacao = ask["checked_at"]
 
                 registar_aposta_virtual(
                     m_hash,
@@ -1422,172 +835,72 @@ def analisar_cruzamento_web3(
                 )
 
                 mensagem = (
-                    "🛡️ [PAPER TRADING - PRICE RECHECK V8.3]\n\n"
-
+                    "🛡️ [PAPER TRADING - CLEAN DIRECT V8.4]\n\n"
                     f"Jogo: {team1} vs {team2}\n"
-
-                    f"Competicao: {sx_m['sport']} - "
-                    f"{sx_m['league']}\n"
-
-                    f"Data e Hora: "
-                    f"{formatar_data_pt(dt_sx or dt_poly)}\n\n"
-
+                    f"Competicao: {sx_m['sport']} - {sx_m['league']}\n"
+                    f"Data e Hora: {formatar_data_pt(dt_sx or dt_poly)}\n\n"
                     "Lado 1 (Polymarket - USDC):\n"
-
                     f"- Aposta: {opt_p['label']}\n"
-
-                    f"- Preco BUY validado: "
-                    f"{preco_cents:.2f}¢ "
-                    f"({preco_bruto_poly:.4f} USDC)\n"
-
-                    f"- Odd Bruta: {odd_bruta_poly:.4f} "
-                    f"| Odd apos buffer: {odd_liq_poly:.4f}\n"
-
-                    f"- Liquidez no melhor ASK: "
-                    f"${ask_final['liquidity_usd']:.2f} USDC\n"
-
-                    f"- Cotacao confirmada (UTC): "
-                    f"{hora_cotacao}\n"
-
-                    f"- Valor investido: "
-                    f"${stake_poly:.2f} USDC\n\n"
-
+                    f"- Preco BUY validado: {preco_cents:.2f}¢ ({preco_bruto_poly:.4f} USDC)\n"
+                    f"- Odd Bruta: {odd_bruta_poly:.4f} | Odd apos buffer: {odd_liq_poly:.4f}\n"
+                    f"- Liquidez no melhor ASK: ${ask['liquidity_usd']:.2f} USDC\n"
+                    f"- Cotacao confirmada (UTC): {hora_cotacao}\n"
+                    f"- Valor investido: ${stake_poly:.2f} USDC\n\n"
                     "Lado 2 (SX Bet - USDC):\n"
-
-                    f"- Aposta: Not "
-                    f"{opt_p['label'].replace(' (Yes)', '')}\n"
-
-                    f"- Odd Taker Real "
-                    f"(Bruta: {odd_bruta_sx:.2f} "
-                    f"| Liq: {odd_liq_sx:.2f})\n"
-
-                    f"- Valor investido: "
-                    f"${stake_sx:.2f} USDC\n\n"
-
-                    f"💵 **ESTRUTURA DE LUCRO "
-                    f"(${banca_efetiva:.2f} Totais):**\n"
-
-                    f"  • Lucro Bruto (Sem Taxas): "
-                    f"+${lucro_usd_bruto:.2f} "
-                    f"(~{lucro_pct_bruto:.2f}%)\n"
-
-                    f"  • Custo de Taxas/Buffers: "
-                    f"-${custo_taxas_estimado:.2f} "
-                    f"({POLY_FEE_BUFFER_PCT}% Poly / "
-                    f"{SX_FEE_BUFFER_PCT}% SX)\n"
-
-                    f"  • 🟢 **Lucro Líquido para ti:** "
-                    f"+${lucro_usd_liquido:.2f} "
-                    f"(~{lucro_pct_liq:.2f}%)\n\n"
-
+                    f"- Aposta: Not {opt_p['label'].replace(' (Yes)', '')}\n"
+                    f"- Odd Taker Real (Bruta: {odd_bruta_sx:.2f} | Liq: {odd_liq_sx:.2f})\n"
+                    f"- Valor investido: ${stake_sx:.2f} USDC\n\n"
+                    f"💵 **ESTRUTURA DE LUCRO (${banca_efetiva:.2f} Totais):**\n"
+                    f"  • Lucro Bruto (Sem Taxas): +${lucro_usd_bruto:.2f} (~{lucro_pct_bruto:.2f}%)\n"
+                    f"  • Custo de Taxas/Buffers: -${custo_taxas_estimado:.2f} ({POLY_FEE_BUFFER_PCT}% Poly / {SX_FEE_BUFFER_PCT}% SX)\n"
+                    f"  • 🟢 **Lucro Líquido para ti:** +${lucro_usd_liquido:.2f} (~{lucro_pct_liq:.2f}%)\n\n"
                     "📊 **ESTADO DAS BANCAS:**\n"
-
-                    f"🔵 **Polymarket:** "
-                    f"Disp: ${paper_wallet['poly']['available']:.2f} "
-                    f"| Inv: ${paper_wallet['poly']['invested']:.2f}\n"
-
-                    f"🟢 **SX Bet:** "
-                    f"Disp: ${paper_wallet['sx']['available']:.2f} "
-                    f"| Inv: ${paper_wallet['sx']['invested']:.2f}\n"
-
-                    f"💰 **Total Global:** "
-                    f"${(paper_wallet['poly']['available'] + paper_wallet['poly']['invested'] + paper_wallet['sx']['available'] + paper_wallet['sx']['invested']):.2f}\n\n"
-
-                    "⚠️ PRECO DE REFERENCIA, NAO GARANTIA "
-                    "DE EXECUCAO. Antes de apostar, confirma "
-                    "que o botao BUY mostra o mesmo preco. "
-                    "Se estiver diferente, NAO executes: "
-                    "a oportunidade foi invalidada."
+                    f"🔵 **Polymarket:** Disp: ${paper_wallet['poly']['available']:.2f} | Inv: ${paper_wallet['poly']['invested']:.2f}\n"
+                    f"🟢 **SX Bet:** Disp: ${paper_wallet['sx']['available']:.2f} | Inv: ${paper_wallet['sx']['invested']:.2f}\n"
+                    f"💰 **Total Global:** ${(paper_wallet['poly']['available'] + paper_wallet['poly']['invested'] + paper_wallet['sx']['available'] + paper_wallet['sx']['invested']):.2f}\n\n"
+                    "⚠️ PRECO DE REFERENCIA, NAO GARANTIA DE EXECUCAO."
                 )
 
                 if enviar_alerta_telegram(mensagem):
-
                     alertas_enviados += 1
-                    break
+                break
 
     return alertas_enviados
+
 
 # ============================================================
 # 10. CICLO PRINCIPAL DO SCANNER
 # ============================================================
 
 def ciclo_scanner():
-
     global diagnostico_inicial_feito
-
     with wallet_lock:
-
         banca_poly = paper_wallet["poly"]["available"]
         banca_sx = paper_wallet["sx"]["available"]
 
-    logger.info(
-        "A iniciar scanner Paper Trading V8.3 "
-        "(Poly Disp: $%.2f | SX Disp: $%.2f).",
-        banca_poly,
-        banca_sx
-    )
+    logger.info("A iniciar scanner Paper Trading V8.4 (Poly Disp: $%.2f | SX Disp: $%.2f).", banca_poly, banca_sx)
 
-    stats = {
-        "jogos_casados": 0,
-        "melhor_margem": None
-    }
-
+    stats = {"jogos_casados": 0, "melhor_margem": None}
     jogos_poly = obter_jogos_polymarket()
-
     mercados_sx = obter_mercados_sx()
 
     mercados_relevantes = [
-        sx_m
-        for sx_m in mercados_sx
-        if any(
-            jogo_coincide_com_titulo(
-                sx_m["team_one"],
-                sx_m["team_two"],
-                jp["title"]
-            )
-            for jp in jogos_poly
-        )
+        sx_m for sx_m in mercados_sx
+        if any(jogo_coincide_com_titulo(sx_m["team_one"], sx_m["team_two"], jp["title"]) for jp in jogos_poly)
     ]
 
     fazer_diag = not diagnostico_inicial_feito
-
-    odds_sx = (
-        obter_melhores_odds_sx(
-            mercados_relevantes,
-            log_diagnostico=fazer_diag
-        )
-        if mercados_relevantes
-        else {}
-    )
+    odds_sx = obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=fazer_diag) if mercados_relevantes else {}
 
     if fazer_diag:
-
         diagnostico_inicial_feito = True
+        logger.info("Diagnostico Cruzamento | Pares por nome: %s | Mercados SX com odds OBv3: %s", len(mercados_relevantes), len(odds_sx))
 
-        logger.info(
-            "Diagnostico Cruzamento | Pares por nome: %s "
-            "| Mercados SX com odds OBv3: %s",
-            len(mercados_relevantes),
-            len(odds_sx)
-        )
+    total_alertas = analisar_cruzamento_web3(jogos_poly, mercados_relevantes, odds_sx, stats)
 
-    total_alertas = analisar_cruzamento_web3(
-        jogos_poly,
-        mercados_relevantes,
-        odds_sx,
-        stats
-    )
-
-    melhor_str = (
-        f"{stats['melhor_margem']:.2f}%"
-        if stats["melhor_margem"] is not None
-        else "N/A"
-    )
-
+    melhor_str = f"{stats['melhor_margem']:.2f}%" if stats["melhor_margem"] is not None else "N/A"
     logger.info(
-        "Ciclo concluido | Poly Disp: $%.2f "
-        "| SX Disp: $%.2f | Casados: %d "
-        "| Melhor margem: %s | Alertas: %d",
+        "Ciclo concluido | Poly Disp: $%.2f | SX Disp: $%.2f | Casados: %d | Melhor margem: %s | Alertas: %d",
         paper_wallet["poly"]["available"],
         paper_wallet["sx"]["available"],
         stats["jogos_casados"],
@@ -1596,138 +909,64 @@ def ciclo_scanner():
     )
 
     with state_lock:
-
-        scanner_status["last_scan"] = (
-            datetime.now(timezone.utc).isoformat()
-        )
-
+        scanner_status["last_scan"] = datetime.now(timezone.utc).isoformat()
         scanner_status["poly_games_checked"] = len(jogos_poly)
-
         scanner_status["sx_markets_checked"] = len(mercados_sx)
-
-        scanner_status["name_matched_games"] = len(
-            mercados_relevantes
-        )
-
-        scanner_status["matched_games"] = (
-            stats["jogos_casados"]
-        )
-
-        scanner_status["best_margin_pct"] = (
-            stats["melhor_margem"]
-        )
-
+        scanner_status["name_matched_games"] = len(mercados_relevantes)
+        scanner_status["matched_games"] = stats["jogos_casados"]
+        scanner_status["best_margin_pct"] = stats["melhor_margem"]
         scanner_status["opportunities"] += total_alertas
-
         scanner_status["last_error"] = None
 
 
-# ============================================================
-# 11. ROBO CONTINUO
-# ============================================================
-
 def correr_robo_continuo():
-
     while True:
-
         try:
-
             ciclo_scanner()
-
         except Exception as e:
-
-            logger.exception(
-                "Erro geral do scanner Paper Trading."
-            )
-
+            logger.exception("Erro geral do scanner Paper Trading.")
             with state_lock:
                 scanner_status["last_error"] = str(e)
-
         time.sleep(SCAN_INTERVAL)
 
 
 # ============================================================
-# 12. SERVIDOR WEB RENDER
+# 11. SERVIDOR WEB RENDER
 # ============================================================
 
 class SimpleHandler(BaseHTTPRequestHandler):
-
     def do_GET(self):
-
         if self.path == "/health":
-
             with state_lock:
                 data = dict(scanner_status)
-
             with wallet_lock:
                 data["paper_wallet"] = dict(paper_wallet)
-
             data["auto_bet"] = AUTO_BET
-
-            body = json.dumps(
-                data,
-                ensure_ascii=False,
-                indent=2
-            ).encode("utf-8")
-
+            body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(200)
-
-            self.send_header(
-                "Content-Type",
-                "application/json; charset=utf-8"
-            )
-
-            self.send_header(
-                "Content-Length",
-                str(len(body))
-            )
-
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-
             self.wfile.write(body)
-
         else:
-
             with wallet_lock:
-
                 p_disp = paper_wallet["poly"]["available"]
                 p_inv = paper_wallet["poly"]["invested"]
-
                 s_disp = paper_wallet["sx"]["available"]
                 s_inv = paper_wallet["sx"]["invested"]
-
             body = (
-                "ROBO ARBITRAGEM PAPER TRADING "
-                "V8.3 ONLINE (PRICE RECHECK)\n"
-
-                f"Polymarket Disp: ${p_disp:.2f} "
-                f"| Investido: ${p_inv:.2f}\n"
-
-                f"SX Bet Disp: ${s_disp:.2f} "
-                f"| Investido: ${s_inv:.2f}\n"
-
+                "ROBO ARBITRAGEM PAPER TRADING V8.4 ONLINE (CLEAN DIRECT)\n"
+                f"Polymarket Disp: ${p_disp:.2f} | Investido: ${p_inv:.2f}\n"
+                f"SX Bet Disp: ${s_disp:.2f} | Investido: ${s_inv:.2f}\n"
                 "Health / Wallet: /health\n"
-
             ).encode("utf-8")
-
             self.send_response(200)
-
-            self.send_header(
-                "Content-Type",
-                "text/plain; charset=utf-8"
-            )
-
-            self.send_header(
-                "Content-Length",
-                str(len(body))
-            )
-
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-
             self.wfile.write(body)
 
     def do_HEAD(self):
-
         self.send_response(200)
         self.end_headers()
 
@@ -1735,44 +974,17 @@ class SimpleHandler(BaseHTTPRequestHandler):
         return
 
 
-# ============================================================
-# 13. INICIAR SERVIDOR
-# ============================================================
-
 def iniciar_servidor_web():
-
     port = int(os.environ.get("PORT", 10000))
-
-    server = ThreadingHTTPServer(
-        ("0.0.0.0", port),
-        SimpleHandler
-    )
-
-    logger.info(
-        "Servidor ativo na porta %s",
-        port
-    )
-
+    server = ThreadingHTTPServer(("0.0.0.0", port), SimpleHandler)
+    logger.info("Servidor ativo na porta %s", port)
     server.serve_forever()
 
 
-# ============================================================
-# 14. EXECUCAO PRINCIPAL
-# ============================================================
-
 if __name__ == "__main__":
-
     if not TELEGRAM_TOKEN or not CHAT_ID:
+        logger.warning("Telegram nao configurado.")
 
-        logger.warning(
-            "Telegram nao configurado."
-        )
-
-    scanner_thread = threading.Thread(
-        target=correr_robo_continuo,
-        daemon=True
-    )
-
+    scanner_thread = threading.Thread(target=correr_robo_continuo, daemon=True)
     scanner_thread.start()
-
     iniciar_servidor_web()
