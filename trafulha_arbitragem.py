@@ -13,14 +13,17 @@ import requests
 
 
 # ============================================================
-# 1. CONFIGURACOES (100% WEB3: POLYMARKET x SX BET OBV3)
+# 1. CONFIGURACOES (PAPER TRADING V6.1 - EMPATE COBERTO)
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 SX_API_KEY = os.getenv("SX_API_KEY", "")
 
-BANKROLL_USD = float(os.getenv("BANKROLL_USD", "100"))
+PAPER_TRADING = True
+PAPER_INITIAL_BANKROLL = float(os.getenv("PAPER_INITIAL_BANKROLL", "1000"))
+PAPER_STAKE_USD = float(os.getenv("PAPER_STAKE_USD", "100"))
+
 MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.5"))
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 
@@ -42,21 +45,32 @@ SX_BASE = "https://api.sx.bet"
 
 
 # ============================================================
-# 2. LOGGING E ESTADO
+# 2. LOGGING E ESTADO DA CARTEIRA VIRTUAL
 # ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("ArbitrageWeb3Bot")
+logger = logging.getLogger("ArbitragePaperBot")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "TrafulhaArbitrageWeb3/5.9"})
+session.headers.update({"User-Agent": "TrafulhaPaperBot/6.1"})
 if SX_API_KEY:
     session.headers.update({"x-sx-api-key": SX_API_KEY})
 
 state_lock = threading.Lock()
+wallet_lock = threading.Lock()
+
+paper_wallet = {
+    "initial_bankroll": PAPER_INITIAL_BANKROLL,
+    "current_bankroll": PAPER_INITIAL_BANKROLL,
+    "total_staked": 0.0,
+    "total_profit": 0.0,
+    "bets_placed": 0,
+    "history": []
+}
+
 scanner_status = {
     "running": True,
     "last_scan": None,
@@ -68,7 +82,7 @@ scanner_status = {
     "best_margin_pct": None,
     "opportunities": 0,
     "sx_odds_endpoint": None,
-    "mode": "WEB3_POLYMARKET_X_SXBET_OBV3"
+    "mode": "WEB3_PAPER_TRADING_SAFE_DRAW_V6.1"
 }
 
 alert_history = {}
@@ -108,7 +122,6 @@ STOPWORDS_EQUIPAS = {
 }
 
 ALIASES_EQUIPAS = {
-    # Futebol Europeu
     "sporting lisbon": "sporting cp",
     "sporting clube de portugal": "sporting cp",
     "sl benfica": "benfica",
@@ -127,7 +140,6 @@ ALIASES_EQUIPAS = {
     "atletico madrid": "atletico",
     "bayern munich": "bayern",
     "borussia dortmund": "dortmund",
-    # NBA
     "atlanta hawks": "hawks",
     "boston celtics": "celtics",
     "brooklyn nets": "nets",
@@ -226,7 +238,7 @@ def formatar_data_pt(dt_obj):
 
 
 # ============================================================
-# 4. TELEGRAM
+# 4. TELEGRAM E PAPER WALLET
 # ============================================================
 
 def enviar_alerta_telegram(mensagem, alert_key=None):
@@ -263,6 +275,28 @@ def enviar_alerta_telegram(mensagem, alert_key=None):
 
 def gerar_chave_alerta(texto):
     return hashlib.sha256(texto.encode("utf-8")).hexdigest()
+
+
+def registar_aposta_virtual(jogo_nome, stake_total, lucro_esperado, odds_detalhes):
+    with wallet_lock:
+        paper_wallet["bets_placed"] += 1
+        paper_wallet["total_staked"] += stake_total
+        paper_wallet["total_profit"] += lucro_esperado
+        paper_wallet["current_bankroll"] += lucro_esperado
+        
+        registo = {
+            "id": paper_wallet["bets_placed"],
+            "time": datetime.now(timezone.utc).isoformat(),
+            "match": jogo_nome,
+            "stake": stake_total,
+            "expected_profit": lucro_esperado,
+            "details": odds_detalhes,
+            "bankroll_after": paper_wallet["current_bankroll"]
+        }
+        paper_wallet["history"].append(registo)
+        logger.info("PAPER TRADING | Aposta registada #${} | Jogo: {} | Stake: ${:.2f} | Lucro Est.: +${:.2f} | Nova Banca: ${:.2f}".format(
+            registo["id"], jogo_nome, stake_total, lucro_esperado, paper_wallet["current_bankroll"]
+        ))
 
 
 # ============================================================
@@ -644,7 +678,7 @@ def obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=False):
 
 
 # ============================================================
-# 7. MOTOR DE CRUZAMENTO: POLYMARKET x SX BET
+# 7. MOTOR DE CRUZAMENTO: POLYMARKET x SX BET (COM FILTRO DE EMPATE)
 # ============================================================
 
 def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
@@ -687,65 +721,45 @@ def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
             no_idx = outs_norm.index("no")
             alvo_texto = g if g else q
 
-            if normalizar_texto(out2_sx).startswith("not ") and equipas_coincidem(alvo_texto, out1_sx):
-                opcoes["sx_one"] = {
-                    "token_id": tids[yes_idx],
-                    "indicative_price": iprices[yes_idx],
-                    "volume": vol,
-                    "label": f"{out1_sx} (Yes)"
-                }
-                opcoes["sx_two"] = {
-                    "token_id": tids[no_idx],
-                    "indicative_price": iprices[no_idx],
-                    "volume": vol,
-                    "label": f"{out2_sx} (No)"
-                }
+            # Filtro rigoroso: So aceita se cobrir o empate (Not Team ou Dupla Hipoteses)
+            is_not_bet = normalizar_texto(out2_sx).startswith("not ") or "not " in normalizar_texto(out1_sx)
+            is_draw_covered = "draw" in normalizar_texto(alvo_texto) or "tie" in normalizar_texto(alvo_texto) or is_not_beta_safe(out1_sx, out2_sx)
 
-            elif normalizar_texto(out1_sx) in ("tie", "draw") and ("draw" in normalizar_texto(alvo_texto) or "tie" in normalizar_texto(alvo_texto)):
-                opcoes["sx_one"] = {
-                    "token_id": tids[yes_idx],
-                    "indicative_price": iprices[yes_idx],
-                    "volume": vol,
-                    "label": "Empate (Yes)"
-                }
-                opcoes["sx_two"] = {
-                    "token_id": tids[no_idx],
-                    "indicative_price": iprices[no_idx],
-                    "volume": vol,
-                    "label": "Sem Empate (No)"
-                }
-
-            elif equipas_coincidem(alvo_texto, team1) and not equipas_coincidem(alvo_texto, team2):
-                if equipas_coincidem(team1, out1_sx):
+            if is_not_bet or is_draw_covered:
+                if normalizar_texto(out2_sx).startswith("not ") and equipas_coincidem(alvo_texto, out1_sx):
                     opcoes["sx_one"] = {
                         "token_id": tids[yes_idx],
                         "indicative_price": iprices[yes_idx],
                         "volume": vol,
-                        "label": f"{team1} Vence (Yes)"
+                        "label": f"{out1_sx} (Yes)"
                     }
                     opcoes["sx_two"] = {
                         "token_id": tids[no_idx],
                         "indicative_price": iprices[no_idx],
                         "volume": vol,
-                        "label": f"{team2} Vence (No)"
+                        "label": f"{out2_sx} (No)"
                     }
-
-            elif equipas_coincidem(alvo_texto, team2) and not equipas_coincidem(alvo_texto, team1):
-                if equipas_coincidem(team2, out2_sx):
+                elif normalizar_texto(out1_sx).startswith("not ") and equipas_coincidem(alvo_texto, out2_sx):
                     opcoes["sx_two"] = {
                         "token_id": tids[yes_idx],
                         "indicative_price": iprices[yes_idx],
                         "volume": vol,
-                        "label": f"{team2} Vence (Yes)"
+                        "label": f"{out2_sx} (Yes)"
                     }
                     opcoes["sx_one"] = {
                         "token_id": tids[no_idx],
                         "indicative_price": iprices[no_idx],
                         "volume": vol,
-                        "label": f"{team1} Vence (No)"
+                        "label": f"{out1_sx} (No)"
                     }
 
     return opcoes
+
+
+def is_not_beta_safe(out1, out2):
+    o1 = normalizar_texto(out1)
+    o2 = normalizar_texto(out2)
+    return o1.startswith("not ") or o2.startswith("not ")
 
 
 def calcular_odd_liquida_poly(ask_price):
@@ -834,9 +848,7 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 prop_poly = (1.0 / odd_poly) / soma_prob
                 prop_sx = (1.0 / odd_sx) / soma_prob
 
-                max_banca_poly = liq_poly_usd / prop_poly
-                max_banca_sx = opt_sx["liquidity_usdc"] / prop_sx
-                banca_efetiva = min(BANKROLL_USD, max_banca_poly, max_banca_sx)
+                banca_efetiva = min(PAPER_STAKE_USD, liq_poly_usd / prop_poly, opt_sx["liquidity_usdc"] / prop_sx)
 
                 if banca_efetiva < 10.0:
                     continue
@@ -849,28 +861,33 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 preco_cents = round(ask["price"] * 100)
 
                 mensagem = (
-                    "Arbitragem Web3 Detetada (Polymarket x SX Bet)!\n\n"
+                    "🛡️ [PAPER TRADING - EMPATE COBERTO]\n\n"
                     f"Jogo: {team1} vs {team2}\n"
                     f"Competicao: {sx_m['sport']} - {sx_m['league']}\n"
                     f"Data e Hora: {formatar_data_pt(dt_sx or dt_poly)}\n\n"
                     f"Lado 1 (Polymarket - USDC):\n"
                     f"- Aposta: {opt_p['label']}\n"
                     f"- Preco Polymarket: {preco_cents}¢ (Odd Liquida: {odd_poly:.2f})\n"
-                    f"- Valor a colocar: ${stake_poly:.2f} USDC\n"
+                    f"- Valor simulado: ${stake_poly:.2f} USDC\n"
                     f"- Liquidez no topo: ${liq_poly_usd:.2f} USDC\n\n"
                     f"Lado 2 (SX Bet - USDC):\n"
                     f"- Aposta: {label_sx}\n"
                     f"- Odd Taker: {odd_sx:.2f}\n"
-                    f"- Valor a colocar: ${stake_sx:.2f} USDC\n"
+                    f"- Valor simulado: ${stake_sx:.2f} USDC\n"
                     f"- Liquidez disponivel: ${opt_sx['liquidity_usdc']:.2f} USDC\n\n"
-                    f"Investimento Total: ${banca_efetiva:.2f} USDC\n"
+                    f"Investimento Total Simulado: ${banca_efetiva:.2f} USDC\n"
                     f"Retorno Garantido: ~${retorno_usd:.2f} USDC\n"
-                    f"Lucro Liquido: {lucro_usd:+.2f} USDC (~{lucro_pct:.2f}%)"
+                    f"Lucro Liquido Simulado: {lucro_usd:+.2f} USDC (~{lucro_pct:.2f}%)\n"
+                    f"💰 Nova Banca Virtual: ${paper_wallet['current_bankroll'] + lucro_usd:.2f}"
                 )
 
-                key = gerar_chave_alerta(f"web3_{m_hash}_{poly_key}_{round(odd_poly,2)}_{round(odd_sx,2)}")
+                key = gerar_chave_alerta(f"paper_safe_{m_hash}_{poly_key}_{round(odd_poly,2)}_{round(odd_sx,2)}")
                 if enviar_alerta_telegram(mensagem, key):
                     alertas_enviados += 1
+                    registar_aposta_virtual(f"{team1} vs {team2}", banca_efetiva, lucro_usd, {
+                        "poly_label": opt_p['label'], "poly_price": preco_cents, "poly_stake": stake_poly,
+                        "sx_label": label_sx, "sx_odd": odd_sx, "sx_stake": stake_sx
+                    })
 
     return alertas_enviados
 
@@ -881,7 +898,8 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
 
 def ciclo_scanner():
     global diagnostico_inicial_feito
-    logger.info("A iniciar scanner Web3 V5.9 (Polymarket x SX Bet OBv3 | MIN_PROFIT = %s%%).", MIN_PROFIT_PCT)
+    logger.info("A iniciar scanner Paper Trading V6.1 (Empate Coberto | Banca: $%s | Stake: $%s).", 
+                paper_wallet["current_bankroll"], PAPER_STAKE_USD)
 
     stats = {
         "jogos_casados": 0,
@@ -911,10 +929,10 @@ def ciclo_scanner():
 
     melhor_str = f"{stats['melhor_margem']:.2f}%" if stats["melhor_margem"] is not None else "N/A"
     logger.info(
-        "Ciclo concluido | Jogos Polymarket: %s | Mercados SX Bet: %s | Pares nome: %s | Jogos casados: %s | Melhor margem: %s | Alertas: %s",
+        "Ciclo concluido | Banca Virtual: ${:.2f} | Jogos Polymarket: {} | Mercados SX: {} | Casados: {} | Melhor margem: {} | Alertas: {}",
+        paper_wallet["current_bankroll"],
         len(jogos_poly),
         len(mercados_sx),
-        len(mercados_relevantes),
         stats["jogos_casados"],
         melhor_str,
         total_alertas
@@ -936,7 +954,7 @@ def correr_robo_continuo():
         try:
             ciclo_scanner()
         except Exception as e:
-            logger.exception("Erro geral do scanner Web3.")
+            logger.exception("Erro geral do scanner Paper Trading.")
             with state_lock:
                 scanner_status["last_error"] = str(e)
         time.sleep(SCAN_INTERVAL)
@@ -951,6 +969,8 @@ class SimpleHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             with state_lock:
                 data = dict(scanner_status)
+            with wallet_lock:
+                data["paper_wallet"] = dict(paper_wallet)
             data["auto_bet"] = AUTO_BET
             body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(200)
@@ -959,11 +979,15 @@ class SimpleHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         else:
+            with wallet_lock:
+                banca_atual = paper_wallet["current_bankroll"]
+                lucro_total = paper_wallet["total_profit"]
+                total_apostas = paper_wallet["bets_placed"]
             body = (
-                "ROBO ARBITRAGEM WEB3 V5.9 ONLINE\n"
-                "Plataformas: Polymarket x SX Bet OBv3 (USDC)\n"
-                "Mode: SCAN ONLY\n"
-                "Health: /health\n"
+                "ROBO ARBITRAGEM PAPER TRADING V6.1 ONLINE (EMPATE COBERTO)\n"
+                f"Banca Virtual: ${banca_atual:.2f} | Lucro Acumulado: ${lucro_total:+.2f} | Apostas: {total_apostas}\n"
+                "Modo: PAPER TRADING COM COBERTURA DE EMPATE\n"
+                "Health / Wallet: /health\n"
             ).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
