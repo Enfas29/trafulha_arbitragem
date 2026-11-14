@@ -38,7 +38,11 @@ AUTO_BET = False
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
 SX_BASE = "https://api.sx.bet"
-SX_USDC_TOKEN = "0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B"
+
+SX_USDC_TOKENS = {
+    "0x6629ce1cf35cc1329ebb4f63202f3f197b3f050b",
+    "0xe2aa35c2039bd0ff196a6ef99523cc0d3972ae3e"
+}
 
 
 # ============================================================
@@ -52,7 +56,7 @@ logging.basicConfig(
 logger = logging.getLogger("ArbitrageWeb3Bot")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "TrafulhaArbitrageWeb3/5.2"})
+session.headers.update({"User-Agent": "TrafulhaArbitrageWeb3/5.3"})
 
 state_lock = threading.Lock()
 scanner_status = {
@@ -76,8 +80,8 @@ sx_v3_route_cache = None
 # 3. UTILITARIOS HTTP E NORMALIZACAO DE EQUIPAS
 # ============================================================
 
-def http_get(url, params=None, timeout=20):
-    response = session.get(url, params=params, timeout=timeout)
+def http_get(url, params=None, headers=None, timeout=20):
+    response = session.get(url, params=params, headers=headers, timeout=timeout)
     response.raise_for_status()
     return response.json()
 
@@ -483,7 +487,6 @@ def _extrair_ordens_payload_sx(payload, m_hash_fallback=None):
         if isinstance(data.get("orders"), list):
             return data["orders"]
 
-        # Formato agrupado por outcomeOne / outcomeTwo
         if "outcomeOne" in data or "outcomeTwo" in data:
             resultado = []
             for item in data.get("outcomeOne", []):
@@ -500,6 +503,19 @@ def _extrair_ordens_payload_sx(payload, m_hash_fallback=None):
                     resultado.append(copia)
             return resultado
 
+        # Formato agrupado por marketHash: {"0x123...": [ordens...]}
+        resultado = []
+        for k, v in data.items():
+            if str(k).startswith("0x") and isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        copia = dict(item)
+                        if "marketHash" not in copia:
+                            copia["marketHash"] = k
+                        resultado.append(copia)
+        if resultado:
+            return resultado
+
     return []
 
 
@@ -512,28 +528,49 @@ def _descobrir_rota_v3_sx(sample_hash):
         return sx_v3_route_cache
 
     candidatos = [
-        ("/orders/v3", {"marketHashes": sample_hash}, False),
-        ("/consolidated-orders", {"marketHashes": sample_hash}, False),
-        ("/order-book", {"marketHash": sample_hash}, True),
-        ("/orders", {"marketHashes": sample_hash, "chainVersion": "V3"}, False),
-        ("/orders", {"marketHashes": sample_hash, "baseToken": SX_USDC_TOKEN}, False),
+        ("/v3/orders", {"marketHashes": sample_hash}, {}, False),
+        ("/v3/consolidated-orders", {"marketHashes": sample_hash}, {}, False),
+        ("/v3/order-book", {"marketHash": sample_hash}, {}, True),
+        ("/v3/orderbook", {"marketHash": sample_hash}, {}, True),
+        ("/orders", {"marketHashes": sample_hash, "orderBookVersion": "V3"}, {}, False),
+        ("/orders", {"marketHashes": sample_hash, "orderBookVersion": "3"}, {}, False),
+        ("/orders", {"marketHashes": sample_hash, "version": "V3"}, {}, False),
+        ("/orders", {"marketHashes": sample_hash, "version": "3"}, {}, False),
+        ("/orders", {"marketHashes": sample_hash}, {"x-orderbook-version": "V3"}, False),
+        ("/orders", {"marketHashes": sample_hash}, {"x-api-version": "V3"}, False),
     ]
 
-    ultimo_erro = "Nenhum endpoint respondeu 200"
-    for path, params, single_mode in candidatos:
+    # Tenta tambem ler o esquema OpenAPI caso exista
+    for doc_path in ("/docs-json", "/swagger-json", "/api-json"):
         try:
-            resp = session.get(f"{SX_BASE}{path}", params=params, timeout=15)
+            doc_resp = session.get(f"{SX_BASE}{doc_path}", timeout=6)
+            if doc_resp.ok:
+                paths = doc_resp.json().get("paths", {})
+                for p in paths:
+                    if "order" in p.lower() and p not in [c[0] for c in candidatos]:
+                        candidatos.insert(0, (p, {"marketHashes": sample_hash}, {}, False))
+                        candidatos.insert(1, (p, {"marketHash": sample_hash}, {}, True))
+                break
+        except Exception:
+            pass
+
+    resumo_erros = []
+    for path, params, headers, single_mode in candidatos:
+        try:
+            resp = session.get(f"{SX_BASE}{path}", params=params, headers=headers or None, timeout=12)
             if resp.ok:
-                sx_v3_route_cache = (path, {k: v for k, v in params.items() if k not in ("marketHashes", "marketHash")}, single_mode)
+                _ = resp.json()
+                extra_p = {k: v for k, v in params.items() if k not in ("marketHashes", "marketHash")}
+                sx_v3_route_cache = (path, extra_p, headers, single_mode)
                 logger.info("SX Bet OrderBook V3 conectado via %s", path)
                 with state_lock:
                     scanner_status["sx_endpoint"] = path
                 return sx_v3_route_cache
-            ultimo_erro = f"{path} -> HTTP {resp.status_code}: {resp.text[:140]}"
-        except Exception as e:
-            ultimo_erro = f"{path} -> {e}"
+            resumo_erros.append(f"{path}:{resp.status_code}")
+        except Exception:
+            resumo_erros.append(f"{path}:ERR")
 
-    logger.error("Nao foi possivel aceder ao OrderBook V3 da SX Bet (%s)", ultimo_erro)
+    logger.error("Nao foi possivel aceder ao OrderBook V3 da SX Bet (%s)", ", ".join(resumo_erros[:8]))
     return None
 
 
@@ -547,14 +584,15 @@ def obter_melhores_odds_sx(market_hashes):
     if not rota:
         return melhores_por_mercado
 
-    path, extra_params, single_mode = rota
+    path, extra_params, extra_headers, single_mode = rota
+    headers_arg = extra_headers or None
     todas_ordens = []
 
     if single_mode:
         for h_unico in hashes_unicos:
             params = dict(extra_params, marketHash=h_unico)
             try:
-                resp = http_get(f"{SX_BASE}{path}", params=params, timeout=15)
+                resp = http_get(f"{SX_BASE}{path}", params=params, headers=headers_arg, timeout=15)
                 todas_ordens.extend(_extrair_ordens_payload_sx(resp, m_hash_fallback=h_unico))
             except Exception:
                 continue
@@ -563,13 +601,13 @@ def obter_melhores_odds_sx(market_hashes):
             lote = hashes_unicos[i:i + 5]
             params = dict(extra_params, marketHashes=",".join(lote))
             try:
-                resp = http_get(f"{SX_BASE}{path}", params=params, timeout=20)
+                resp = http_get(f"{SX_BASE}{path}", params=params, headers=headers_arg, timeout=20)
                 todas_ordens.extend(_extrair_ordens_payload_sx(resp))
             except Exception:
                 for h_unico in lote:
                     try:
                         p_ind = dict(extra_params, marketHashes=h_unico)
-                        resp = http_get(f"{SX_BASE}{path}", params=p_ind, timeout=15)
+                        resp = http_get(f"{SX_BASE}{path}", params=p_ind, headers=headers_arg, timeout=15)
                         todas_ordens.extend(_extrair_ordens_payload_sx(resp, m_hash_fallback=h_unico))
                     except Exception:
                         continue
@@ -578,14 +616,19 @@ def obter_melhores_odds_sx(market_hashes):
         if o.get("orderStatus", "ACTIVE") != "ACTIVE":
             continue
 
+        base_token = str(o.get("baseToken", "")).lower()
+        if base_token and base_token not in SX_USDC_TOKENS:
+            continue
+
         m_hash = o.get("marketHash", "")
         if not m_hash:
             continue
 
         try:
-            maker_prob = int(o["percentageOdds"]) / 1e20
-            total_bet = int(o["totalBetSize"])
-            fill_amount = int(o.get("fillAmount", 0))
+            raw_prob = float(o["percentageOdds"])
+            maker_prob = raw_prob / 1e20 if raw_prob > 1e10 else (raw_prob / 100.0 if raw_prob > 1.0 else raw_prob)
+            total_bet = float(o["totalBetSize"])
+            fill_amount = float(o.get("fillAmount", 0))
         except (ValueError, TypeError, KeyError):
             continue
 
@@ -857,7 +900,7 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
 # ============================================================
 
 def ciclo_scanner():
-    logger.info("A iniciar scanner Web3 V5.2 (Polymarket x SX Bet | MIN_PROFIT = %s%%).", MIN_PROFIT_PCT)
+    logger.info("A iniciar scanner Web3 V5.3 (Polymarket x SX Bet | MIN_PROFIT = %s%%).", MIN_PROFIT_PCT)
 
     stats = {
         "jogos_casados": 0,
@@ -926,7 +969,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         else:
             body = (
-                "ROBO ARBITRAGEM WEB3 V5.2 ONLINE\n"
+                "ROBO ARBITRAGEM WEB3 V5.3 ONLINE\n"
                 "Plataformas: Polymarket x SX Bet V3 (USDC)\n"
                 "Mode: SCAN ONLY\n"
                 "Health: /health\n"
