@@ -52,7 +52,7 @@ logging.basicConfig(
 logger = logging.getLogger("ArbitrageWeb3Bot")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "TrafulhaArbitrageWeb3/5.8"})
+session.headers.update({"User-Agent": "TrafulhaArbitrageWeb3/5.9"})
 if SX_API_KEY:
     session.headers.update({"x-sx-api-key": SX_API_KEY})
 
@@ -473,11 +473,6 @@ def obter_mercados_sx():
 
 
 def _extrair_niveis_lado_obv3(lado_raw):
-    """
-    Converte niveis do livro OBv3 da SX Bet (perspetiva maker) para a perspetiva taker:
-    - Maker apostado em outcomeOne -> Taker aposta em outcomeTwo (odd = 1 / (1 - maker_prob))
-    - Capacidade do taker em USDC = maker_size * (taker_prob / maker_prob)
-    """
     if isinstance(lado_raw, dict):
         itens = [lado_raw]
     elif isinstance(lado_raw, list):
@@ -525,9 +520,7 @@ def _registar_livro_mercado_obv3(m_hash, bloco, melhores_por_mercado):
     if not m_hash or not isinstance(bloco, dict):
         return
 
-    # Ordens maker em outcomeOne oferecem aposta taker em outcome_two
     niveis_para_out2 = _extrair_niveis_lado_obv3(bloco.get("outcomeOne"))
-    # Ordens maker em outcomeTwo oferecem aposta taker em outcome_one
     niveis_para_out1 = _extrair_niveis_lado_obv3(bloco.get("outcomeTwo"))
 
     if not niveis_para_out1 and not niveis_para_out2:
@@ -591,7 +584,6 @@ def obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=False):
     rota_usada = None
     diag_msg = None
 
-    # 1) Endpoint oficial OBv3 em lote: GET /orders-v3/odds/best
     for i in range(0, len(hashes_unicos), 50):
         lote = hashes_unicos[i:i + 50]
         try:
@@ -620,7 +612,6 @@ def obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=False):
             if diag_msg is None:
                 diag_msg = f"/orders-v3/odds/best -> ERR: {e}"
 
-    # 2) Fallback: GET /orderbook-v3/snapshot/market para os mercados relevantes
     if not melhores_por_mercado:
         for m_hash in hashes_unicos[:40]:
             try:
@@ -855,6 +846,8 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 retorno_usd = banca_efetiva / soma_prob
                 lucro_usd = retorno_usd - banca_efetiva
 
+                preco_cents = round(ask["price"] * 100)
+
                 mensagem = (
                     "Arbitragem Web3 Detetada (Polymarket x SX Bet)!\n\n"
                     f"Jogo: {team1} vs {team2}\n"
@@ -862,7 +855,7 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                     f"Data e Hora: {formatar_data_pt(dt_sx or dt_poly)}\n\n"
                     f"Lado 1 (Polymarket - USDC):\n"
                     f"- Aposta: {opt_p['label']}\n"
-                    f"- Odd Liquida: {odd_poly:.2f} (Preco: ${ask['price']:.3f})\n"
+                    f"- Preco Polymarket: {preco_cents}¢ (Odd Liquida: {odd_poly:.2f})\n"
                     f"- Valor a colocar: ${stake_poly:.2f} USDC\n"
                     f"- Liquidez no topo: ${liq_poly_usd:.2f} USDC\n\n"
                     f"Lado 2 (SX Bet - USDC):\n"
@@ -888,7 +881,7 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
 
 def ciclo_scanner():
     global diagnostico_inicial_feito
-    logger.info("A iniciar scanner Web3 V5.8 (Polymarket x SX Bet OBv3 | MIN_PROFIT = %s%%).", MIN_PROFIT_PCT)
+    logger.info("A iniciar scanner Web3 V5.9 (Polymarket x SX Bet OBv3 | MIN_PROFIT = %s%%).", MIN_PROFIT_PCT)
 
     stats = {
         "jogos_casados": 0,
@@ -967,7 +960,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         else:
             body = (
-                "ROBO ARBITRAGEM WEB3 V5.8 ONLINE\n"
+                "ROBO ARBITRAGEM WEB3 V5.9 ONLINE\n"
                 "Plataformas: Polymarket x SX Bet OBv3 (USDC)\n"
                 "Mode: SCAN ONLY\n"
                 "Health: /health\n"
