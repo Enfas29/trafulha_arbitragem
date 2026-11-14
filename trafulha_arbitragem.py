@@ -13,7 +13,7 @@ import requests
 
 
 # ============================================================
-# 1. CONFIGURACOES (PAPER TRADING V8.4 - CLEAN DIRECT CLOB)
+# 1. CONFIGURACOES (PAPER TRADING V8.5 - STRICT MARKET ID)
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -52,7 +52,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("ArbitragePaperBotV84")
+logger = logging.getLogger("ArbitragePaperBotV85")
 
 session = requests.Session()
 session.headers.update({
@@ -99,7 +99,7 @@ scanner_status = {
     "best_margin_pct": None,
     "opportunities": 0,
     "sx_odds_endpoint": None,
-    "mode": "WEB3_PAPER_TRADING_CLEAN_DIRECT_V8.4"
+    "mode": "WEB3_PAPER_TRADING_STRICT_ID_V8.5"
 }
 
 diagnostico_inicial_feito = False
@@ -306,7 +306,7 @@ def registar_aposta_virtual(m_hash, jogo_nome, stake_poly, stake_sx, lucro_esper
 
 
 # ============================================================
-# 5. POLYMARKET - LEITURA DIRETA DO CLOB V8.4
+# 5. POLYMARKET - LEITURA CLOB V8.5
 # ============================================================
 
 SPORT_KEYWORDS = [
@@ -324,7 +324,6 @@ def parece_evento_desportivo(texto):
 
 
 def obter_preco_real_clob(token_id):
-    """Obtém o melhor ASK instantâneo do CLOB da Polymarket com precisão total."""
     try:
         book = http_get(f"{POLY_CLOB}/book", params={"token_id": token_id}, timeout=8)
         asks = book.get("asks", [])
@@ -345,13 +344,10 @@ def obter_preco_real_clob(token_id):
             return None
 
         melhor_ask = min(asks_validos, key=lambda x: x["price"])
-        book_price = melhor_ask["price"]
-        book_size = melhor_ask["size"]
-
         return {
-            "price": book_price,
-            "size": book_size,
-            "liquidity_usd": book_price * book_size,
+            "price": melhor_ask["price"],
+            "size": melhor_ask["size"],
+            "liquidity_usd": melhor_ask["price"] * melhor_ask["size"],
             "checked_at": datetime.now(timezone.utc).isoformat()
         }
     except Exception:
@@ -359,7 +355,7 @@ def obter_preco_real_clob(token_id):
 
 
 # ============================================================
-# 6. RECOLHA DE JOGOS E MERCADOS
+# 6. RECOLHA DE JOGOS E MERCADOS (COM FILTRO MONEYLINE RIGOROSO)
 # ============================================================
 
 def obter_jogos_polymarket():
@@ -415,9 +411,12 @@ def obter_jogos_polymarket():
                 q_lower = str(m.get("question", "")).lower()
                 g_lower = str(m.get("groupItemTitle", "")).lower()
 
+                # FILTRO RIGOROSO: Garantir que é o mercado vencedor principal (Moneyline/Winner)
                 is_moneyline = any(w in q_lower for w in ["win the match", "winner", "vence", "vs"]) and not any(
-                    w in f"{q_lower} {g_lower}" for w in ["spread", "over", "under", "total", "goals", "points", "handicap", "o/u", "half", "map", "set", "quarter", "corners", "cards"]
+                    w in f"{q_lower} {g_lower}" for w in ["spread", "over", "under", "total", "goals", "points", "handicap", "o/u", "half", "map", "set", "quarter", "corners", "cards", "winner of"]
                 )
+                
+                # Se houver múltiplos mercados mas nenhum for claramente o moneyline principal, rejeita secundários
                 if not is_moneyline and len(mercados_ev) > 1:
                     continue
 
@@ -719,13 +718,12 @@ def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
 
 
 # ============================================================
-# 9. ANALISE DE ARBITRAGEM V8.4
+# 9. ANALISE DE ARBITRAGEM V8.5
 # ============================================================
 
 def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
     alertas_enviados = 0
     fator_min = max(0.5, 1.0 + (MIN_PROFIT_PCT / 100.0))
-    max_soma_prob = 1.0 / fator_min
 
     for sx_m in mercados_sx:
         m_hash = sx_m["market_hash"]
@@ -772,7 +770,6 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 if opt_sx["liquidity_usdc"] < MIN_LIQUIDITY_USD:
                     continue
 
-                # LEITURA DIRETA E UNICA DO ASK CLOB
                 ask = obter_preco_real_clob(opt_p["token_id"])
                 if not ask:
                     continue
@@ -782,6 +779,11 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                     continue
 
                 preco_bruto_poly = ask["price"]
+                
+                # FILTRO DE SANIDADE: Rejeitar preços absurdos abaixo de 0.05 ou acima de 0.95 se forem margens falsas
+                if not (0.01 < preco_bruto_poly < 0.99):
+                    continue
+
                 odd_bruta_poly = 1.0 / preco_bruto_poly
                 odd_bruta_sx = opt_sx["odd"]
 
@@ -835,7 +837,7 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 )
 
                 mensagem = (
-                    "🛡️ [PAPER TRADING - CLEAN DIRECT V8.4]\n\n"
+                    "🛡️ [PAPER TRADING - STRICT ID V8.5]\n\n"
                     f"Jogo: {team1} vs {team2}\n"
                     f"Competicao: {sx_m['sport']} - {sx_m['league']}\n"
                     f"Data e Hora: {formatar_data_pt(dt_sx or dt_poly)}\n\n"
@@ -878,7 +880,7 @@ def ciclo_scanner():
         banca_poly = paper_wallet["poly"]["available"]
         banca_sx = paper_wallet["sx"]["available"]
 
-    logger.info("A iniciar scanner Paper Trading V8.4 (Poly Disp: $%.2f | SX Disp: $%.2f).", banca_poly, banca_sx)
+    logger.info("A iniciar scanner Paper Trading V8.5 (Poly Disp: $%.2f | SX Disp: $%.2f).", banca_poly, banca_sx)
 
     stats = {"jogos_casados": 0, "melhor_margem": None}
     jogos_poly = obter_jogos_polymarket()
@@ -955,7 +957,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 s_disp = paper_wallet["sx"]["available"]
                 s_inv = paper_wallet["sx"]["invested"]
             body = (
-                "ROBO ARBITRAGEM PAPER TRADING V8.4 ONLINE (CLEAN DIRECT)\n"
+                "ROBO ARBITRAGEM PAPER TRADING V8.5 ONLINE (STRICT ID)\n"
                 f"Polymarket Disp: ${p_disp:.2f} | Investido: ${p_inv:.2f}\n"
                 f"SX Bet Disp: ${s_disp:.2f} | Investido: ${s_inv:.2f}\n"
                 "Health / Wallet: /health\n"
