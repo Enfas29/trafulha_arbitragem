@@ -13,7 +13,7 @@ import requests
 
 
 # ============================================================
-# 1. CONFIGURACOES (100% WEB3: POLYMARKET x SX BET)
+# 1. CONFIGURACOES (100% WEB3: POLYMARKET x SX BET V3)
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -38,6 +38,7 @@ AUTO_BET = False
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
 SX_BASE = "https://api.sx.bet"
+SX_USDC_TOKEN = "0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B"
 
 
 # ============================================================
@@ -51,7 +52,7 @@ logging.basicConfig(
 logger = logging.getLogger("ArbitrageWeb3Bot")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "TrafulhaArbitrageWeb3/5.1"})
+session.headers.update({"User-Agent": "TrafulhaArbitrageWeb3/5.2"})
 
 state_lock = threading.Lock()
 scanner_status = {
@@ -63,10 +64,12 @@ scanner_status = {
     "matched_games": 0,
     "best_margin_pct": None,
     "opportunities": 0,
-    "mode": "WEB3_POLYMARKET_X_SXBET"
+    "sx_endpoint": None,
+    "mode": "WEB3_POLYMARKET_X_SXBET_V3"
 }
 
 alert_history = {}
+sx_v3_route_cache = None
 
 
 # ============================================================
@@ -121,7 +124,7 @@ ALIASES_EQUIPAS = {
     "atletico madrid": "atletico",
     "bayern munich": "bayern",
     "borussia dortmund": "dortmund",
-    # Todas as 30 equipas da NBA (SX Bet -> Polymarket)
+    # NBA
     "atlanta hawks": "hawks",
     "boston celtics": "celtics",
     "brooklyn nets": "nets",
@@ -189,11 +192,6 @@ def equipas_coincidem(nome_a, nome_b):
 
 
 def jogo_coincide_com_titulo(team1, team2, titulo_poly):
-    """
-    Separa titulos no formato 'Equipa A vs Equipa B' para comparar cada lado
-    individualmente e evitar falhas quando uma plataforma usa o nome completo
-    e a outra apenas o nome curto.
-    """
     partes = re.split(r"\s+(?:vs\.?|v\.?|@)\s+", str(titulo_poly), maxsplit=1, flags=re.IGNORECASE)
     if len(partes) == 2:
         lado_a, lado_b = partes[0], partes[1]
@@ -411,7 +409,7 @@ def obter_jogos_polymarket():
 
 
 # ============================================================
-# 6. SX BET - MERCADOS ATIVOS E LIVRO DE ORDENS (USDC)
+# 6. SX BET - MERCADOS ATIVOS E LIVRO DE ORDENS V3 (USDC)
 # ============================================================
 
 def obter_mercados_sx():
@@ -469,43 +467,115 @@ def obter_mercados_sx():
     return mercados
 
 
-def _consultar_lote_ordens_sx(lote):
-    resp = session.get(
-        f"{SX_BASE}/orders",
-        params={"marketHashes": ",".join(lote)},
-        timeout=20
-    )
-    if not resp.ok:
-        raise ValueError(f"HTTP {resp.status_code}: {resp.text[:180]}")
-    payload = resp.json()
-    ordens = payload.get("data", [])
-    if isinstance(ordens, dict):
-        ordens = ordens.get("orders", [])
-    return ordens
+def _extrair_ordens_payload_sx(payload, m_hash_fallback=None):
+    data = payload.get("data", payload) if isinstance(payload, dict) else payload
+
+    if isinstance(data, list):
+        resultado = []
+        for item in data:
+            if isinstance(item, dict):
+                if m_hash_fallback and "marketHash" not in item:
+                    item = dict(item, marketHash=m_hash_fallback)
+                resultado.append(item)
+        return resultado
+
+    if isinstance(data, dict):
+        if isinstance(data.get("orders"), list):
+            return data["orders"]
+
+        # Formato agrupado por outcomeOne / outcomeTwo
+        if "outcomeOne" in data or "outcomeTwo" in data:
+            resultado = []
+            for item in data.get("outcomeOne", []):
+                if isinstance(item, dict):
+                    copia = dict(item, isMakerBettingOutcomeOne=True)
+                    if m_hash_fallback and "marketHash" not in copia:
+                        copia["marketHash"] = m_hash_fallback
+                    resultado.append(copia)
+            for item in data.get("outcomeTwo", []):
+                if isinstance(item, dict):
+                    copia = dict(item, isMakerBettingOutcomeOne=False)
+                    if m_hash_fallback and "marketHash" not in copia:
+                        copia["marketHash"] = m_hash_fallback
+                    resultado.append(copia)
+            return resultado
+
+    return []
+
+
+def _descobrir_rota_v3_sx(sample_hash):
+    """
+    Deteta automaticamente o endpoint ativo do OrderBook V3 da SX Bet.
+    """
+    global sx_v3_route_cache
+    if sx_v3_route_cache is not None:
+        return sx_v3_route_cache
+
+    candidatos = [
+        ("/orders/v3", {"marketHashes": sample_hash}, False),
+        ("/consolidated-orders", {"marketHashes": sample_hash}, False),
+        ("/order-book", {"marketHash": sample_hash}, True),
+        ("/orders", {"marketHashes": sample_hash, "chainVersion": "V3"}, False),
+        ("/orders", {"marketHashes": sample_hash, "baseToken": SX_USDC_TOKEN}, False),
+    ]
+
+    ultimo_erro = "Nenhum endpoint respondeu 200"
+    for path, params, single_mode in candidatos:
+        try:
+            resp = session.get(f"{SX_BASE}{path}", params=params, timeout=15)
+            if resp.ok:
+                sx_v3_route_cache = (path, {k: v for k, v in params.items() if k not in ("marketHashes", "marketHash")}, single_mode)
+                logger.info("SX Bet OrderBook V3 conectado via %s", path)
+                with state_lock:
+                    scanner_status["sx_endpoint"] = path
+                return sx_v3_route_cache
+            ultimo_erro = f"{path} -> HTTP {resp.status_code}: {resp.text[:140]}"
+        except Exception as e:
+            ultimo_erro = f"{path} -> {e}"
+
+    logger.error("Nao foi possivel aceder ao OrderBook V3 da SX Bet (%s)", ultimo_erro)
+    return None
 
 
 def obter_melhores_odds_sx(market_hashes):
-    """
-    Consulta o livro de ordens da SX Bet em lotes pequenos de 5 hashes
-    para evitar limites de comprimento de URL (HTTP 400).
-    """
     melhores_por_mercado = {}
     hashes_unicos = list(dict.fromkeys(market_hashes))
+    if not hashes_unicos:
+        return melhores_por_mercado
+
+    rota = _descobrir_rota_v3_sx(hashes_unicos[0])
+    if not rota:
+        return melhores_por_mercado
+
+    path, extra_params, single_mode = rota
     todas_ordens = []
 
-    for i in range(0, len(hashes_unicos), 5):
-        lote = hashes_unicos[i:i + 5]
-        try:
-            todas_ordens.extend(_consultar_lote_ordens_sx(lote))
-        except Exception:
-            for h_unico in lote:
-                try:
-                    todas_ordens.extend(_consultar_lote_ordens_sx([h_unico]))
-                except Exception as e_ind:
-                    logger.warning("Hash SX Bet ignorado (%s): %s", h_unico[:12], e_ind)
+    if single_mode:
+        for h_unico in hashes_unicos:
+            params = dict(extra_params, marketHash=h_unico)
+            try:
+                resp = http_get(f"{SX_BASE}{path}", params=params, timeout=15)
+                todas_ordens.extend(_extrair_ordens_payload_sx(resp, m_hash_fallback=h_unico))
+            except Exception:
+                continue
+    else:
+        for i in range(0, len(hashes_unicos), 5):
+            lote = hashes_unicos[i:i + 5]
+            params = dict(extra_params, marketHashes=",".join(lote))
+            try:
+                resp = http_get(f"{SX_BASE}{path}", params=params, timeout=20)
+                todas_ordens.extend(_extrair_ordens_payload_sx(resp))
+            except Exception:
+                for h_unico in lote:
+                    try:
+                        p_ind = dict(extra_params, marketHashes=h_unico)
+                        resp = http_get(f"{SX_BASE}{path}", params=p_ind, timeout=15)
+                        todas_ordens.extend(_extrair_ordens_payload_sx(resp, m_hash_fallback=h_unico))
+                    except Exception:
+                        continue
 
     for o in todas_ordens:
-        if o.get("orderStatus") != "ACTIVE":
+        if o.get("orderStatus", "ACTIVE") != "ACTIVE":
             continue
 
         m_hash = o.get("marketHash", "")
@@ -787,7 +857,7 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
 # ============================================================
 
 def ciclo_scanner():
-    logger.info("A iniciar scanner Web3 V5.1 (Polymarket x SX Bet | MIN_PROFIT = %s%%).", MIN_PROFIT_PCT)
+    logger.info("A iniciar scanner Web3 V5.2 (Polymarket x SX Bet | MIN_PROFIT = %s%%).", MIN_PROFIT_PCT)
 
     stats = {
         "jogos_casados": 0,
@@ -856,8 +926,8 @@ class SimpleHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         else:
             body = (
-                "ROBO ARBITRAGEM WEB3 V5.1 ONLINE\n"
-                "Plataformas: Polymarket x SX Bet (USDC)\n"
+                "ROBO ARBITRAGEM WEB3 V5.2 ONLINE\n"
+                "Plataformas: Polymarket x SX Bet V3 (USDC)\n"
                 "Mode: SCAN ONLY\n"
                 "Health: /health\n"
             ).encode("utf-8")
