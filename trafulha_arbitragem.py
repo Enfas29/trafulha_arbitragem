@@ -13,15 +13,15 @@ import requests
 
 
 # ============================================================
-# 1. CONFIGURACOES (PAPER TRADING V6.1 - EMPATE COBERTO)
+# 1. CONFIGURACOES (PAPER TRADING V7.0 - DUPLA BANCA)
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 SX_API_KEY = os.getenv("SX_API_KEY", "")
 
-PAPER_TRADING = True
-PAPER_INITIAL_BANKROLL = float(os.getenv("PAPER_INITIAL_BANKROLL", "1000"))
+PAPER_INITIAL_BANKROLL_POLY = float(os.getenv("PAPER_INITIAL_BANKROLL_POLY", "1000"))
+PAPER_INITIAL_BANKROLL_SX = float(os.getenv("PAPER_INITIAL_BANKROLL_SX", "1000"))
 PAPER_STAKE_USD = float(os.getenv("PAPER_STAKE_USD", "100"))
 
 MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.5"))
@@ -36,7 +36,6 @@ SX_FEE_BUFFER_PCT = float(os.getenv("SX_FEE_BUFFER_PCT", "0.0"))
 MAX_POLY_PAGES = int(os.getenv("MAX_POLY_PAGES", "10"))
 MAX_POLY_MARKETS = int(os.getenv("MAX_POLY_MARKETS", "300"))
 
-ALERT_COOLDOWN = 1800
 AUTO_BET = False
 
 POLY_GAMMA = "https://gamma-api.polymarket.com"
@@ -45,17 +44,17 @@ SX_BASE = "https://api.sx.bet"
 
 
 # ============================================================
-# 2. LOGGING E ESTADO DA CARTEIRA VIRTUAL
+# 2. LOGGING E ESTADO DA CARTEIRA DUPLA
 # ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("ArbitragePaperBot")
+logger = logging.getLogger("ArbitragePaperBotV7")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "TrafulhaPaperBot/6.1"})
+session.headers.update({"User-Agent": "TrafulhaPaperBot/7.0"})
 if SX_API_KEY:
     session.headers.update({"x-sx-api-key": SX_API_KEY})
 
@@ -63,12 +62,21 @@ state_lock = threading.Lock()
 wallet_lock = threading.Lock()
 
 paper_wallet = {
-    "initial_bankroll": PAPER_INITIAL_BANKROLL,
-    "current_bankroll": PAPER_INITIAL_BANKROLL,
-    "total_staked": 0.0,
-    "total_profit": 0.0,
+    "poly": {
+        "initial": PAPER_INITIAL_BANKROLL_POLY,
+        "available": PAPER_INITIAL_BANKROLL_POLY,
+        "invested": 0.0,
+        "profit": 0.0
+    },
+    "sx": {
+        "initial": PAPER_INITIAL_BANKROLL_SX,
+        "available": PAPER_INITIAL_BANKROLL_SX,
+        "invested": 0.0,
+        "profit": 0.0
+    },
     "bets_placed": 0,
-    "history": []
+    "history": [],
+    "apostas_realizadas_hashes": set()  # Evita repetir o mesmo jogo
 }
 
 scanner_status = {
@@ -82,10 +90,9 @@ scanner_status = {
     "best_margin_pct": None,
     "opportunities": 0,
     "sx_odds_endpoint": None,
-    "mode": "WEB3_PAPER_TRADING_SAFE_DRAW_V6.1"
+    "mode": "WEB3_PAPER_TRADING_DUAL_BANK_V7"
 }
 
-alert_history = {}
 diagnostico_inicial_feito = False
 
 
@@ -238,19 +245,13 @@ def formatar_data_pt(dt_obj):
 
 
 # ============================================================
-# 4. TELEGRAM E PAPER WALLET
+# 4. TELEGRAM E GESTAO DA CARTEIRA
 # ============================================================
 
-def enviar_alerta_telegram(mensagem, alert_key=None):
+def enviar_alerta_telegram(mensagem):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         logger.warning("Telegram nao configurado.")
         return False
-
-    now = time.time()
-    if alert_key:
-        previous = alert_history.get(alert_key, 0)
-        if now - previous < ALERT_COOLDOWN:
-            return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -264,8 +265,6 @@ def enviar_alerta_telegram(mensagem, alert_key=None):
         if not response.ok:
             logger.error("Falha Telegram (%s): %s", response.status_code, response.text)
             return False
-        if alert_key:
-            alert_history[alert_key] = now
         logger.info("Alerta enviado para Telegram!")
         return True
     except requests.RequestException as e:
@@ -273,34 +272,34 @@ def enviar_alerta_telegram(mensagem, alert_key=None):
         return False
 
 
-def gerar_chave_alerta(texto):
-    return hashlib.sha256(texto.encode("utf-8")).hexdigest()
-
-
-def registar_aposta_virtual(jogo_nome, stake_total, lucro_esperado, odds_detalhes):
+def registar_aposta_virtual(m_hash, jogo_nome, stake_poly, stake_sx, lucro_esperado):
     with wallet_lock:
+        paper_wallet["apostas_realizadas_hashes"].add(m_hash)
         paper_wallet["bets_placed"] += 1
-        paper_wallet["total_staked"] += stake_total
-        paper_wallet["total_profit"] += lucro_esperado
-        paper_wallet["current_bankroll"] += lucro_esperado
-        
+
+        # Retira do saldo disponivel e coloca em investido
+        paper_wallet["poly"]["available"] -= stake_poly
+        paper_wallet["poly"]["invested"] += stake_poly
+
+        paper_wallet["sx"]["available"] -= stake_sx
+        paper_wallet["sx"]["invested"] += stake_sx
+
         registo = {
             "id": paper_wallet["bets_placed"],
             "time": datetime.now(timezone.utc).isoformat(),
             "match": jogo_nome,
-            "stake": stake_total,
-            "expected_profit": lucro_esperado,
-            "details": odds_detalhes,
-            "bankroll_after": paper_wallet["current_bankroll"]
+            "stake_poly": stake_poly,
+            "stake_sx": stake_sx,
+            "expected_profit": lucro_esperado
         }
         paper_wallet["history"].append(registo)
-        logger.info("PAPER TRADING | Aposta registada #${} | Jogo: {} | Stake: ${:.2f} | Lucro Est.: +${:.2f} | Nova Banca: ${:.2f}".format(
-            registo["id"], jogo_nome, stake_total, lucro_esperado, paper_wallet["current_bankroll"]
+        logger.info("PAPER TRADING | Aposta #${} registada para {} | Investido Poly: ${:.2f} | Investido SX: ${:.2f}".format(
+            registo["id"], jogo_nome, stake_poly, stake_sx
         ))
 
 
 # ============================================================
-# 5. POLYMARKET - RECOLHA DE JOGOS E ORDER BOOK CLOB
+# 5. POLYMARKET E SX BET RECOLHA DE DADOS
 # ============================================================
 
 SPORT_KEYWORDS = [
@@ -444,10 +443,6 @@ def obter_jogos_polymarket():
 
     return jogos_poly
 
-
-# ============================================================
-# 6. SX BET - MERCADOS ATIVOS E ORDERBOOK OBV3 (USDC)
-# ============================================================
 
 def obter_mercados_sx():
     mercados = []
@@ -678,7 +673,7 @@ def obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=False):
 
 
 # ============================================================
-# 7. MOTOR DE CRUZAMENTO: POLYMARKET x SX BET (COM FILTRO DE EMPATE)
+# 7. MOTOR DE CRUZAMENTO E FILTRO DE JOGOS REPETIDOS
 # ============================================================
 
 def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
@@ -721,7 +716,6 @@ def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
             no_idx = outs_norm.index("no")
             alvo_texto = g if g else q
 
-            # Filtro rigoroso: So aceita se cobrir o empate (Not Team ou Dupla Hipoteses)
             is_not_bet = normalizar_texto(out2_sx).startswith("not ") or "not " in normalizar_texto(out1_sx)
             is_draw_covered = "draw" in normalizar_texto(alvo_texto) or "tie" in normalizar_texto(alvo_texto) or is_not_beta_safe(out1_sx, out2_sx)
 
@@ -781,6 +775,11 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
         m_hash = sx_m["market_hash"]
         if m_hash not in odds_sx:
             continue
+
+        # Verifica se ja apostamos neste jogo para nao repetir
+        with wallet_lock:
+            if m_hash in paper_wallet["apostas_realizadas_hashes"]:
+                continue
 
         lados_sx = odds_sx[m_hash]
         team1 = sx_m["team_one"]
@@ -860,34 +859,54 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
 
                 preco_cents = round(ask["price"] * 100)
 
+                # Regista a aposta e desconta do saldo disponivel
+                registar_aposta_virtual(m_hash, f"{team1} vs {team2}", stake_poly, stake_sx, lucro_usd)
+
+                with wallet_lock:
+                    poly_disp = paper_wallet["poly"]["available"]
+                    poly_inv = paper_wallet["poly"]["invested"]
+                    poly_tot = poly_disp + poly_inv
+
+                    sx_disp = paper_wallet["sx"]["available"]
+                    sx_inv = paper_wallet["sx"]["invested"]
+                    sx_tot = sx_disp + sx_inv
+
+                    total_inv = poly_inv + sx_inv
+                    total_geral = poly_tot + sx_tot
+
                 mensagem = (
-                    "🛡️ [PAPER TRADING - EMPATE COBERTO]\n\n"
+                    "🛡️ [PAPER TRADING - DUPLA BANCA & EMPATE SEGURO]\n\n"
                     f"Jogo: {team1} vs {team2}\n"
                     f"Competicao: {sx_m['sport']} - {sx_m['league']}\n"
                     f"Data e Hora: {formatar_data_pt(dt_sx or dt_poly)}\n\n"
                     f"Lado 1 (Polymarket - USDC):\n"
                     f"- Aposta: {opt_p['label']}\n"
-                    f"- Preco Polymarket: {preco_cents}¢ (Odd Liquida: {odd_poly:.2f})\n"
-                    f"- Valor simulado: ${stake_poly:.2f} USDC\n"
-                    f"- Liquidez no topo: ${liq_poly_usd:.2f} USDC\n\n"
+                    f"- Preco: {preco_cents}¢ (Odd Liquida: {odd_poly:.2f})\n"
+                    f"- Valor investido: ${stake_poly:.2f} USDC\n\n"
                     f"Lado 2 (SX Bet - USDC):\n"
                     f"- Aposta: {label_sx}\n"
                     f"- Odd Taker: {odd_sx:.2f}\n"
-                    f"- Valor simulado: ${stake_sx:.2f} USDC\n"
-                    f"- Liquidez disponivel: ${opt_sx['liquidity_usdc']:.2f} USDC\n\n"
-                    f"Investimento Total Simulado: ${banca_efetiva:.2f} USDC\n"
-                    f"Retorno Garantido: ~${retorno_usd:.2f} USDC\n"
-                    f"Lucro Liquido Simulado: {lucro_usd:+.2f} USDC (~{lucro_pct:.2f}%)\n"
-                    f"💰 Nova Banca Virtual: ${paper_wallet['current_bankroll'] + lucro_usd:.2f}"
+                    f"- Valor investido: ${stake_sx:.2f} USDC\n\n"
+                    f"Investimento Total no Jogo: ${banca_efetiva:.2f} USDC\n"
+                    f"Lucro Liquido Esperado: +${lucro_usd:.2f} (~{lucro_pct:.2f}%)\n\n"
+                    f"📊 **ESTADO DAS BANCAS:**\n"
+                    f"🔵 **Polymarket:**\n"
+                    f"  • Disponivel: ${poly_disp:.2f}\n"
+                    f"  • Investido: ${poly_inv:.2f}\n"
+                    f"  • Total na App: ${poly_tot:.2f}\n\n"
+                    f"🟢 **SX Bet:**\n"
+                    f"  • Disponivel: ${sx_disp:.2f}\n"
+                    f"  • Investido: ${sx_inv:.2f}\n"
+                    f"  • Total na App: ${sx_tot:.2f}\n\n"
+                    f"💰 **TOTAL CONSOLIDADO:**\n"
+                    f"  • Total Investido: ${total_inv:.2f}\n"
+                    f"  • Banca Global Atual: ${total_geral:.2f}"
                 )
 
-                key = gerar_chave_alerta(f"paper_safe_{m_hash}_{poly_key}_{round(odd_poly,2)}_{round(odd_sx,2)}")
-                if enviar_alerta_telegram(mensagem, key):
+                if enviar_alerta_telegram(mensagem):
                     alertas_enviados += 1
-                    registar_aposta_virtual(f"{team1} vs {team2}", banca_efetiva, lucro_usd, {
-                        "poly_label": opt_p['label'], "poly_price": preco_cents, "poly_stake": stake_poly,
-                        "sx_label": label_sx, "sx_odd": odd_sx, "sx_stake": stake_sx
-                    })
+                
+                break # Apenas uma aposta por jogo
 
     return alertas_enviados
 
@@ -898,8 +917,11 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
 
 def ciclo_scanner():
     global diagnostico_inicial_feito
-    logger.info("A iniciar scanner Paper Trading V6.1 (Empate Coberto | Banca: $%s | Stake: $%s).", 
-                paper_wallet["current_bankroll"], PAPER_STAKE_USD)
+    with wallet_lock:
+        banca_poly = paper_wallet["poly"]["available"]
+        banca_sx = paper_wallet["sx"]["available"]
+
+    logger.info("A iniciar scanner Paper Trading V7.0 (Poly Disp: $%s | SX Disp: $%s).", banca_poly, banca_sx)
 
     stats = {
         "jogos_casados": 0,
@@ -929,10 +951,9 @@ def ciclo_scanner():
 
     melhor_str = f"{stats['melhor_margem']:.2f}%" if stats["melhor_margem"] is not None else "N/A"
     logger.info(
-        "Ciclo concluido | Banca Virtual: ${:.2f} | Jogos Polymarket: {} | Mercados SX: {} | Casados: {} | Melhor margem: {} | Alertas: {}",
-        paper_wallet["current_bankroll"],
-        len(jogos_poly),
-        len(mercados_sx),
+        "Ciclo concluido | Poly Disp: ${:.2f} | SX Disp: ${:.2f} | Casados: {} | Melhor margem: {} | Alertas: {}",
+        paper_wallet["poly"]["available"],
+        paper_wallet["sx"]["available"],
         stats["jogos_casados"],
         melhor_str,
         total_alertas
@@ -980,13 +1001,14 @@ class SimpleHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         else:
             with wallet_lock:
-                banca_atual = paper_wallet["current_bankroll"]
-                lucro_total = paper_wallet["total_profit"]
-                total_apostas = paper_wallet["bets_placed"]
+                p_disp = paper_wallet["poly"]["available"]
+                p_inv = paper_wallet["poly"]["invested"]
+                s_disp = paper_wallet["sx"]["available"]
+                s_inv = paper_wallet["sx"]["invested"]
             body = (
-                "ROBO ARBITRAGEM PAPER TRADING V6.1 ONLINE (EMPATE COBERTO)\n"
-                f"Banca Virtual: ${banca_atual:.2f} | Lucro Acumulado: ${lucro_total:+.2f} | Apostas: {total_apostas}\n"
-                "Modo: PAPER TRADING COM COBERTURA DE EMPATE\n"
+                "ROBO ARBITRAGEM PAPER TRADING V7.0 ONLINE (DUPLA BANCA)\n"
+                f"Polymarket Disp: ${p_disp:.2f} | Investido: ${p_inv:.2f}\n"
+                f"SX Bet Disp: ${s_disp:.2f} | Investido: ${s_inv:.2f}\n"
                 "Health / Wallet: /health\n"
             ).encode("utf-8")
             self.send_response(200)
