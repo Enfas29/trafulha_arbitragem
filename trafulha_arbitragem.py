@@ -13,7 +13,7 @@ import requests
 
 
 # ============================================================
-# 1. CONFIGURACOES (PAPER TRADING V7.0 - DUPLA BANCA)
+# 1. CONFIGURACOES (PAPER TRADING V7.1 - MONEYLINE STRICT)
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -51,10 +51,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("ArbitragePaperBotV7")
+logger = logging.getLogger("ArbitragePaperBotV71")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "TrafulhaPaperBot/7.0"})
+session.headers.update({"User-Agent": "TrafulhaPaperBot/7.1"})
 if SX_API_KEY:
     session.headers.update({"x-sx-api-key": SX_API_KEY})
 
@@ -76,7 +76,7 @@ paper_wallet = {
     },
     "bets_placed": 0,
     "history": [],
-    "apostas_realizadas_hashes": set()  # Evita repetir o mesmo jogo
+    "apostas_realizadas_hashes": set()
 }
 
 scanner_status = {
@@ -90,7 +90,7 @@ scanner_status = {
     "best_margin_pct": None,
     "opportunities": 0,
     "sx_odds_endpoint": None,
-    "mode": "WEB3_PAPER_TRADING_DUAL_BANK_V7"
+    "mode": "WEB3_PAPER_TRADING_MONEYLINE_STRICT_V7.1"
 }
 
 diagnostico_inicial_feito = False
@@ -277,7 +277,6 @@ def registar_aposta_virtual(m_hash, jogo_nome, stake_poly, stake_sx, lucro_esper
         paper_wallet["apostas_realizadas_hashes"].add(m_hash)
         paper_wallet["bets_placed"] += 1
 
-        # Retira do saldo disponivel e coloca em investido
         paper_wallet["poly"]["available"] -= stake_poly
         paper_wallet["poly"]["invested"] += stake_poly
 
@@ -299,7 +298,7 @@ def registar_aposta_virtual(m_hash, jogo_nome, stake_poly, stake_sx, lucro_esper
 
 
 # ============================================================
-# 5. POLYMARKET E SX BET RECOLHA DE DADOS
+# 5. POLYMARKET (MONEYLINE STRICT) E SX BET RECOLHA
 # ============================================================
 
 SPORT_KEYWORDS = [
@@ -392,7 +391,12 @@ def obter_jogos_polymarket():
 
                 q_lower = str(m.get("question", "")).lower()
                 g_lower = str(m.get("groupItemTitle", "")).lower()
-                if any(w in f"{q_lower} {g_lower}" for w in ["spread", "over", "under", "total", "goals", "points", "handicap", "o/u"]):
+
+                # FILTRO RIGOROSO: Apenas aceita o mercado principal de vencedor (Moneyline / 1X2 / Who will win)
+                is_moneyline = any(w in q_lower for w in ["win the match", "winner", "vence", "vs"]) and not any(
+                    w in f"{q_lower} {g_lower}" for w in ["spread", "over", "under", "total", "goals", "points", "handicap", "o/u", "half", "map", "set", "quarter"]
+                )
+                if not is_moneyline and len(mercados_ev) > 1:
                     continue
 
                 try:
@@ -776,7 +780,6 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
         if m_hash not in odds_sx:
             continue
 
-        # Verifica se ja apostamos neste jogo para nao repetir
         with wallet_lock:
             if m_hash in paper_wallet["apostas_realizadas_hashes"]:
                 continue
@@ -859,7 +862,6 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
 
                 preco_cents = round(ask["price"] * 100)
 
-                # Regista a aposta e desconta do saldo disponivel
                 registar_aposta_virtual(m_hash, f"{team1} vs {team2}", stake_poly, stake_sx, lucro_usd)
 
                 with wallet_lock:
@@ -875,13 +877,13 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                     total_geral = poly_tot + sx_tot
 
                 mensagem = (
-                    "🛡️ [PAPER TRADING - DUPLA BANCA & EMPATE SEGURO]\n\n"
+                    "🛡️ [PAPER TRADING - DUPLA BANCA & MONEYLINE STRICT]\n\n"
                     f"Jogo: {team1} vs {team2}\n"
                     f"Competicao: {sx_m['sport']} - {sx_m['league']}\n"
                     f"Data e Hora: {formatar_data_pt(dt_sx or dt_poly)}\n\n"
                     f"Lado 1 (Polymarket - USDC):\n"
                     f"- Aposta: {opt_p['label']}\n"
-                    f"- Preco: {preco_cents}¢ (Odd Liquida: {odd_poly:.2f})\n"
+                    f"- Preco Principal: {preco_cents}¢ (Odd Liquida: {odd_poly:.2f})\n"
                     f"- Valor investido: ${stake_poly:.2f} USDC\n\n"
                     f"Lado 2 (SX Bet - USDC):\n"
                     f"- Aposta: {label_sx}\n"
@@ -906,7 +908,7 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 if enviar_alerta_telegram(mensagem):
                     alertas_enviados += 1
                 
-                break # Apenas uma aposta por jogo
+                break
 
     return alertas_enviados
 
@@ -921,7 +923,7 @@ def ciclo_scanner():
         banca_poly = paper_wallet["poly"]["available"]
         banca_sx = paper_wallet["sx"]["available"]
 
-    logger.info("A iniciar scanner Paper Trading V7.0 (Poly Disp: $%s | SX Disp: $%s).", banca_poly, banca_sx)
+    logger.info("A iniciar scanner Paper Trading V7.1 (Poly Disp: $%s | SX Disp: $%s).", banca_poly, banca_sx)
 
     stats = {
         "jogos_casados": 0,
@@ -1006,7 +1008,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 s_disp = paper_wallet["sx"]["available"]
                 s_inv = paper_wallet["sx"]["invested"]
             body = (
-                "ROBO ARBITRAGEM PAPER TRADING V7.0 ONLINE (DUPLA BANCA)\n"
+                "ROBO ARBITRAGEM PAPER TRADING V7.1 ONLINE (MONEYLINE STRICT)\n"
                 f"Polymarket Disp: ${p_disp:.2f} | Investido: ${p_inv:.2f}\n"
                 f"SX Bet Disp: ${s_disp:.2f} | Investido: ${s_inv:.2f}\n"
                 "Health / Wallet: /health\n"
