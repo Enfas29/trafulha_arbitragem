@@ -1,96 +1,127 @@
-import os
-import re
-import json
-import time
-import threading
-import logging
-import hashlib
-import unicodedata
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import requests
+                if enviar_alerta_telegram(mensagem):
+                    alertas_enviados += 1
+                    break
+
+    return alertas_enviados
 
 
 # ============================================================
-# 1. CONFIGURACOES (PAPER TRADING V8.2 - EXACT BUTTON SYNC)
+# 8. CICLO PRINCIPAL
 # ============================================================
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-CHAT_ID = os.getenv("CHAT_ID", "")
-SX_API_KEY = os.getenv("SX_API_KEY", "")
-POLY_API_KEY = os.getenv("POLY_API_KEY", "")
+def ciclo_scanner():
+    global diagnostico_inicial_feito
+    with wallet_lock:
+        banca_poly = paper_wallet["poly"]["available"]
+        banca_sx = paper_wallet["sx"]["available"]
 
-PAPER_INITIAL_BANKROLL_POLY = float(os.getenv("PAPER_INITIAL_BANKROLL_POLY", "1000"))
-PAPER_INITIAL_BANKROLL_SX = float(os.getenv("PAPER_INITIAL_BANKROLL_SX", "1000"))
-PAPER_STAKE_USD = float(os.getenv("PAPER_STAKE_USD", "100"))
+    logger.info("A iniciar scanner Paper Trading V8.3 (Poly Disp: $%.2f | SX Disp: $%.2f).", banca_poly, banca_sx)
 
-MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.5"))
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
+    stats = {
+        "jogos_casados": 0,
+        "melhor_margem": None
+    }
 
-MIN_POLY_VOLUME = float(os.getenv("MIN_POLY_VOLUME", "1000"))
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "15"))
+    jogos_poly = obter_jogos_polymarket()
+    mercados_sx = obter_mercados_sx()
 
-POLY_FEE_BUFFER_PCT = float(os.getenv("POLY_FEE_BUFFER_PCT", "1.0"))
-SX_FEE_BUFFER_PCT = float(os.getenv("SX_FEE_BUFFER_PCT", "0.0"))
+    mercados_relevantes = [
+        sx_m for sx_m in mercados_sx
+        if any(jogo_coincide_com_titulo(sx_m["team_one"], sx_m["team_two"], jp["title"]) for jp in jogos_poly)
+    ]
 
-MAX_POLY_PAGES = int(os.getenv("MAX_POLY_PAGES", "15"))
-MAX_POLY_MARKETS = int(os.getenv("MAX_POLY_MARKETS", "400"))
+    fazer_diag = not diagnostico_inicial_feito
+    odds_sx = obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=fazer_diag) if mercados_relevantes else {}
 
-AUTO_BET = False
+    if fazer_diag:
+        diagnostico_inicial_feito = True
+        logger.info(
+            "Diagnostico Cruzamento | Pares por nome: %s | Mercados SX com odds OBv3: %s",
+            len(mercados_relevantes),
+            len(odds_sx)
+        )
 
-POLY_GAMMA = "https://gamma-api.polymarket.com"
-POLY_CLOB = "https://clob.polymarket.com"
-SX_BASE = "https://api.sx.bet"
+    total_alertas = analisar_cruzamento_web3(jogos_poly, mercados_relevantes, odds_sx, stats)
+
+    melhor_str = f"{stats['melhor_margem']:.2f}%" if stats["melhor_margem"] is not None else "N/A"
+    logger.info(
+        "Ciclo concluido | Poly Disp: $%.2f | SX Disp: $%.2f | Casados: %d | Melhor margem: %s | Alertas: %d",
+        paper_wallet["poly"]["available"],
+        paper_wallet["sx"]["available"],
+        stats["jogos_casados"],
+        melhor_str,
+        total_alertas
+    )
+
+    with state_lock:
+        scanner_status["last_scan"] = datetime.now(timezone.utc).isoformat()
+        scanner_status["poly_games_checked"] = len(jogos_poly)
+        scanner_status["sx_markets_checked"] = len(mercados_sx)
+        scanner_status["name_matched_games"] = len(mercados_relevantes)
+        scanner_status["matched_games"] = stats["jogos_casados"]
+        scanner_status["best_margin_pct"] = stats["melhor_margem"]
+        scanner_status["opportunities"] += total_alertas
+        scanner_status["last_error"] = None
+
+
+def correr_robo_continuo():
+    while True:
+        try:
+            ciclo_scanner()
+        except Exception as e:
+            logger.exception("Erro geral do scanner Paper Trading.")
+            with state_lock:
+                scanner_status["last_error"] = str(e)
+        time.sleep(SCAN_INTERVAL)
 
 
 # ============================================================
-# 2. LOGGING E ESTADO DA CARTEIRA DUPLA
+# 9. SERVIDOR WEB RENDER
 # ============================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-logger = logging.getLogger("ArbitragePaperBotV83")
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            with state_lock:
+                data = dict(scanner_status)
+            with wallet_lock:
+                data["paper_wallet"] = dict(paper_wallet)
+            data["auto_bet"] = AUTO_BET
+            body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            with wallet_lock:
+                p_disp = paper_wallet["poly"]["available"]
+                p_inv = paper_wallet["poly"]["invested"]
+                s_disp = paper_wallet["sx"]["available"]
+                s_inv = paper_wallet["sx"]["invested"]
+            body = (
+                "ROBO ARBITRAGEM PAPER TRADING V8.3 ONLINE (PRICE RECHECK)\n"
+                f"Polymarket Disp: ${p_disp:.2f} | Investido: ${p_inv:.2f}\n"
+                f"SX Bet Disp: ${s_disp:.2f} | Investido: ${s_inv:.2f}\n"
+                "Health / Wallet: /health\n"
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Cache-Control": "no-store, no-cache, must-revalidate",
-    "Pragma": "no-cache"
-})
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
-if SX_API_KEY:
-    session.headers.update({"x-sx-api-key": SX_API_KEY})
+    def log_message(self, format, *args):
+        return
 
-if POLY_API_KEY:
-    session.headers.update({"POLY_API_KEY": POLY_API_KEY})
 
-state_lock = threading.Lock()
-wallet_lock = threading.Lock()
-
-paper_wallet = {
-    "poly": {
-        "initial": PAPER_INITIAL_BANKROLL_POLY,
-        "available": PAPER_INITIAL_BANKROLL_POLY,
-        "invested": 0.0,
-        "profit": 0.0
-    },
-    "sx": {
-        "initial": PAPER_INITIAL_BANKROLL_SX,
-        "available": PAPER_INITIAL_BANKROLL_SX,
-        "invested": 0.0,
-        "profit": 0.0
-    },
-    "bets_placed": 0,
-    "history": [],
-    "apostas_realizadas_hashes": set()
-}
-
-scanner_status = {
-    "running": True,
-    "last_scan": None,
-    "last_error": None,
-    "poly_games_checked": 0,
-    "sx_markets_checked": 0,
+def iniciar_servidor_web():
+    port = int(os.environ.get("PORT", 10000))
+    server = ThreadingHTTPServer(("0.0.0.0", port), SimpleHandler)
+    logger.info("Servidor ativo na porta %s", port)
+    server.serve_forever()
