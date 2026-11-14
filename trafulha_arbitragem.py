@@ -13,7 +13,7 @@ import requests
 
 
 # ============================================================
-# 1. CONFIGURACOES (PAPER TRADING V7.4 - DETALHE DE LUCROS)
+# 1. CONFIGURACOES (PAPER TRADING V7.5 - TOP OF BOOK STRICT)
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -51,10 +51,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("ArbitragePaperBotV74")
+logger = logging.getLogger("ArbitragePaperBotV75")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "TrafulhaPaperBot/7.4"})
+session.headers.update({"User-Agent": "TrafulhaPaperBot/7.5"})
 if SX_API_KEY:
     session.headers.update({"x-sx-api-key": SX_API_KEY})
 
@@ -90,7 +90,7 @@ scanner_status = {
     "best_margin_pct": None,
     "opportunities": 0,
     "sx_odds_endpoint": None,
-    "mode": "WEB3_PAPER_TRADING_PROFIT_DETAILS_V7.4"
+    "mode": "WEB3_PAPER_TRADING_TOP_OF_BOOK_STRICT_V7.5"
 }
 
 diagnostico_inicial_feito = False
@@ -297,7 +297,7 @@ def registar_aposta_virtual(m_hash, jogo_nome, stake_poly, stake_sx, lucro_esper
 
 
 # ============================================================
-# 5. POLYMARKET CLOB ORDERBOOK RECOLHA EXATA
+# 5. POLYMARKET CLOB ORDERBOOK (TOP OF BOOK STRICT)
 # ============================================================
 
 SPORT_KEYWORDS = [
@@ -315,6 +315,7 @@ def parece_evento_desportivo(texto):
 
 
 def obter_preco_real_clob(token_id):
+    """Lê estritamente o topo exato (primeira ordem de venda / ask) do book da Polymarket"""
     try:
         book = http_get(
             f"{POLY_CLOB}/book",
@@ -322,18 +323,19 @@ def obter_preco_real_clob(token_id):
             timeout=12
         )
         asks = book.get("asks", [])
-        validas = []
-        for ask in asks:
-            try:
-                price = float(ask["price"])
-                size = float(ask["size"])
-            except (ValueError, TypeError, KeyError):
-                continue
-            if 0.01 < price < 0.99 and size > 0:
-                validas.append({"price": price, "size": size})
-        if not validas:
+        if not asks:
             return None
-        return min(validas, key=lambda x: x["price"])
+        
+        # Ordenar por preço ascendente para garantir que apanhamos exatamente o topo do book (melhor preço atual)
+        asks_ordenados = sorted(asks, key=lambda x: float(x["price"]))
+        melhor_ask = asks_ordenados[0]
+        
+        price = float(melhor_ask["price"])
+        size = float(melhor_ask["size"])
+        
+        if 0.01 < price < 0.99 and size > 0:
+            return {"price": price, "size": size}
+        return None
     except requests.RequestException:
         return None
 
@@ -666,7 +668,7 @@ def obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=False):
 
 
 # ============================================================
-# 7. MOTOR DE CRUZAMENTO E ANALISE DE LUCRO BRUTO VS LIQUIDO
+# 7. MOTOR DE CRUZAMENTO
 # ============================================================
 
 def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
@@ -758,23 +760,19 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 if liq_poly_usd < MIN_LIQUIDITY_USD:
                     continue
 
-                # 1. Analise de Precos e Odds Brutas vs Liquidas
-                preco_bruto_poly = ask["price"]  # Ex: 0.66
+                preco_bruto_poly = ask["price"]
                 odd_bruta_poly = 1.0 / preco_bruto_poly
                 odd_bruta_sx = opt_sx["odd"]
 
-                # Calculo Bruto (Sem Taxas / Sem Buffer)
                 soma_prob_bruta = (1.0 / odd_bruta_poly) + (1.0 / odd_bruta_sx)
                 lucro_pct_bruto = ((1.0 / soma_prob_bruta) - 1.0) * 100.0
 
-                # Calculo Liquido (Com as taxas / buffers aplicados)
                 fator_taxa_poly = 1.0 + (POLY_FEE_BUFFER_PCT / 100.0)
                 preco_com_taxa_poly = preco_bruto_poly * fator_taxa_poly
                 if preco_com_taxa_poly >= 1.0:
                     continue
                 odd_liq_poly = 1.0 / preco_com_taxa_poly
 
-                # Taxa SX Bet (aplicada sobre a comissao de ganho se configurada)
                 fator_taxa_sx = 1.0 - (SX_FEE_BUFFER_PCT / 100.0)
                 odd_liq_sx = 1.0 + (odd_bruta_sx - 1.0) * fator_taxa_sx
 
@@ -798,7 +796,6 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 stake_poly = banca_efetiva * prop_poly
                 stake_sx = banca_efetiva * prop_sx
 
-                # Valores monetarios brutos e liquidos
                 retorno_bruto = banca_efetiva / soma_prob_bruta
                 lucro_usd_bruto = retorno_bruto - banca_efetiva
                 custo_taxas_estimado = banca_efetiva * ((lucro_pct_bruto - lucro_pct_liq) / 100.0)
@@ -811,17 +808,17 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 registar_aposta_virtual(m_hash, f"{team1} vs {team2}", stake_poly, stake_sx, lucro_usd_liquido)
 
                 mensagem = (
-                    "🛡️ [PAPER TRADING - ANALISE DE LUCROS V7.4]\n\n"
+                    "🛡️ [PAPER TRADING - TOP OF BOOK V7.5]\n\n"
                     f"Jogo: {team1} vs {team2}\n"
                     f"Competicao: {sx_m['sport']} - {sx_m['league']}\n"
                     f"Data e Hora: {formatar_data_pt(dt_sx or dt_poly)}\n\n"
                     f"Lado 1 (Polymarket - USDC):\n"
                     f"- Aposta: {opt_p['label']}\n"
-                    f"- Preco CLOB: {preco_cents}¢ (Odd Bruta: {odd_bruta_poly:.2f} | Liq: {odd_liq_poly:.2f})\n"
+                    f"- Preco Topo CLOB: {preco_cents}¢ (Odd Bruta: {odd_bruta_poly:.2f} | Liq: {odd_liq_poly:.2f})\n"
                     f"- Valor investido: ${stake_poly:.2f} USDC\n\n"
                     f"Lado 2 (SX Bet - USDC):\n"
                     f"- Aposta: Not {opt_p['label'].replace(' (Yes)', '')}\n"
-                    f"- Odd Taker (Bruta: {odd_bruta_sx:.2f} | Liq: {odd_liq_sx:.2f})\n"
+                    f"- Odd Taker Topo (Bruta: {odd_bruta_sx:.2f} | Liq: {odd_liq_sx:.2f})\n"
                     f"- Valor investido: ${stake_sx:.2f} USDC\n\n"
                     f"💵 **ESTRUTURA DE LUCRO (${banca_efetiva:.2f} Totais):**\n"
                     f"  • Lucro Bruto (Sem Taxas): +${lucro_usd_bruto:.2f} (~{lucro_pct_bruto:.2f}%)\n"
@@ -851,7 +848,7 @@ def ciclo_scanner():
         banca_poly = paper_wallet["poly"]["available"]
         banca_sx = paper_wallet["sx"]["available"]
 
-    logger.info("A iniciar scanner Paper Trading V7.4 (Poly Disp: $%.2f | SX Disp: $%.2f).", banca_poly, banca_sx)
+    logger.info("A iniciar scanner Paper Trading V7.5 (Poly Disp: $%.2f | SX Disp: $%.2f).", banca_poly, banca_sx)
 
     stats = {
         "jogos_casados": 0,
@@ -936,7 +933,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 s_disp = paper_wallet["sx"]["available"]
                 s_inv = paper_wallet["sx"]["invested"]
             body = (
-                "ROBO ARBITRAGEM PAPER TRADING V7.4 ONLINE (PROFIT DETAILS)\n"
+                "ROBO ARBITRAGEM PAPER TRADING V7.5 ONLINE (TOP OF BOOK)\n"
                 f"Polymarket Disp: ${p_disp:.2f} | Investido: ${p_inv:.2f}\n"
                 f"SX Bet Disp: ${s_disp:.2f} | Investido: ${s_inv:.2f}\n"
                 "Health / Wallet: /health\n"
