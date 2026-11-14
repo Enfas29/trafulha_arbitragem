@@ -13,11 +13,12 @@ import requests
 
 
 # ============================================================
-# 1. CONFIGURACOES (100% WEB3: POLYMARKET x SX BET V3)
+# 1. CONFIGURACOES (100% WEB3: POLYMARKET x SX BET OBV3)
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
+SX_API_KEY = os.getenv("SX_API_KEY", "")
 
 BANKROLL_USD = float(os.getenv("BANKROLL_USD", "100"))
 MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.5"))
@@ -39,8 +40,6 @@ POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
 SX_BASE = "https://api.sx.bet"
 
-SX_LEGACY_V2_USDC = "0x6629ce1cf35cc1329ebb4f63202f3f197b3f050b"
-
 
 # ============================================================
 # 2. LOGGING E ESTADO
@@ -53,7 +52,9 @@ logging.basicConfig(
 logger = logging.getLogger("ArbitrageWeb3Bot")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "TrafulhaArbitrageWeb3/5.7"})
+session.headers.update({"User-Agent": "TrafulhaArbitrageWeb3/5.8"})
+if SX_API_KEY:
+    session.headers.update({"x-sx-api-key": SX_API_KEY})
 
 state_lock = threading.Lock()
 scanner_status = {
@@ -66,12 +67,11 @@ scanner_status = {
     "matched_games": 0,
     "best_margin_pct": None,
     "opportunities": 0,
-    "sx_usdc_token": None,
-    "mode": "WEB3_POLYMARKET_X_SXBET_V3"
+    "sx_odds_endpoint": None,
+    "mode": "WEB3_POLYMARKET_X_SXBET_OBV3"
 }
 
 alert_history = {}
-sx_usdc_token_cache = None
 diagnostico_inicial_feito = False
 
 
@@ -412,83 +412,8 @@ def obter_jogos_polymarket():
 
 
 # ============================================================
-# 6. SX BET - DESCOBERTA DO CONTRATO USDC V3 E SUMMARY ENDPOINTS
+# 6. SX BET - MERCADOS ATIVOS E ORDERBOOK OBV3 (USDC)
 # ============================================================
-
-def _extrair_candidatos_token(obj, contexto="", resultados=None):
-    if resultados is None:
-        resultados = []
-
-    if isinstance(obj, dict):
-        ctx_local = contexto + " " + " ".join(
-            f"{k}:{v}" for k, v in obj.items() if isinstance(v, (str, int, float, bool))
-        )
-        for k, v in obj.items():
-            if isinstance(v, str) and re.fullmatch(r"0x[a-fA-F0-9]{40}", v):
-                resultados.append((v, f"{k} | {ctx_local}".lower()))
-            elif isinstance(v, (dict, list)):
-                _extrair_candidatos_token(v, f"{contexto} {k}", resultados)
-    elif isinstance(obj, list):
-        for item in obj:
-            _extrair_candidatos_token(item, contexto, resultados)
-
-    return resultados
-
-
-def obter_usdc_token_sx():
-    global sx_usdc_token_cache
-    if sx_usdc_token_cache:
-        return sx_usdc_token_cache
-
-    candidatos_brutos = []
-    meta_dumps = []
-
-    for meta_path in ("/metadata/obv3", "/metadata/token", "/metadata"):
-        try:
-            resp = http_get(f"{SX_BASE}{meta_path}", timeout=12)
-            _extrair_candidatos_token(resp, meta_path, candidatos_brutos)
-            if len(meta_dumps) < 2:
-                meta_dumps.append(f"{meta_path}: {json.dumps(resp, ensure_ascii=False)[:280]}")
-        except Exception:
-            continue
-
-    # Remove duplicados preservando prioridade:
-    # 1) Tokens associados a USDC que NAO sejam o contrato legado V2
-    # 2) Outros tokens encontrados no metadata (excluindo o legado V2)
-    prioritarios_usdc = []
-    outros_tokens = []
-    vistos = set()
-
-    for addr, ctx in candidatos_brutos:
-        addr_low = addr.lower()
-        if addr_low in vistos or addr_low == SX_LEGACY_V2_USDC:
-            continue
-        vistos.add(addr_low)
-        if "usdc" in ctx:
-            prioritarios_usdc.append(addr)
-        else:
-            outros_tokens.append(addr)
-
-    lista_teste = prioritarios_usdc + outros_tokens
-
-    # Testa cada token candidato contra /summary/upcoming/{token} ate obter HTTP 200
-    for addr in lista_teste:
-        try:
-            test_resp = session.get(f"{SX_BASE}/summary/upcoming/{addr}", timeout=12)
-            if test_resp.ok:
-                sx_usdc_token_cache = addr
-                logger.info("SX Bet USDC V3 baseToken validado: %s", addr)
-                with state_lock:
-                    scanner_status["sx_usdc_token"] = addr
-                return addr
-        except Exception:
-            continue
-
-    for dump in meta_dumps:
-        logger.info("Diagnostico Metadata SX | %s", dump)
-
-    return None
-
 
 def obter_mercados_sx():
     mercados = []
@@ -530,7 +455,6 @@ def obter_mercados_sx():
             mercados.append({
                 "market_hash": m_hash,
                 "event_id": str(m.get("sportXeventId") or m.get("eventId") or ""),
-                "bet_group": str(m.get("betGroup") or m.get("group") or ""),
                 "type": m_type,
                 "team_one": team1,
                 "team_two": team2,
@@ -548,145 +472,114 @@ def obter_mercados_sx():
     return mercados
 
 
-def _normalizar_odd_sx(raw_val):
-    try:
-        v = float(raw_val)
-    except (ValueError, TypeError):
-        return None
-    if v <= 0:
-        return None
-
-    if v > 1e12:
-        prob = v / 1e20
-        if not (0.01 < prob < 0.99):
-            return None
-        odd_bruta = 1.0 / prob
-    elif 1.01 <= v <= 100.0:
-        odd_bruta = v
-    elif 0.01 < v < 1.0:
-        odd_bruta = 1.0 / v
+def _extrair_niveis_lado_obv3(lado_raw):
+    """
+    Converte niveis do livro OBv3 da SX Bet (perspetiva maker) para a perspetiva taker:
+    - Maker apostado em outcomeOne -> Taker aposta em outcomeTwo (odd = 1 / (1 - maker_prob))
+    - Capacidade do taker em USDC = maker_size * (taker_prob / maker_prob)
+    """
+    if isinstance(lado_raw, dict):
+        itens = [lado_raw]
+    elif isinstance(lado_raw, list):
+        itens = lado_raw
     else:
-        return None
+        return []
 
+    niveis_taker = []
     fator_taxa_sx = 1.0 - (SX_FEE_BUFFER_PCT / 100.0)
-    return 1.0 + (odd_bruta - 1.0) * fator_taxa_sx
+
+    for item in itens:
+        if not isinstance(item, dict):
+            continue
+
+        raw_odds = item.get("percentageOdds")
+        raw_size = item.get("size") if item.get("size") is not None else item.get("totalBetSize")
+        if raw_odds is None or raw_size is None:
+            continue
+
+        try:
+            maker_prob = float(raw_odds) / 1e20
+            maker_stake_usdc = float(raw_size) / 1e6
+        except (ValueError, TypeError):
+            continue
+
+        if not (0.01 < maker_prob < 0.99) or maker_stake_usdc <= 0:
+            continue
+
+        taker_prob = 1.0 - maker_prob
+        taker_odd_bruta = 1.0 / taker_prob
+        taker_odd = 1.0 + (taker_odd_bruta - 1.0) * fator_taxa_sx
+        taker_liq_usdc = maker_stake_usdc * (taker_prob / maker_prob)
+
+        if taker_liq_usdc > 0:
+            niveis_taker.append({
+                "odd": taker_odd,
+                "liquidity_usdc": taker_liq_usdc
+            })
+
+    niveis_taker.sort(key=lambda x: x["odd"], reverse=True)
+    return niveis_taker
 
 
-def _normalizar_liquidez_usdc(raw_val):
-    try:
-        v = float(raw_val)
-    except (ValueError, TypeError):
-        return 0.0
-    if v <= 0:
-        return 0.0
-    return (v / 1e6) if v >= 10000 else v
-
-
-def _extrair_lado_summary(bloco):
-    if isinstance(bloco, list):
-        melhor = None
-        for item in bloco:
-            cand = _extrair_lado_summary(item)
-            if cand and (melhor is None or cand["odd"] > melhor["odd"]):
-                melhor = cand
-        return melhor
-
-    if not isinstance(bloco, dict):
-        return None
-
-    odd_val = None
-    for k in ("percentageOdds", "odds", "decimalOdds", "bestOdds", "price", "impliedProbability", "takerOdds", "makerOdds"):
-        if bloco.get(k) is not None:
-            odd_val = _normalizar_odd_sx(bloco[k])
-            if odd_val:
-                break
-
-    if not odd_val:
-        return None
-
-    liq_val = 0.0
-    for k in ("liquidity", "availableLiquidity", "totalLiquidity", "maxBet", "amount", "size", "takerLiquidity", "totalBetSize"):
-        if bloco.get(k) is not None:
-            liq_val = _normalizar_liquidez_usdc(bloco[k])
-            if liq_val > 0:
-                break
-
-    if liq_val <= 0:
-        liq_val = max(MIN_LIQUIDITY_USD, 25.0)
-
-    return {"odd": odd_val, "liquidity_usdc": liq_val}
-
-
-def _varrer_summaries_sx(obj, melhores_por_mercado, mapa_eventos):
-    if isinstance(obj, list):
-        for item in obj:
-            _varrer_summaries_sx(item, melhores_por_mercado, mapa_eventos)
+def _registar_livro_mercado_obv3(m_hash, bloco, melhores_por_mercado):
+    if not m_hash or not isinstance(bloco, dict):
         return
 
-    if not isinstance(obj, dict):
+    # Ordens maker em outcomeOne oferecem aposta taker em outcome_two
+    niveis_para_out2 = _extrair_niveis_lado_obv3(bloco.get("outcomeOne"))
+    # Ordens maker em outcomeTwo oferecem aposta taker em outcome_one
+    niveis_para_out1 = _extrair_niveis_lado_obv3(bloco.get("outcomeTwo"))
+
+    if not niveis_para_out1 and not niveis_para_out2:
         return
 
-    m_hash = obj.get("marketHash")
+    lados = melhores_por_mercado.setdefault(m_hash, {})
 
-    if not m_hash:
-        ev_id = str(obj.get("sportXeventId") or obj.get("eventId") or "")
-        m_type = obj.get("type")
-        if ev_id and m_type is not None:
-            m_hash = mapa_eventos.get((ev_id, m_type))
+    if niveis_para_out1:
+        melhor_1 = niveis_para_out1[0]
+        liq_topo_1 = sum(
+            n["liquidity_usdc"] for n in niveis_para_out1
+            if abs(n["odd"] - melhor_1["odd"]) < 0.002
+        )
+        lados["outcome_one"] = {
+            "odd": melhor_1["odd"],
+            "liquidity_usdc": liq_topo_1,
+            "levels": niveis_para_out1
+        }
 
-    if m_hash:
-        lados = melhores_por_mercado.setdefault(m_hash, {})
+    if niveis_para_out2:
+        melhor_2 = niveis_para_out2[0]
+        liq_topo_2 = sum(
+            n["liquidity_usdc"] for n in niveis_para_out2
+            if abs(n["odd"] - melhor_2["odd"]) < 0.002
+        )
+        lados["outcome_two"] = {
+            "odd": melhor_2["odd"],
+            "liquidity_usdc": liq_topo_2,
+            "levels": niveis_para_out2
+        }
 
-        if obj.get("outcomeOne") is not None:
-            res1 = _extrair_lado_summary(obj["outcomeOne"])
-            if res1:
-                lados["outcome_one"] = res1
-        if obj.get("outcomeTwo") is not None:
-            res2 = _extrair_lado_summary(obj["outcomeTwo"])
-            if res2:
-                lados["outcome_two"] = res2
 
-        for k_odd in ("outcomeOnePercentageOdds", "outcomeOneOdds", "bestOutcomeOneOdds"):
-            if obj.get(k_odd) is not None and "outcome_one" not in lados:
-                o1 = _normalizar_odd_sx(obj[k_odd])
-                if o1:
-                    liq1 = 0.0
-                    for k_liq in ("outcomeOneLiquidity", "outcomeOneAvailableLiquidity", "outcomeOneMaxBet", "liquidity"):
-                        if obj.get(k_liq) is not None:
-                            liq1 = _normalizar_liquidez_usdc(obj[k_liq])
-                            if liq1 > 0:
-                                break
-                    lados["outcome_one"] = {
-                        "odd": o1,
-                        "liquidity_usdc": liq1 if liq1 > 0 else max(MIN_LIQUIDITY_USD, 25.0)
-                    }
+def _parsear_payload_obv3(data, melhores_por_mercado, m_hash_fallback=None):
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                mh = item.get("marketHash") or m_hash_fallback
+                _registar_livro_mercado_obv3(mh, item, melhores_por_mercado)
+        return
 
-        for k_odd in ("outcomeTwoPercentageOdds", "outcomeTwoOdds", "bestOutcomeTwoOdds"):
-            if obj.get(k_odd) is not None and "outcome_two" not in lados:
-                o2 = _normalizar_odd_sx(obj[k_odd])
-                if o2:
-                    liq2 = 0.0
-                    for k_liq in ("outcomeTwoLiquidity", "outcomeTwoAvailableLiquidity", "outcomeTwoMaxBet", "liquidity"):
-                        if obj.get(k_liq) is not None:
-                            liq2 = _normalizar_liquidez_usdc(obj[k_liq])
-                            if liq2 > 0:
-                                break
-                    lados["outcome_two"] = {
-                        "odd": o2,
-                        "liquidity_usdc": liq2 if liq2 > 0 else max(MIN_LIQUIDITY_USD, 25.0)
-                    }
+    if not isinstance(data, dict):
+        return
 
-    for k, v in obj.items():
-        if str(k).startswith("0x") and len(str(k)) >= 40 and isinstance(v, (dict, list)):
-            if isinstance(v, dict):
-                copia = dict(v, marketHash=k)
-                _varrer_summaries_sx(copia, melhores_por_mercado, mapa_eventos)
-            else:
-                for item in v:
-                    if isinstance(item, dict):
-                        _varrer_summaries_sx(dict(item, marketHash=k), melhores_por_mercado, mapa_eventos)
-        elif isinstance(v, (dict, list)):
-            _varrer_summaries_sx(v, melhores_por_mercado, mapa_eventos)
+    if "outcomeOne" in data or "outcomeTwo" in data:
+        mh = data.get("marketHash") or m_hash_fallback
+        _registar_livro_mercado_obv3(mh, data, melhores_por_mercado)
+        return
+
+    for k, v in data.items():
+        if isinstance(v, dict) and ("outcomeOne" in v or "outcomeTwo" in v):
+            mh = v.get("marketHash") or (k if str(k).startswith("0x") else m_hash_fallback)
+            _registar_livro_mercado_obv3(mh, v, melhores_por_mercado)
 
 
 def obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=False):
@@ -694,65 +587,67 @@ def obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=False):
     if not mercados_relevantes:
         return melhores_por_mercado
 
-    base_token = obter_usdc_token_sx()
-    if not base_token:
-        logger.error("Nao foi encontrado nenhum baseToken V3 ativo na SX Bet.")
-        return melhores_por_mercado
+    hashes_unicos = list(dict.fromkeys(m["market_hash"] for m in mercados_relevantes))
+    rota_usada = None
+    diag_msg = None
 
-    mapa_eventos = {
-        (m["event_id"], m["type"]): m["market_hash"]
-        for m in mercados_relevantes
-        if m.get("event_id")
-    }
-
-    amostra_200 = None
-
-    # 1) Consulta global dos jogos futuros, populares e ao vivo em USDC V3
-    for summary_path in (f"/summary/upcoming/{base_token}", f"/summary/popular/{base_token}", f"/summary/inplay/{base_token}"):
+    # 1) Endpoint oficial OBv3 em lote: GET /orders-v3/odds/best
+    for i in range(0, len(hashes_unicos), 50):
+        lote = hashes_unicos[i:i + 50]
         try:
-            resp = session.get(f"{SX_BASE}{summary_path}", timeout=20)
+            resp = session.get(
+                f"{SX_BASE}/orders-v3/odds/best",
+                params={"marketHashes": ",".join(lote)},
+                timeout=20
+            )
+            if resp.status_code == 400:
+                resp = session.get(
+                    f"{SX_BASE}/orders-v3/odds/best",
+                    params=[("marketHashes", h) for h in lote],
+                    timeout=20
+                )
+
             if resp.ok:
                 payload = resp.json()
                 data = payload.get("data", payload) if isinstance(payload, dict) else payload
-                if amostra_200 is None and data:
-                    amostra_200 = (summary_path, data)
-                _varrer_summaries_sx(data, melhores_por_mercado, mapa_eventos)
+                _parsear_payload_obv3(data, melhores_por_mercado)
+                rota_usada = "/orders-v3/odds/best"
+                if diag_msg is None:
+                    diag_msg = f"/orders-v3/odds/best -> HTTP 200: {json.dumps(data, ensure_ascii=False)[:260]}"
+            elif diag_msg is None:
+                diag_msg = f"/orders-v3/odds/best -> HTTP {resp.status_code}: {resp.text[:160]}"
         except Exception as e:
-            logger.debug("Erro em %s: %s", summary_path, e)
+            if diag_msg is None:
+                diag_msg = f"/orders-v3/odds/best -> ERR: {e}"
 
-    # 2) Consulta por evento individual para mercados relevantes ainda sem odds
-    eventos_em_falta = []
-    vistos_ev = set()
-    for m in mercados_relevantes:
-        ev_id = m.get("event_id")
-        if ev_id and ev_id not in vistos_ev and m["market_hash"] not in melhores_por_mercado:
-            vistos_ev.add(ev_id)
-            eventos_em_falta.append(m)
-
-    for m_item in eventos_em_falta[:25]:
-        ev_id = m_item["event_id"]
-        b_group = m_item.get("bet_group") or "1X2"
-        rotas_evento = [
-            f"/summary/event/summary/{ev_id}/{base_token}",
-            f"/summary/birdseye/{ev_id}/{base_token}",
-            f"/summary/event/{ev_id}/{b_group}/{base_token}"
-        ]
-        for ev_path in rotas_evento:
+    # 2) Fallback: GET /orderbook-v3/snapshot/market para os mercados relevantes
+    if not melhores_por_mercado:
+        for m_hash in hashes_unicos[:40]:
             try:
-                resp = session.get(f"{SX_BASE}{ev_path}", timeout=12)
+                resp = session.get(
+                    f"{SX_BASE}/orderbook-v3/snapshot/market",
+                    params={"marketHash": m_hash},
+                    timeout=12
+                )
                 if resp.ok:
                     payload = resp.json()
                     data = payload.get("data", payload) if isinstance(payload, dict) else payload
-                    if amostra_200 is None and data:
-                        amostra_200 = (ev_path, data)
-                    _varrer_summaries_sx(data, melhores_por_mercado, mapa_eventos)
-                    break
+                    _parsear_payload_obv3(data, melhores_por_mercado, m_hash_fallback=m_hash)
+                    if rota_usada is None:
+                        rota_usada = "/orderbook-v3/snapshot/market"
+                    if diag_msg is None or "HTTP 200" not in diag_msg:
+                        diag_msg = f"/orderbook-v3/snapshot/market -> HTTP 200: {json.dumps(data, ensure_ascii=False)[:260]}"
+                elif diag_msg is None:
+                    diag_msg = f"/orderbook-v3/snapshot/market -> HTTP {resp.status_code}: {resp.text[:160]}"
             except Exception:
                 continue
 
-    if log_diagnostico and not melhores_por_mercado and amostra_200:
-        rota_ok, dados_ok = amostra_200
-        logger.info("Diagnostico Payload V3 (%s) | %s", rota_ok, json.dumps(dados_ok, ensure_ascii=False)[:350])
+    if rota_usada:
+        with state_lock:
+            scanner_status["sx_odds_endpoint"] = rota_usada
+
+    if log_diagnostico and diag_msg:
+        logger.info("Diagnostico SX OBv3 | %s", diag_msg)
 
     return melhores_por_mercado
 
@@ -993,7 +888,7 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
 
 def ciclo_scanner():
     global diagnostico_inicial_feito
-    logger.info("A iniciar scanner Web3 V5.7 (Polymarket x SX Bet | MIN_PROFIT = %s%%).", MIN_PROFIT_PCT)
+    logger.info("A iniciar scanner Web3 V5.8 (Polymarket x SX Bet OBv3 | MIN_PROFIT = %s%%).", MIN_PROFIT_PCT)
 
     stats = {
         "jogos_casados": 0,
@@ -1014,7 +909,7 @@ def ciclo_scanner():
     if fazer_diag:
         diagnostico_inicial_feito = True
         logger.info(
-            "Diagnostico Cruzamento | Pares por nome: %s | Mercados SX com odds: %s",
+            "Diagnostico Cruzamento | Pares por nome: %s | Mercados SX com odds OBv3: %s",
             len(mercados_relevantes),
             len(odds_sx)
         )
@@ -1072,8 +967,8 @@ class SimpleHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         else:
             body = (
-                "ROBO ARBITRAGEM WEB3 V5.7 ONLINE\n"
-                "Plataformas: Polymarket x SX Bet V3 (USDC)\n"
+                "ROBO ARBITRAGEM WEB3 V5.8 ONLINE\n"
+                "Plataformas: Polymarket x SX Bet OBv3 (USDC)\n"
                 "Mode: SCAN ONLY\n"
                 "Health: /health\n"
             ).encode("utf-8")
