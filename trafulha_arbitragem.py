@@ -13,44 +13,31 @@ import requests
 
 
 # ============================================================
-# 1. CONFIGURACOES
+# 1. CONFIGURACOES (100% WEB3: POLYMARKET x SX BET)
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 
-BANKROLL_EUR = float(os.getenv("BANKROLL_EUR", "100"))
 BANKROLL_USD = float(os.getenv("BANKROLL_USD", "100"))
-EUR_USD_RATE = float(os.getenv("EUR_USD_RATE", "1.08"))
-
 MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "1.0"))
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "14400"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 
 MIN_POLY_VOLUME = float(os.getenv("MIN_POLY_VOLUME", "2000"))
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "15"))
+
 POLY_FEE_BUFFER_PCT = float(os.getenv("POLY_FEE_BUFFER_PCT", "1.0"))
-
-BOOKMAKER_FILTER = [
-    x.strip().lower()
-    for x in os.getenv("BOOKMAKER_FILTER", "").split(",")
-    if x.strip()
-]
-
-CUSTOM_SPORT_KEYS = [
-    x.strip()
-    for x in os.getenv("SPORT_KEYS", "").split(",")
-    if x.strip()
-]
+SX_FEE_BUFFER_PCT = float(os.getenv("SX_FEE_BUFFER_PCT", "0.0"))
 
 MAX_POLY_PAGES = int(os.getenv("MAX_POLY_PAGES", "10"))
 MAX_POLY_MARKETS = int(os.getenv("MAX_POLY_MARKETS", "300"))
 
-ALERT_COOLDOWN = 3600
+ALERT_COOLDOWN = 1800  # 30 minutos para nao repetir o mesmo alerta
 AUTO_BET = False
 
-ODDS_BASE = "https://api.the-odds-api.com/v4"
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
+SX_BASE = "https://api.sx.bet"
 
 
 # ============================================================
@@ -61,43 +48,35 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("ArbitrageBot")
+logger = logging.getLogger("ArbitrageWeb3Bot")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "TrafulhaArbitrage/4.1"})
+session.headers.update({"User-Agent": "TrafulhaArbitrageWeb3/5.0"})
 
 state_lock = threading.Lock()
 scanner_status = {
     "running": True,
     "last_scan": None,
     "last_error": None,
-    "events_checked": 0,
     "poly_games_checked": 0,
+    "sx_markets_checked": 0,
     "matched_games": 0,
     "best_margin_pct": None,
     "opportunities": 0,
-    "sports": [],
-    "mode": "HYBRID_POLY_BOOKMAKERS"
+    "mode": "WEB3_POLYMARKET_X_SXBET"
 }
 
 alert_history = {}
 
 
 # ============================================================
-# 3. UTILITARIOS HTTP E NORMALIZACAO DE NOMES
+# 3. UTILITARIOS HTTP E NORMALIZACAO DE EQUIPAS
 # ============================================================
 
-def limpar_erro_url(texto):
-    return re.sub(r"apiKey=[^&\s]+", "apiKey=***", str(texto))
-
-
 def http_get(url, params=None, timeout=20):
-    try:
-        response = session.get(url, params=params, timeout=timeout)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        raise requests.RequestException(limpar_erro_url(e)) from None
+    response = session.get(url, params=params, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
 
 
 def converter_lista(valor):
@@ -146,7 +125,14 @@ ALIASES_EQUIPAS = {
     "los angeles clippers": "clippers",
     "la clippers": "clippers",
     "golden state warriors": "warriors",
-    "boston celtics": "celtics"
+    "boston celtics": "celtics",
+    "new york knicks": "knicks",
+    "brooklyn nets": "nets",
+    "philadelphia 76ers": "76ers",
+    "milwaukee bucks": "bucks",
+    "denver nuggets": "nuggets",
+    "phoenix suns": "suns",
+    "dallas mavericks": "mavericks"
 }
 
 
@@ -181,20 +167,24 @@ def equipas_coincidem(nome_a, nome_b):
     return len(intersecao) >= min(len(tok_a), len(tok_b))
 
 
-def parse_iso_datetime(dt_str):
-    if not dt_str:
+def parse_timestamp_utc(valor):
+    if not valor:
         return None
+    if isinstance(valor, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(valor), tz=timezone.utc)
+        except (ValueError, OSError):
+            return None
     try:
-        return datetime.fromisoformat(str(dt_str).replace("Z", "+00:00"))
+        return datetime.fromisoformat(str(valor).replace("Z", "+00:00"))
     except ValueError:
         return None
 
 
-def formatar_data_pt(dt_str):
-    dt = parse_iso_datetime(dt_str)
-    if not dt:
+def formatar_data_pt(dt_obj):
+    if not dt_obj:
         return "Data por confirmar"
-    return dt.strftime("%d/%m/%Y as %H:%M UTC")
+    return dt_obj.strftime("%d/%m/%Y as %H:%M UTC")
 
 
 # ============================================================
@@ -203,7 +193,7 @@ def formatar_data_pt(dt_str):
 
 def enviar_alerta_telegram(mensagem, alert_key=None):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.warning("Telegram nao configurado (TELEGRAM_TOKEN ou CHAT_ID em falta).")
+        logger.warning("Telegram nao configurado.")
         return False
 
     now = time.time()
@@ -226,7 +216,7 @@ def enviar_alerta_telegram(mensagem, alert_key=None):
             return False
         if alert_key:
             alert_history[alert_key] = now
-        logger.info("Alerta enviado para Telegram com sucesso!")
+        logger.info("Alerta enviado para Telegram!")
         return True
     except requests.RequestException as e:
         logger.error("Erro de rede Telegram: %s", e)
@@ -238,109 +228,15 @@ def gerar_chave_alerta(texto):
 
 
 # ============================================================
-# 5. THE ODDS API
-# ============================================================
-
-def descobrir_desportos():
-    if not ODDS_API_KEY:
-        return []
-    if CUSTOM_SPORT_KEYS:
-        return CUSTOM_SPORT_KEYS
-    try:
-        sports = http_get(f"{ODDS_BASE}/sports", params={"apiKey": ODDS_API_KEY})
-        return [s["key"] for s in sports if s.get("active")][:6]
-    except requests.RequestException as e:
-        logger.error("Erro ao descobrir competicoes: %s", e)
-        return []
-
-
-def obter_odds_desporto(sport_key):
-    if not ODDS_API_KEY:
-        return []
-    try:
-        dados = http_get(
-            f"{ODDS_BASE}/sports/{sport_key}/odds",
-            params={
-                "apiKey": ODDS_API_KEY,
-                "regions": "eu",
-                "markets": "h2h",
-                "oddsFormat": "decimal"
-            },
-            timeout=25
-        )
-        logger.info("%s: %s eventos", sport_key, len(dados))
-        return dados
-    except requests.RequestException as e:
-        logger.error("Erro em %s: %s", sport_key, e)
-        return []
-
-
-def extrair_melhores_odds_tradicionais(evento, casas_vistas):
-    sport = evento.get("sport_key", "")
-    home_raw = evento.get("home_team", "")
-    away_raw = evento.get("away_team", "")
-    if not home_raw or not away_raw:
-        return None
-
-    is_soccer = sport.startswith("soccer_")
-    melhores = {}
-
-    for bookmaker in evento.get("bookmakers", []):
-        bk_key = bookmaker.get("key", "").lower()
-        bk_name = bookmaker.get("title", bk_key)
-        casas_vistas.add(bk_key)
-
-        if BOOKMAKER_FILTER and bk_key not in BOOKMAKER_FILTER:
-            continue
-
-        for market in bookmaker.get("markets", []):
-            if market.get("key") != "h2h":
-                continue
-
-            for outcome in market.get("outcomes", []):
-                out_name = outcome.get("name", "")
-                try:
-                    odd = float(outcome.get("price", 0))
-                except (ValueError, TypeError):
-                    continue
-                if odd <= 1.0:
-                    continue
-
-                slot = None
-                if normalizar_texto(out_name) == "draw":
-                    slot = "draw"
-                elif equipas_coincidem(out_name, home_raw):
-                    slot = "home"
-                elif equipas_coincidem(out_name, away_raw):
-                    slot = "away"
-
-                if not slot:
-                    continue
-
-                if slot not in melhores or odd > melhores[slot]["odd"]:
-                    melhores[slot] = {
-                        "odd": odd,
-                        "bookmaker": bk_name,
-                        "label": out_name
-                    }
-
-    if "home" not in melhores or "away" not in melhores:
-        return None
-    if is_soccer and "draw" not in melhores:
-        return None
-
-    return melhores
-
-
-# ============================================================
-# 6. POLYMARKET - RECOLHA DE JOGOS DESPORTIVOS
+# 5. POLYMARKET - RECOLHA DE JOGOS E ORDER BOOK CLOB
 # ============================================================
 
 SPORT_KEYWORDS = [
     " vs ", " vs. ", "nba", "euroleague", "premier league",
     "champions league", "la liga", "serie a", "bundesliga",
     "ligue 1", "primeira liga", "benfica", "porto", "sporting",
-    "ufc", "mma", "atp", "wta", "tennis", "basketball", "soccer", "football"
+    "ufc", "mma", "atp", "wta", "tennis", "basketball", "soccer",
+    "football", "nhl", "hockey", "nfl", "mlb", "baseball"
 ]
 
 
@@ -423,6 +319,11 @@ def obter_jogos_polymarket():
                 if m.get("closed") is True or m.get("active") is False:
                     continue
 
+                q_lower = str(m.get("question", "")).lower()
+                g_lower = str(m.get("groupItemTitle", "")).lower()
+                if any(w in f"{q_lower} {g_lower}" for w in ["spread", "over", "under", "total", "goals", "points", "handicap", "o/u"]):
+                    continue
+
                 try:
                     m_vol = float(m.get("volume", 0) or 0)
                 except (ValueError, TypeError):
@@ -460,7 +361,8 @@ def obter_jogos_polymarket():
                 jogos_poly.append({
                     "event_id": ev_id,
                     "title": titulo,
-                    "end_date": ev.get("endDate") or ev.get("startDate"),
+                    "slug": ev.get("slug", ""),
+                    "end_date": parse_timestamp_utc(ev.get("endDate") or ev.get("startDate")),
                     "volume": ev_volume,
                     "markets": submercados
                 })
@@ -472,10 +374,157 @@ def obter_jogos_polymarket():
 
 
 # ============================================================
-# 7. MOTOR DE CRUZAMENTO: POLYMARKET x CASAS DE APOSTAS
+# 6. SX BET - MERCADOS ATIVOS E LIVRO DE ORDENS (USDC)
 # ============================================================
 
-def extrair_opcoes_poly_para_jogo(jogo_poly, home_team, away_team, is_soccer):
+def obter_mercados_sx():
+    """
+    Recolhe mercados ativos de vencedor de jogo (Moneyline / 1X2) na SX Bet.
+    """
+    mercados = []
+    next_key = None
+
+    for _ in range(8):
+        params = {"onlyMainLine": "true"}
+        if next_key:
+            params["paginationKey"] = next_key
+
+        try:
+            resp = http_get(f"{SX_BASE}/markets/active", params=params, timeout=20)
+        except requests.RequestException as e:
+            logger.error("Erro ao ler mercados SX Bet: %s", e)
+            break
+
+        data = resp.get("data", {})
+        lista = data.get("markets", [])
+        if not lista:
+            break
+
+        for m in lista:
+            if m.get("status") != "ACTIVE":
+                continue
+
+            # Tipos de vencedor direto na SX Bet: 1 (1X2 / Moneyline), 52 (12), 226 (Game Winner)
+            m_type = m.get("type")
+            if m_type not in (1, 52, 226):
+                continue
+
+            team1 = m.get("teamOneName", "")
+            team2 = m.get("teamTwoName", "")
+            out1 = m.get("outcomeOneName", "")
+            out2 = m.get("outcomeTwoName", "")
+            m_hash = m.get("marketHash", "")
+
+            if not (team1 and team2 and out1 and out2 and m_hash):
+                continue
+
+            mercados.append({
+                "market_hash": m_hash,
+                "team_one": team1,
+                "team_two": team2,
+                "outcome_one": out1,
+                "outcome_two": out2,
+                "sport": m.get("sportLabel", ""),
+                "league": m.get("leagueLabel", ""),
+                "game_time": parse_timestamp_utc(m.get("gameTime"))
+            })
+
+        next_key = data.get("nextKey")
+        if not next_key:
+            break
+
+    return mercados
+
+
+def obter_melhores_odds_sx(market_hashes):
+    """
+    Consulta o livro de ordens da SX Bet e calcula a melhor odd e liquidez
+    disponivel para o Taker em outcomeOne e outcomeTwo.
+    """
+    melhores_por_mercado = {}
+    hashes_unicos = list(set(market_hashes))
+
+    for i in range(0, len(hashes_unicos), 30):
+        lote = hashes_unicos[i:i + 30]
+        try:
+            resp = http_get(
+                f"{SX_BASE}/orders",
+                params={"marketHashes": ",".join(lote)},
+                timeout=20
+            )
+        except requests.RequestException as e:
+            logger.error("Erro ao ler ordens SX Bet: %s", e)
+            continue
+
+        ordens = resp.get("data", [])
+        if isinstance(ordens, dict):
+            ordens = ordens.get("orders", [])
+
+        for o in ordens:
+            if o.get("orderStatus") != "ACTIVE":
+                continue
+
+            m_hash = o.get("marketHash", "")
+            if not m_hash:
+                continue
+
+            try:
+                maker_prob = int(o["percentageOdds"]) / 1e20
+                total_bet = int(o["totalBetSize"])
+                fill_amount = int(o.get("fillAmount", 0))
+            except (ValueError, TypeError, KeyError):
+                continue
+
+            if not (0.01 < maker_prob < 0.99):
+                continue
+
+            maker_rem_usdc = (total_bet - fill_amount) / 1e6
+            if maker_rem_usdc <= 0:
+                continue
+
+            # Na SX Bet, o Taker aposta no lado OPOSTO ao do Maker
+            taker_prob = 1.0 - maker_prob
+            taker_odd_bruta = 1.0 / taker_prob
+            fator_taxa_sx = 1.0 - (SX_FEE_BUFFER_PCT / 100.0)
+            taker_odd = 1.0 + (taker_odd_bruta - 1.0) * fator_taxa_sx
+
+            # Liquidez maxima que o Taker pode colocar nesta ordem (em USDC)
+            taker_liq_usdc = maker_rem_usdc * (taker_prob / maker_prob)
+            if taker_liq_usdc < 5.0:
+                continue
+
+            taker_slot = "outcome_two" if o.get("isMakerBettingOutcomeOne") else "outcome_one"
+
+            if m_hash not in melhores_por_mercado:
+                melhores_por_mercado[m_hash] = {}
+
+            atual = melhores_por_mercado[m_hash].get(taker_slot)
+            if not atual or taker_odd > atual["odd"]:
+                melhores_por_mercado[m_hash][taker_slot] = {
+                    "odd": taker_odd,
+                    "liquidity_usdc": taker_liq_usdc
+                }
+            elif abs(taker_odd - atual["odd"]) < 0.002:
+                atual["liquidity_usdc"] += taker_liq_usdc
+
+    return melhores_por_mercado
+
+
+# ============================================================
+# 7. MOTOR DE CRUZAMENTO: POLYMARKET x SX BET
+# ============================================================
+
+def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
+    """
+    Mapeia as opcoes da Polymarket para os lados exactos do mercado da SX Bet:
+    - 'sx_one': corresponde a sx_market['outcome_one']
+    - 'sx_two': corresponde a sx_market['outcome_two']
+    """
+    out1_sx = sx_market["outcome_one"]
+    out2_sx = sx_market["outcome_two"]
+    team1 = sx_market["team_one"]
+    team2 = sx_market["team_two"]
+
     opcoes = {}
 
     for m in jogo_poly["markets"]:
@@ -488,51 +537,90 @@ def extrair_opcoes_poly_para_jogo(jogo_poly, home_team, away_team, is_soccer):
 
         outs_norm = [normalizar_texto(o) for o in outs]
 
+        # Caso 1: Mercado direto "Team A vs Team B" na Polymarket
         if "yes" not in outs_norm and "no" not in outs_norm:
             for idx, out_name in enumerate(outs):
-                if equipas_coincidem(out_name, home_team):
-                    opcoes["home"] = {
+                if equipas_coincidem(out_name, out1_sx) and not equipas_coincidem(out_name, out2_sx):
+                    opcoes["sx_one"] = {
                         "token_id": tids[idx],
                         "indicative_price": iprices[idx],
                         "volume": vol,
-                        "label": f"{home_team} Vence"
+                        "label": out_name
                     }
-                elif equipas_coincidem(out_name, away_team):
-                    opcoes["away"] = {
+                elif equipas_coincidem(out_name, out2_sx) and not equipas_coincidem(out_name, out1_sx):
+                    opcoes["sx_two"] = {
                         "token_id": tids[idx],
                         "indicative_price": iprices[idx],
                         "volume": vol,
-                        "label": f"{away_team} Vence"
+                        "label": out_name
                     }
 
-        elif "yes" in outs_norm:
+        # Caso 2: Mercado binario Yes/No na Polymarket (ex: "Will Benfica win?" -> Yes = Benfica, No = Not Benfica)
+        elif "yes" in outs_norm and "no" in outs_norm:
             yes_idx = outs_norm.index("yes")
+            no_idx = outs_norm.index("no")
             alvo_texto = g if g else q
 
-            if any(w in alvo_texto.lower() for w in ["spread", "over", "under", "total", "goals", "points", "handicap", "o/u"]):
-                continue
+            # Se SX Bet tem outcomeOne="Benfica" e outcomeTwo="Not Benfica"
+            if normalizar_texto(out2_sx).startswith("not ") and equipas_coincidem(alvo_texto, out1_sx):
+                opcoes["sx_one"] = {
+                    "token_id": tids[yes_idx],
+                    "indicative_price": iprices[yes_idx],
+                    "volume": vol,
+                    "label": f"{out1_sx} (Yes)"
+                }
+                opcoes["sx_two"] = {
+                    "token_id": tids[no_idx],
+                    "indicative_price": iprices[no_idx],
+                    "volume": vol,
+                    "label": f"{out2_sx} (No)"
+                }
 
-            if is_soccer and ("draw" in normalizar_texto(alvo_texto) or "tie" in normalizar_texto(alvo_texto)):
-                opcoes["draw"] = {
+            # Se SX Bet tem outcomeOne="Tie" e outcomeTwo="Not Tie"
+            elif normalizar_texto(out1_sx) in ("tie", "draw") and ("draw" in normalizar_texto(alvo_texto) or "tie" in normalizar_texto(alvo_texto)):
+                opcoes["sx_one"] = {
                     "token_id": tids[yes_idx],
                     "indicative_price": iprices[yes_idx],
                     "volume": vol,
-                    "label": "Empate"
+                    "label": "Empate (Yes)"
                 }
-            elif equipas_coincidem(alvo_texto, home_team) and not equipas_coincidem(alvo_texto, away_team):
-                opcoes["home"] = {
-                    "token_id": tids[yes_idx],
-                    "indicative_price": iprices[yes_idx],
+                opcoes["sx_two"] = {
+                    "token_id": tids[no_idx],
+                    "indicative_price": iprices[no_idx],
                     "volume": vol,
-                    "label": f"{home_team} Vence"
+                    "label": "Sem Empate (No)"
                 }
-            elif equipas_coincidem(alvo_texto, away_team) and not equipas_coincidem(alvo_texto, home_team):
-                opcoes["away"] = {
-                    "token_id": tids[yes_idx],
-                    "indicative_price": iprices[yes_idx],
-                    "volume": vol,
-                    "label": f"{away_team} Vence"
-                }
+
+            # Se SX Bet e 2-way (Team 1 vs Team 2) e Polymarket pergunta "Will Team 1 win?"
+            elif equipas_coincidem(alvo_texto, team1) and not equipas_coincidem(alvo_texto, team2):
+                if equipas_coincidem(team1, out1_sx):
+                    opcoes["sx_one"] = {
+                        "token_id": tids[yes_idx],
+                        "indicative_price": iprices[yes_idx],
+                        "volume": vol,
+                        "label": f"{team1} Vence (Yes)"
+                    }
+                    opcoes["sx_two"] = {
+                        "token_id": tids[no_idx],
+                        "indicative_price": iprices[no_idx],
+                        "volume": vol,
+                        "label": f"{team2} Vence (No)"
+                    }
+
+            elif equipas_coincidem(alvo_texto, team2) and not equipas_coincidem(alvo_texto, team1):
+                if equipas_coincidem(team2, out2_sx):
+                    opcoes["sx_two"] = {
+                        "token_id": tids[yes_idx],
+                        "indicative_price": iprices[yes_idx],
+                        "volume": vol,
+                        "label": f"{team2} Vence (Yes)"
+                    }
+                    opcoes["sx_one"] = {
+                        "token_id": tids[no_idx],
+                        "indicative_price": iprices[no_idx],
+                        "volume": vol,
+                        "label": f"{team1} Vence (No)"
+                    }
 
     return opcoes
 
@@ -545,71 +633,77 @@ def calcular_odd_liquida_poly(ask_price):
     return 1.0 / preco_com_taxa
 
 
-def cruzar_evento_hibrido(evento, jogos_poly, stats):
-    home = evento.get("home_team", "")
-    away = evento.get("away_team", "")
-    sport = evento.get("sport_key", "")
-    commence_time = evento.get("commence_time", "")
-    is_soccer = sport.startswith("soccer_")
+def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
+    alertas_enviados = 0
 
-    melhores_trad = extrair_melhores_odds_tradicionais(evento, stats["casas_vistas"])
-    if not melhores_trad:
-        return False
-
-    # Limite maximo de soma de probabilidades ajustado ao MIN_PROFIT_PCT configurado
     fator_min = max(0.5, 1.0 + (MIN_PROFIT_PCT / 100.0))
     max_soma_prob = 1.0 / fator_min
     limite_prefiltro = max_soma_prob + 0.03
 
-    dt_evento = parse_iso_datetime(commence_time)
-    alertas_enviados = 0
-
-    for jogo_poly in jogos_poly:
-        titulo_poly = jogo_poly["title"]
-        if not (equipas_coincidem(home, titulo_poly) and equipas_coincidem(away, titulo_poly)):
+    for sx_m in mercados_sx:
+        m_hash = sx_m["market_hash"]
+        if m_hash not in odds_sx:
             continue
 
-        dt_poly = parse_iso_datetime(jogo_poly.get("end_date"))
-        if dt_evento and dt_poly:
-            diff_horas = abs((dt_poly - dt_evento).total_seconds()) / 3600.0
-            if diff_horas > 120:
+        lados_sx = odds_sx[m_hash]
+        team1 = sx_m["team_one"]
+        team2 = sx_m["team_two"]
+        dt_sx = sx_m["game_time"]
+
+        for jogo_poly in jogos_poly:
+            titulo_poly = jogo_poly["title"]
+            if not (equipas_coincidem(team1, titulo_poly) and equipas_coincidem(team2, titulo_poly)):
                 continue
 
-        opcoes_poly = extrair_opcoes_poly_para_jogo(jogo_poly, home, away, is_soccer)
-        if not opcoes_poly:
-            continue
+            dt_poly = jogo_poly["end_date"]
+            if dt_sx and dt_poly:
+                diff_horas = abs((dt_poly - dt_sx).total_seconds()) / 3600.0
+                if diff_horas > 96:
+                    continue
 
-        stats["jogos_casados"] += 1
+            opcoes_poly = extrair_opcoes_poly_para_sx(jogo_poly, sx_m)
+            if not opcoes_poly:
+                continue
 
-        # CENARIO A: DESPORTOS 2-WAY (NBA, EUROLIGA, MMA, TENIS)
-        if not is_soccer:
+            stats["jogos_casados"] += 1
+
+            # Cruzamentos possiveis:
+            # 1) Polymarket aposta no lado 1 (sx_one) vs SX Bet aposta no lado 2 (outcome_two)
+            # 2) Polymarket aposta no lado 2 (sx_two) vs SX Bet aposta no lado 1 (outcome_one)
             pares = [
-                ("home", "away", f"{home} Vence", f"{away} Vence"),
-                ("away", "home", f"{away} Vence", f"{home} Vence")
+                ("sx_one", "outcome_two", sx_m["outcome_two"]),
+                ("sx_two", "outcome_one", sx_m["outcome_one"])
             ]
 
-            for lado_poly, lado_trad, label_poly, label_trad in pares:
-                if lado_poly not in opcoes_poly or lado_trad not in melhores_trad:
+            for poly_key, sx_key, label_sx in pares:
+                if poly_key not in opcoes_poly or sx_key not in lados_sx:
                     continue
 
-                opt_p = opcoes_poly[lado_poly]
-                opt_t = melhores_trad[lado_trad]
+                opt_p = opcoes_poly[poly_key]
+                opt_sx = lados_sx[sx_key]
+
+                if opt_sx["liquidity_usdc"] < MIN_LIQUIDITY_USD:
+                    continue
 
                 if opt_p["indicative_price"] > 0:
                     odd_ind = calcular_odd_liquida_poly(opt_p["indicative_price"])
-                    if odd_ind and (1.0 / odd_ind + 1.0 / opt_t["odd"]) > limite_prefiltro:
+                    if odd_ind and (1.0 / odd_ind + 1.0 / opt_sx["odd"]) > limite_prefiltro:
                         continue
 
                 ask = obter_melhor_ask_clob(opt_p["token_id"])
                 if not ask:
                     continue
 
+                liq_poly_usd = ask["size"] * ask["price"]
+                if liq_poly_usd < MIN_LIQUIDITY_USD:
+                    continue
+
                 odd_poly = calcular_odd_liquida_poly(ask["price"])
                 if not odd_poly:
                     continue
 
-                odd_trad = opt_t["odd"]
-                soma_prob = (1.0 / odd_poly) + (1.0 / odd_trad)
+                odd_sx = opt_sx["odd"]
+                soma_prob = (1.0 / odd_poly) + (1.0 / odd_sx)
                 lucro_pct = ((1.0 / soma_prob) - 1.0) * 100.0
 
                 if stats["melhor_margem"] is None or lucro_pct > stats["melhor_margem"]:
@@ -618,121 +712,47 @@ def cruzar_evento_hibrido(evento, jogos_poly, stats):
                 if lucro_pct < MIN_PROFIT_PCT:
                     continue
 
-                stake_poly_eur = BANKROLL_EUR * (1.0 / odd_poly) / soma_prob
-                stake_trad_eur = BANKROLL_EUR * (1.0 / odd_trad) / soma_prob
-                stake_poly_usd = stake_poly_eur * EUR_USD_RATE
+                # Calcula banca ajustada a liquidez disponivel nos dois livros de ordens
+                prop_poly = (1.0 / odd_poly) / soma_prob
+                prop_sx = (1.0 / odd_sx) / soma_prob
 
-                liquidez_usd = ask["size"] * ask["price"]
-                if liquidez_usd < 10.0:
+                max_banca_poly = liq_poly_usd / prop_poly
+                max_banca_sx = opt_sx["liquidity_usdc"] / prop_sx
+                banca_efetiva = min(BANKROLL_USD, max_banca_poly, max_banca_sx)
+
+                if banca_efetiva < 10.0:
                     continue
 
-                retorno_eur = BANKROLL_EUR / soma_prob
-                lucro_eur = retorno_eur - BANKROLL_EUR
+                stake_poly = banca_efetiva * prop_poly
+                stake_sx = banca_efetiva * prop_sx
+                retorno_usd = banca_efetiva / soma_prob
+                lucro_usd = retorno_usd - banca_efetiva
 
                 mensagem = (
-                    "Oportunidade de Arbitragem Detetada!\n\n"
-                    f"Jogo: {home} vs {away}\n"
-                    f"Data e Hora: {formatar_data_pt(commence_time)}\n"
-                    f"Volume Polymarket: ${opt_p['volume']:,.2f} (Valido > ${MIN_POLY_VOLUME:,.0f})\n\n"
-                    f"Lado 1 (Polymarket):\n"
-                    f"- Aposta: {label_poly}\n"
+                    "Arbitragem Web3 Detetada (Polymarket x SX Bet)!\n\n"
+                    f"Jogo: {team1} vs {team2}\n"
+                    f"Competicao: {sx_m['sport']} - {sx_m['league']}\n"
+                    f"Data e Hora: {formatar_data_pt(dt_sx or dt_poly)}\n\n"
+                    f"Lado 1 (Polymarket - USDC):\n"
+                    f"- Aposta: {opt_p['label']}\n"
                     f"- Odd Liquida: {odd_poly:.2f} (Preco: ${ask['price']:.3f})\n"
-                    f"- Valor a colocar: {stake_poly_eur:.2f} EUR (~${stake_poly_usd:.2f} USD)\n\n"
-                    f"Lado 2 ({opt_t['bookmaker']}):\n"
-                    f"- Aposta: {label_trad}\n"
-                    f"- Odd: {odd_trad:.2f}\n"
-                    f"- Valor a colocar: {stake_trad_eur:.2f} EUR\n\n"
-                    f"Investimento Total: {BANKROLL_EUR:.2f} EUR\n"
-                    f"Retorno Garantido: ~{retorno_eur:.2f} EUR\n"
-                    f"Lucro Liquido: {lucro_eur:+.2f} EUR (~{lucro_pct:.2f}%)"
+                    f"- Valor a colocar: ${stake_poly:.2f} USDC\n"
+                    f"- Liquidez no topo: ${liq_poly_usd:.2f} USDC\n\n"
+                    f"Lado 2 (SX Bet - USDC):\n"
+                    f"- Aposta: {label_sx}\n"
+                    f"- Odd Taker: {odd_sx:.2f}\n"
+                    f"- Valor a colocar: ${stake_sx:.2f} USDC\n"
+                    f"- Liquidez disponivel: ${opt_sx['liquidity_usdc']:.2f} USDC\n\n"
+                    f"Investimento Total: ${banca_efetiva:.2f} USDC\n"
+                    f"Retorno Garantido: ~${retorno_usd:.2f} USDC\n"
+                    f"Lucro Liquido: {lucro_usd:+.2f} USDC (~{lucro_pct:.2f}%)"
                 )
 
-                key = gerar_chave_alerta(f"hyb2_{evento.get('id')}_{lado_poly}_{round(odd_poly,2)}_{round(odd_trad,2)}")
+                key = gerar_chave_alerta(f"web3_{m_hash}_{poly_key}_{round(odd_poly,2)}_{round(odd_sx,2)}")
                 if enviar_alerta_telegram(mensagem, key):
                     alertas_enviados += 1
 
-        # CENARIO B: FUTEBOL (POLYMARKET x HIPOTESE DUPLA)
-        else:
-            combinacoes_futebol = [
-                ("home", "draw", "away", f"{home} Vence", f"{away} ou Empate (Hipotese Dupla)"),
-                ("away", "draw", "home", f"{away} Vence", f"{home} ou Empate (Hipotese Dupla)"),
-                ("draw", "home", "away", "Empate", f"{home} ou {away} (Hipotese Dupla 12)")
-            ]
-
-            for lado_poly, t1, t2, label_poly, label_dupla in combinacoes_futebol:
-                if lado_poly not in opcoes_poly:
-                    continue
-                if t1 not in melhores_trad or t2 not in melhores_trad:
-                    continue
-
-                opt_p = opcoes_poly[lado_poly]
-                odd_t1 = melhores_trad[t1]["odd"]
-                odd_t2 = melhores_trad[t2]["odd"]
-                bk_t1 = melhores_trad[t1]["bookmaker"]
-                bk_t2 = melhores_trad[t2]["bookmaker"]
-
-                odd_dupla = 1.0 / ((1.0 / odd_t1) + (1.0 / odd_t2))
-
-                if opt_p["indicative_price"] > 0:
-                    odd_ind = calcular_odd_liquida_poly(opt_p["indicative_price"])
-                    if odd_ind and (1.0 / odd_ind + 1.0 / odd_dupla) > limite_prefiltro:
-                        continue
-
-                ask = obter_melhor_ask_clob(opt_p["token_id"])
-                if not ask:
-                    continue
-
-                odd_poly = calcular_odd_liquida_poly(ask["price"])
-                if not odd_poly:
-                    continue
-
-                soma_prob = (1.0 / odd_poly) + (1.0 / odd_t1) + (1.0 / odd_t2)
-                lucro_pct = ((1.0 / soma_prob) - 1.0) * 100.0
-
-                if stats["melhor_margem"] is None or lucro_pct > stats["melhor_margem"]:
-                    stats["melhor_margem"] = lucro_pct
-
-                if lucro_pct < MIN_PROFIT_PCT:
-                    continue
-
-                liquidez_usd = ask["size"] * ask["price"]
-                if liquidez_usd < 10.0:
-                    continue
-
-                stake_poly_eur = BANKROLL_EUR * (1.0 / odd_poly) / soma_prob
-                stake_t1_eur = BANKROLL_EUR * (1.0 / odd_t1) / soma_prob
-                stake_t2_eur = BANKROLL_EUR * (1.0 / odd_t2) / soma_prob
-                stake_poly_usd = stake_poly_eur * EUR_USD_RATE
-
-                retorno_eur = BANKROLL_EUR / soma_prob
-                lucro_eur = retorno_eur - BANKROLL_EUR
-
-                casas_lado2 = bk_t1 if bk_t1 == bk_t2 else f"{bk_t1} / {bk_t2}"
-
-                mensagem = (
-                    "Oportunidade de Arbitragem Detetada!\n\n"
-                    f"Jogo: {home} vs {away}\n"
-                    f"Data e Hora: {formatar_data_pt(commence_time)}\n"
-                    f"Volume Polymarket: ${opt_p['volume']:,.2f} (Valido > ${MIN_POLY_VOLUME:,.0f})\n\n"
-                    f"Lado 1 (Polymarket):\n"
-                    f"- Aposta: {label_poly}\n"
-                    f"- Odd Liquida: {odd_poly:.2f} (Preco: ${ask['price']:.3f})\n"
-                    f"- Valor a colocar: {stake_poly_eur:.2f} EUR (~${stake_poly_usd:.2f} USD)\n\n"
-                    f"Lado 2 ({casas_lado2}):\n"
-                    f"- Aposta: {label_dupla}\n"
-                    f"- Odd Combinada: {odd_dupla:.2f}\n"
-                    f"  * {melhores_trad[t1]['label']} ({bk_t1}): {stake_t1_eur:.2f} EUR @ {odd_t1:.2f}\n"
-                    f"  * {melhores_trad[t2]['label']} ({bk_t2}): {stake_t2_eur:.2f} EUR @ {odd_t2:.2f}\n\n"
-                    f"Investimento Total: {BANKROLL_EUR:.2f} EUR\n"
-                    f"Retorno Garantido: ~{retorno_eur:.2f} EUR\n"
-                    f"Lucro Liquido: {lucro_eur:+.2f} EUR (~{lucro_pct:.2f}%)"
-                )
-
-                key = gerar_chave_alerta(f"hyb3_{evento.get('id')}_{lado_poly}_{round(odd_poly,2)}_{round(odd_dupla,2)}")
-                if enviar_alerta_telegram(mensagem, key):
-                    alertas_enviados += 1
-
-    return alertas_enviados > 0
+    return alertas_enviados
 
 
 # ============================================================
@@ -740,58 +760,47 @@ def cruzar_evento_hibrido(evento, jogos_poly, stats):
 # ============================================================
 
 def ciclo_scanner():
-    logger.info("A iniciar scanner Hibrido V4.1 (MIN_PROFIT_PCT = %s%%).", MIN_PROFIT_PCT)
+    logger.info("A iniciar scanner Web3 V5 (Polymarket x SX Bet | MIN_PROFIT = %s%%).", MIN_PROFIT_PCT)
 
-    total_eventos = 0
-    total_alertas = 0
     stats = {
-        "casas_vistas": set(),
         "jogos_casados": 0,
         "melhor_margem": None
     }
 
     jogos_poly = obter_jogos_polymarket()
-    logger.info("Polymarket: %s eventos desportivos carregados.", len(jogos_poly))
+    mercados_sx = obter_mercados_sx()
 
-    sports = descobrir_desportos()
-    with state_lock:
-        scanner_status["sports"] = sports
+    # Filtra previamente mercados da SX Bet cujas equipas existem na Polymarket
+    mercados_relevantes = []
+    for sx_m in mercados_sx:
+        for jp in jogos_poly:
+            if equipas_coincidem(sx_m["team_one"], jp["title"]) and equipas_coincidem(sx_m["team_two"], jp["title"]):
+                mercados_relevantes.append(sx_m)
+                break
 
-    for sport in sports:
-        eventos = obter_odds_desporto(sport)
-        total_eventos += len(eventos)
+    hashes_relevantes = [m["market_hash"] for m in mercados_relevantes]
+    odds_sx = obter_melhores_odds_sx(hashes_relevantes) if hashes_relevantes else {}
 
-        for evento in eventos:
-            evento["sport_key"] = sport
-            try:
-                if cruzar_evento_hibrido(evento, jogos_poly, stats):
-                    total_alertas += 1
-            except Exception:
-                logger.exception("Erro ao analisar evento.")
+    total_alertas = analisar_cruzamento_web3(jogos_poly, mercados_relevantes, odds_sx, stats)
 
     melhor_str = f"{stats['melhor_margem']:.2f}%" if stats["melhor_margem"] is not None else "N/A"
     logger.info(
-        "Diagnostico | Casas API: %s | Jogos casados: %s | Melhor margem: %s",
-        sorted(list(stats["casas_vistas"]))[:10],
+        "Ciclo concluido | Jogos Polymarket: %s | Mercados SX Bet: %s | Jogos casados: %s | Melhor margem: %s | Alertas: %s",
+        len(jogos_poly),
+        len(mercados_sx),
         stats["jogos_casados"],
-        melhor_str
+        melhor_str,
+        total_alertas
     )
 
     with state_lock:
         scanner_status["last_scan"] = datetime.now(timezone.utc).isoformat()
-        scanner_status["events_checked"] = total_eventos
         scanner_status["poly_games_checked"] = len(jogos_poly)
+        scanner_status["sx_markets_checked"] = len(mercados_sx)
         scanner_status["matched_games"] = stats["jogos_casados"]
         scanner_status["best_margin_pct"] = stats["melhor_margem"]
         scanner_status["opportunities"] += total_alertas
         scanner_status["last_error"] = None
-
-    logger.info(
-        "Ciclo terminado | Eventos API: %s | Jogos Polymarket: %s | Alertas: %s",
-        total_eventos,
-        len(jogos_poly),
-        total_alertas
-    )
 
 
 def correr_robo_continuo():
@@ -799,9 +808,9 @@ def correr_robo_continuo():
         try:
             ciclo_scanner()
         except Exception as e:
-            logger.exception("Erro geral do scanner.")
+            logger.exception("Erro geral do scanner Web3.")
             with state_lock:
-                scanner_status["last_error"] = limpar_erro_url(e)
+                scanner_status["last_error"] = str(e)
         time.sleep(SCAN_INTERVAL)
 
 
@@ -823,8 +832,8 @@ class SimpleHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         else:
             body = (
-                "ROBO HIBRIDO V4.1 ONLINE\n"
-                "Cruzamento: Polymarket x Casas Europeias\n"
+                "ROBO ARBITRAGEM WEB3 V5 ONLINE\n"
+                "Plataformas: Polymarket x SX Bet (USDC)\n"
                 "Mode: SCAN ONLY\n"
                 "Health: /health\n"
             ).encode("utf-8")
@@ -850,8 +859,6 @@ def iniciar_servidor_web():
 
 
 if __name__ == "__main__":
-    if not ODDS_API_KEY:
-        logger.warning("ODDS_API_KEY nao configurada.")
     if not TELEGRAM_TOKEN or not CHAT_ID:
         logger.warning("Telegram nao configurado.")
 
