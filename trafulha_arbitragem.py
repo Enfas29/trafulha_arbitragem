@@ -13,7 +13,7 @@ import requests
 
 
 # ============================================================
-# 1. CONFIGURACOES (PAPER TRADING V7.1 - MONEYLINE STRICT)
+# 1. CONFIGURACOES (PAPER TRADING V7.2 - CLOB PRICE FIX)
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -51,10 +51,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("ArbitragePaperBotV71")
+logger = logging.getLogger("ArbitragePaperBotV72")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "TrafulhaPaperBot/7.1"})
+session.headers.update({"User-Agent": "TrafulhaPaperBot/7.2"})
 if SX_API_KEY:
     session.headers.update({"x-sx-api-key": SX_API_KEY})
 
@@ -90,7 +90,7 @@ scanner_status = {
     "best_margin_pct": None,
     "opportunities": 0,
     "sx_odds_endpoint": None,
-    "mode": "WEB3_PAPER_TRADING_MONEYLINE_STRICT_V7.1"
+    "mode": "WEB3_PAPER_TRADING_CLOB_EXACT_V7.2"
 }
 
 diagnostico_inicial_feito = False
@@ -298,7 +298,7 @@ def registar_aposta_virtual(m_hash, jogo_nome, stake_poly, stake_sx, lucro_esper
 
 
 # ============================================================
-# 5. POLYMARKET (MONEYLINE STRICT) E SX BET RECOLHA
+# 5. POLYMARKET CLOB ORDERBOOK RECOLHA EXATA
 # ============================================================
 
 SPORT_KEYWORDS = [
@@ -315,7 +315,8 @@ def parece_evento_desportivo(texto):
     return any(k in t for k in SPORT_KEYWORDS)
 
 
-def obter_melhor_ask_clob(token_id):
+def obter_preco_real_clob(token_id):
+    """Lê diretamente o melhor preço de compra (ask) no order book oficial da Polymarket"""
     try:
         book = http_get(
             f"{POLY_CLOB}/book",
@@ -392,7 +393,7 @@ def obter_jogos_polymarket():
                 q_lower = str(m.get("question", "")).lower()
                 g_lower = str(m.get("groupItemTitle", "")).lower()
 
-                # FILTRO RIGOROSO: Apenas aceita o mercado principal de vencedor (Moneyline / 1X2 / Who will win)
+                # Apenas mercado principal de vencedor
                 is_moneyline = any(w in q_lower for w in ["win the match", "winner", "vence", "vs"]) and not any(
                     w in f"{q_lower} {g_lower}" for w in ["spread", "over", "under", "total", "goals", "points", "handicap", "o/u", "half", "map", "set", "quarter"]
                 )
@@ -410,17 +411,9 @@ def obter_jogos_polymarket():
 
                 outcomes = converter_lista(m.get("outcomes"))
                 token_ids = converter_lista(m.get("clobTokenIds"))
-                prices_raw = converter_lista(m.get("outcomePrices"))
 
                 if len(outcomes) != 2 or len(token_ids) != 2:
                     continue
-
-                prices = []
-                for p in prices_raw:
-                    try:
-                        prices.append(float(p))
-                    except (ValueError, TypeError):
-                        prices.append(0.0)
 
                 submercados.append({
                     "id": str(m.get("id", "")),
@@ -428,7 +421,6 @@ def obter_jogos_polymarket():
                     "group_title": m.get("groupItemTitle", ""),
                     "outcomes": outcomes,
                     "token_ids": token_ids,
-                    "indicative_prices": prices if len(prices) == 2 else [0.0, 0.0],
                     "volume": volume_efetivo
                 })
 
@@ -677,7 +669,7 @@ def obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=False):
 
 
 # ============================================================
-# 7. MOTOR DE CRUZAMENTO E FILTRO DE JOGOS REPETIDOS
+# 7. MOTOR DE CRUZAMENTO E MAPEAR OPCOES POLYMARKET EXATAS
 # ============================================================
 
 def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
@@ -689,75 +681,29 @@ def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
     opcoes = {}
 
     for m in jogo_poly["markets"]:
-        q = m["question"]
-        g = m["group_title"]
         outs = m["outcomes"]
         tids = m["token_ids"]
-        iprices = m["indicative_prices"]
-        vol = m["volume"]
+        if len(outs) != 2 or len(tids) != 2:
+            continue
 
-        outs_norm = [normalizar_texto(o) for o in outs]
+        out0_norm = normalizar_texto(outs[0])
+        out1_norm = normalizar_texto(outs[1])
 
-        if "yes" not in outs_norm and "no" not in outs_norm:
-            for idx, out_name in enumerate(outs):
-                if equipas_coincidem(out_name, out1_sx) and not equipas_coincidem(out_name, out2_sx):
-                    opcoes["sx_one"] = {
-                        "token_id": tids[idx],
-                        "indicative_price": iprices[idx],
-                        "volume": vol,
-                        "label": out_name
-                    }
-                elif equipas_coincidem(out_name, out2_sx) and not equipas_coincidem(out_name, out1_sx):
-                    opcoes["sx_two"] = {
-                        "token_id": tids[idx],
-                        "indicative_price": iprices[idx],
-                        "volume": vol,
-                        "label": out_name
-                    }
-
-        elif "yes" in outs_norm and "no" in outs_norm:
-            yes_idx = outs_norm.index("yes")
-            no_idx = outs_norm.index("no")
-            alvo_texto = g if g else q
-
-            is_not_bet = normalizar_texto(out2_sx).startswith("not ") or "not " in normalizar_texto(out1_sx)
-            is_draw_covered = "draw" in normalizar_texto(alvo_texto) or "tie" in normalizar_texto(alvo_texto) or is_not_beta_safe(out1_sx, out2_sx)
-
-            if is_not_bet or is_draw_covered:
-                if normalizar_texto(out2_sx).startswith("not ") and equipas_coincidem(alvo_texto, out1_sx):
-                    opcoes["sx_one"] = {
-                        "token_id": tids[yes_idx],
-                        "indicative_price": iprices[yes_idx],
-                        "volume": vol,
-                        "label": f"{out1_sx} (Yes)"
-                    }
-                    opcoes["sx_two"] = {
-                        "token_id": tids[no_idx],
-                        "indicative_price": iprices[no_idx],
-                        "volume": vol,
-                        "label": f"{out2_sx} (No)"
-                    }
-                elif normalizar_texto(out1_sx).startswith("not ") and equipas_coincidem(alvo_texto, out2_sx):
-                    opcoes["sx_two"] = {
-                        "token_id": tids[yes_idx],
-                        "indicative_price": iprices[yes_idx],
-                        "volume": vol,
-                        "label": f"{out2_sx} (Yes)"
-                    }
-                    opcoes["sx_one"] = {
-                        "token_id": tids[no_idx],
-                        "indicative_price": iprices[no_idx],
-                        "volume": vol,
-                        "label": f"{out1_sx} (No)"
-                    }
+        # Mapeamento direto por nome da equipa na Polymarket vs SX Bet
+        for idx, out_name in enumerate(outs):
+            tid = tids[idx]
+            if equipas_coincidem(out_name, team1) and not equipas_coincidem(out_name, team2):
+                opcoes["sx_one"] = {
+                    "token_id": tid,
+                    "label": f"{team1} (Yes)"
+                }
+            elif equipas_coincidem(out_name, team2) and not equipas_coincidem(out_name, team1):
+                opcoes["sx_two"] = {
+                    "token_id": tid,
+                    "label": f"{team2} (Yes)"
+                }
 
     return opcoes
-
-
-def is_not_beta_safe(out1, out2):
-    o1 = normalizar_texto(out1)
-    o2 = normalizar_texto(out2)
-    return o1.startswith("not ") or o2.startswith("not ")
 
 
 def calcular_odd_liquida_poly(ask_price):
@@ -773,7 +719,6 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
 
     fator_min = max(0.5, 1.0 + (MIN_PROFIT_PCT / 100.0))
     max_soma_prob = 1.0 / fator_min
-    limite_prefiltro = max_soma_prob + 0.03
 
     for sx_m in mercados_sx:
         m_hash = sx_m["market_hash"]
@@ -820,12 +765,8 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 if opt_sx["liquidity_usdc"] < MIN_LIQUIDITY_USD:
                     continue
 
-                if opt_p["indicative_price"] > 0:
-                    odd_ind = calcular_odd_liquida_poly(opt_p["indicative_price"])
-                    if odd_ind and (1.0 / odd_ind + 1.0 / opt_sx["odd"]) > limite_prefiltro:
-                        continue
-
-                ask = obter_melhor_ask_clob(opt_p["token_id"])
+                # CONSULTA EXATA AO ORDER BOOK CLOB DA POLYMARKET
+                ask = obter_preco_real_clob(opt_p["token_id"])
                 if not ask:
                     continue
 
@@ -877,16 +818,16 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                     total_geral = poly_tot + sx_tot
 
                 mensagem = (
-                    "🛡️ [PAPER TRADING - DUPLA BANCA & MONEYLINE STRICT]\n\n"
+                    "🛡️ [PAPER TRADING - CLOB EXATO V7.2]\n\n"
                     f"Jogo: {team1} vs {team2}\n"
                     f"Competicao: {sx_m['sport']} - {sx_m['league']}\n"
                     f"Data e Hora: {formatar_data_pt(dt_sx or dt_poly)}\n\n"
                     f"Lado 1 (Polymarket - USDC):\n"
                     f"- Aposta: {opt_p['label']}\n"
-                    f"- Preco Principal: {preco_cents}¢ (Odd Liquida: {odd_poly:.2f})\n"
+                    f"- Preco Real CLOB: {preco_cents}¢ (Odd Liquida: {odd_poly:.2f})\n"
                     f"- Valor investido: ${stake_poly:.2f} USDC\n\n"
                     f"Lado 2 (SX Bet - USDC):\n"
-                    f"- Aposta: {label_sx}\n"
+                    f"- Aposta: Not {opt_p['label'].replace(' (Yes)', '')}\n"
                     f"- Odd Taker: {odd_sx:.2f}\n"
                     f"- Valor investido: ${stake_sx:.2f} USDC\n\n"
                     f"Investimento Total no Jogo: ${banca_efetiva:.2f} USDC\n"
@@ -923,7 +864,7 @@ def ciclo_scanner():
         banca_poly = paper_wallet["poly"]["available"]
         banca_sx = paper_wallet["sx"]["available"]
 
-    logger.info("A iniciar scanner Paper Trading V7.1 (Poly Disp: $%s | SX Disp: $%s).", banca_poly, banca_sx)
+    logger.info("A iniciar scanner Paper Trading V7.2 (Poly Disp: $%s | SX Disp: $%s).", banca_poly, banca_sx)
 
     stats = {
         "jogos_casados": 0,
@@ -1008,7 +949,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 s_disp = paper_wallet["sx"]["available"]
                 s_inv = paper_wallet["sx"]["invested"]
             body = (
-                "ROBO ARBITRAGEM PAPER TRADING V7.1 ONLINE (MONEYLINE STRICT)\n"
+                "ROBO ARBITRAGEM PAPER TRADING V7.2 ONLINE (CLOB EXACT)\n"
                 f"Polymarket Disp: ${p_disp:.2f} | Investido: ${p_inv:.2f}\n"
                 f"SX Bet Disp: ${s_disp:.2f} | Investido: ${s_inv:.2f}\n"
                 "Health / Wallet: /health\n"
@@ -1034,7 +975,7 @@ def iniciar_servidor_web():
     server.serve_forever()
 
 
-if __name__ == "__main__":
+if __name__ ==- "__main__":
     if not TELEGRAM_TOKEN or not CHAT_ID:
         logger.warning("Telegram nao configurado.")
 
