@@ -111,6 +111,19 @@ Localizar o serviço antigo (por exemplo Render, outra app Railway, GitHub
 Actions recorrente ou PC local) e parar **apenas esse processo**. O V12 não
 consegue desligar processos externos de forma segura por si.
 
+## Segurança das credenciais
+
+Foi corrigido um problema anterior: a chave da SX Bet estava num
+cabeçalho HTTP global e podia acompanhar pedidos à Polymarket.
+O novo `get_json` inclui `x-sx-api-key` exclusivamente quando o URL
+é de `https://api.sx.bet/`. O teste `test_security_v12.py` verifica isso
+sem fazer pedidos de rede.
+
+**Boa prática:** revogar a antiga chave SX de apenas leitura e criar outra,
+atualizando os Secrets do GitHub e as Variables do Railway. Não enviar
+a chave em mensagens, screenshots ou commits. Não colocar chaves privadas
+de carteira no projeto.
+
 ## Por validar antes de qualquer execução com dinheiro real
 
 1. Regras de liquidação em cenários excecionais: desistências no ténis,
