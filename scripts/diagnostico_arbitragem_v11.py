@@ -42,7 +42,7 @@ def send_report(message):
         print("⚠️ Telegram: falha ao enviar relatório (" + type(exc).__name__ + ")")
 
 
-def percentage_quote(poly_levels, sx_levels):
+def percentage_quote(poly_levels, sx_levels, poly_buffer=None, sx_buffer=None):
     """Margem ilustrativa para payout igual, com buffers V11.
     Só se aplica caso os dois resultados tenham regras de liquidação iguais.
     Não é uma garantia de execução nem cria operações.
@@ -57,7 +57,11 @@ def percentage_quote(poly_levels, sx_levels):
     sc = bot.cost_for_payout(sx_levels, available)
     if pc is None or sc is None:
         return None
-    buffer = pc * bot.POLY_FEE_BUFFER + sc * bot.SX_FEE_BUFFER
+    if poly_buffer is None:
+        poly_buffer = bot.POLY_FEE_BUFFER
+    if sx_buffer is None:
+        sx_buffer = bot.SX_FEE_BUFFER
+    buffer = pc * poly_buffer + sc * sx_buffer
     total = pc + sc + buffer
     return 100 * (available - total) / total if total > 0 else None
 
@@ -267,6 +271,8 @@ def main():
     poly_ok = sx_ok = price_tests = potential_positive = priced_count = 0
     examples = []
     roi_samples = []
+    gross_samples = []
+    gross_positive = 0
     seen_poly, seen_sx = set(), set()
     for pair in selected_pairs:
         try:
@@ -280,7 +286,11 @@ def main():
             sx_ok += 1
             price_tests += int(bool(poly_levels and sx_levels))
             roi = percentage_quote(poly_levels, sx_levels)
-            if roi is not None:
+            gross = percentage_quote(poly_levels, sx_levels, 0.0, 0.0)
+            if roi is not None and gross is not None:
+                gross_samples.append(gross)
+                if gross > 0:
+                    gross_positive += 1
                 priced_count += 1
                 roi_samples.append((roi, pair["sx"]["sport"],
                                     pair["sx"]["teams"][0], pair["sx"]["teams"][1],
@@ -310,7 +320,12 @@ def main():
 
     print(f"📚 Livros acessíveis: Polymarket {poly_ok} | SX Bet {sx_ok}")
     print(f"💹 Pares com liquidez em ambos os lados: {price_tests}")
-    print(f"📈 Margens indicativas positivas na amostra: {potential_positive}")
+    print(f"📈 Margens indicativas positivas após buffers: {potential_positive}")
+    print(f"🧮 Margens brutas positivas (sem qualquer taxa ou custo): {gross_positive}")
+    print(f"    Buffers V11: Poly {bot.POLY_FEE_BUFFER*100:.1f}% e SX {bot.SX_FEE_BUFFER*100:.1f}% do custo de cada aposta; não são taxas oficiais.")
+    if gross_samples:
+        print(f"    Melhor margem bruta: {max(gross_samples):+.2f}% | mediana: {statistics.median(gross_samples):+.2f}%")
+    print("    Não usar margem bruta como autorização para apostar.")
     if roi_samples:
         rois = [entry[0] for entry in roi_samples]
         print("📉 Margens calculáveis (indicativas): "
@@ -344,6 +359,7 @@ def main():
         f"Pares candidatos: {len(pairs)}\n"
         f"Confrontos aceites: {unique_pairs}\n"
         f"Preços avaliados: {priced_count}/{len(selected_pairs)}\n"
+        f"Brutas +: {gross_positive} | Após buffers +: {potential_positive}\n"
         f"Livros: Poly {poly_ok} | SX {sx_ok}\n"
         f"Margens + indicativas: {potential_positive}\n"
         + conclusion + "\n"
@@ -372,11 +388,18 @@ def main():
                 ("Direções de aposta selecionadas para preço", len(selected_pairs)),
                 ("Pares com liquidez dos dois lados", price_tests),
                 ("Margens efetivamente calculadas", priced_count),
-                ("Margens indicativas positivas", potential_positive),
+                ("Margens indicativas positivas após buffers", potential_positive),
+                ("Margens brutas positivas antes de custos", gross_positive),
+                ("Melhor margem bruta sem custos", f"{max(gross_samples):+.2f}%" if gross_samples else "N/D"),
                 ("Melhor margem indicativa", f"{max([r[0] for r in roi_samples]):+.2f}%" if roi_samples else "N/D"),
                 ("Mediana das margens", f"{statistics.median([r[0] for r in roi_samples]):+.2f}%" if roi_samples else "N/D"),
             ]:
                 f.write(f"| {label} | {value} |\n")
+            f.write("\n**Atenção:** margens brutas ignoram TODAS as taxas, buffers, "
+                    "slippage e atrasos; não são oportunidades seguras.\n\n")
+            f.write(f"Buffers de diagnóstico: Poly {bot.POLY_FEE_BUFFER*100:.1f}% + "
+                    f"SX {bot.SX_FEE_BUFFER*100:.1f}% sobre o custo de cada perna; "
+                    "não representam a tabela oficial de taxas.\n\n")
             f.write("\nAmostra de preços com payout comum de até 10 USDC. "
                     "Margens apenas indicativas; liquidação e execução não validadas.\n")
             if roi_samples:
