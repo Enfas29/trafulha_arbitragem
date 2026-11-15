@@ -274,6 +274,15 @@ def match_time(poly_ts, sx_ts):
     return bool(poly_ts and sx_ts and abs(poly_ts - sx_ts) <= MAX_START_DIFF_H * 3600)
 
 
+def is_poly_moneyline(market):
+    """Aceitar apenas mercados de vencedor (moneyline) identificados pela Gamma.
+
+    Rejeitar tipos vazios/desconhecidos, spreads, totais e parciais mesmo
+    quando os resultados têm nomes de equipas iguais.
+    """
+    return str(market.get("sportsMarketType") or "").strip().lower() == "moneyline"
+
+
 def discover_poly():
     metadata = get_json(POLY_GAMMA + "/sports")
     sports = metadata if isinstance(metadata, list) else []
@@ -321,6 +330,9 @@ def discover_poly():
                 continue
             for m in event.get("markets", []) or []:
                 if m.get("closed") or m.get("active") is False:
+                    continue
+                # Nunca comparar um spread/total/segmento com moneyline da SX.
+                if not is_poly_moneyline(m):
                     continue
                 outs = values(m.get("outcomes"))
                 ids = values(m.get("positionIds")) if m.get("version") == "v2" else values(m.get("clobTokenIds"))
@@ -803,6 +815,12 @@ def self_test():
     assert not same_team("Boston Celtics", "Los Angeles Lakers")
     assert parse_title("NBA: Boston Celtics vs Los Angeles Lakers") == (
         "Boston Celtics", "Los Angeles Lakers")
+    assert is_poly_moneyline({"sportsMarketType": "moneyline"})
+    assert is_poly_moneyline({"sportsMarketType": "MONEYLINE"})
+    assert not is_poly_moneyline({"sportsMarketType": "spread"})
+    assert not is_poly_moneyline({"sportsMarketType": "total"})
+    assert not is_poly_moneyline({"sportsMarketType": "half_moneyline"})
+    assert not is_poly_moneyline({"outcomes": ["Team A", "Team B"]})
     assert sport_family("NFL") == "american_football"
     assert sx_sport_family({"sportLabel": "Basketball"}) == "basketball"
     assert sx_sport_family({"sportLabel": "Soccer"}) == "soccer"
