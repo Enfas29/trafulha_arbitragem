@@ -36,7 +36,8 @@ O workflow inclui agora:
 - Testes do motor de matching e catálogo V11.
 - Testes do monitor, histórico e relatório de seis horas.
 - Testes do PAPER V12 (limites, livro, carteiras, não duplicação, liquidação).
-- Testes do mecanismo opcional SX WebSocket.
+- Testes dos mecanismos WebSocket SX e Polymarket.
+- Teste integral com livros sintéticos e simulação sem APIs ou apostas.
 
 Não usar um resultado verde como prova de arbitragem real: são testes
 locais, com livros sintéticos.
@@ -82,16 +83,21 @@ automática nem tratamento automático de eventos void, empate ou desistência.
 
 ## Aceleração por WebSocket — opcional
 
-A SX Bet V3 expõe canais `orderbook_v3:{marketHash}`. O adaptador
-`sx_ws_v12.py` limita-se a dar um sinal para refazer o pedido REST;
-não aplica preços WS diretamente ao paper e não executa apostas.
+A SX Bet V3 expõe canais `orderbook_v3:{marketHash}` e a
+Polymarket dispõe de um canal `market` por token. Os adaptadores
+`sx_ws_v12.py` e `poly_ws_v12.py` dão apenas um sinal para refazer
+a leitura REST; **não usam os preços recebidos pelo WebSocket para
+simular fills e não executam apostas**.
 
     SX_WS_V12_ENABLED=1
+    POLY_WS_V12_ENABLED=1
 
-É **experimental**. Se a subscrição falhar, o REST continua a funcionar.
-O adaptador acompanha até 12 mercados SX de cada vez e o scanner
-mantém uma rotação para os restantes. A frequência real depende da
-rede, mercado e créditos do Railway. Não é execução instantânea.
+Ambos são **experimentais** e estão desligados por defeito.
+Testar primeiro cada integração isoladamente no Railway. Em caso de
+falha de subscrição, o REST continua ativo. São acompanhados no máximo
+12 mercados SX e 24 tokens Polymarket simultaneamente, enquanto os
+restantes continuam em rotação REST. A frequência depende de rede,
+limites da API e créditos do Railway: não é execução instantânea.
 
 ## Por validar antes de qualquer execução com dinheiro real
 
