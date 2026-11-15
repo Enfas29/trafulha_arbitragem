@@ -353,7 +353,7 @@ def main(once=False):
     try:
         while True:
             started = time.monotonic()
-            if not pairs or started - last_catalog >= CATALOG_INTERVAL:
+            if last_catalog == 0.0 or started - last_catalog >= CATALOG_INTERVAL:
                 try:
                     pairs = catalog()
                     cursor = cursor % len(pairs) if pairs else 0
