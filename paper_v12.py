@@ -394,6 +394,15 @@ def self_test():
     assert select_shadow_quote([(0.55, 300)], [(0.55, 300)], 0.91, 100_000, 100_000) is None
     assert select_shadow_quote([(0.43, 0.1)], [(0.50, 300)], 0.91, 100_000, 100_000) is None
     assert quote_for_payout([(0.43, 10)], [(0.50, 10)], 10, 0.91).poly_fee_cents > 0
+    # Falha da segunda perna, perda de liquidez e spread adverso não podem
+    # criar duas apostas fictícias com lucro.
+    assert select_shadow_quote([(0.43, 300)], [], 0.91, 100_000, 100_000) is None
+    assert select_shadow_quote([(0.43, 300)], [(0.60, 300)],
+                               0.91, 100_000, 100_000) is None
+    assert select_shadow_quote([(0.43, 300)], [(0.50, 300)],
+                               0, 100_000, 100_000) is None
+    assert select_shadow_quote([(0.43, 300)], [(0.50, 300)],
+                               0.91, 0, 100_000) is None
 
     sample = {
         "poly": {"id": "poly-1", "type": "moneyline",
