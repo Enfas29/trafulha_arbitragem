@@ -13,7 +13,7 @@ import websocket
 
 
 # ============================================================
-# 1. CONFIGURACOES (PAPER TRADING V9.2 - SMART MATCHING)
+# 1. CONFIGURACOES (PAPER TRADING V9.3 - ULTRA SMART MATCH)
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -25,7 +25,7 @@ PAPER_INITIAL_BANKROLL_POLY = float(os.getenv("PAPER_INITIAL_BANKROLL_POLY", "10
 PAPER_INITIAL_BANKROLL_SX = float(os.getenv("PAPER_INITIAL_BANKROLL_SX", "1000"))
 PAPER_STAKE_USD = float(os.getenv("PAPER_STAKE_USD", "100"))
 
-MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "-3.0"))
+MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "-3.0"))  # Forçar alertas de teste
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "15"))
 
 MIN_POLY_VOLUME = float(os.getenv("MIN_POLY_VOLUME", "100"))
@@ -52,7 +52,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("ArbitragePaperBotV92")
+logger = logging.getLogger("ArbitragePaperBotV93")
 
 session = requests.Session()
 session.headers.update({
@@ -92,7 +92,7 @@ scanner_status = {
     "best_margin_pct": None,
     "opportunities": 0,
     "ws_connected": False,
-    "mode": "WEB3_PAPER_TRADING_SMART_MATCH_V9.2"
+    "mode": "WEB3_PAPER_TRADING_ULTRA_MATCH_V9.3"
 }
 
 
@@ -160,7 +160,7 @@ def correr_websocket_poly():
 
 
 # ============================================================
-# 4. UTILITARIOS DE NORMALIZACAO INTELIGENTE
+# 4. NORMALIZACAO E COMPARACAO ULTRA FLEXIVEL
 # ============================================================
 
 def http_get(url, params=None, timeout=20):
@@ -185,32 +185,13 @@ def remover_acentos(texto):
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
-STOPWORDS_EQUIPAS = {
-    "fc", "cf", "sl", "sc", "ac", "as", "cd", "ud", "rc", "rcd", "afc",
-    "club", "clube", "sporting", "de", "do", "da", "dos", "das", "the",
-    "united", "city", "real", "atletico", "athletic", "saint", "st"
-}
-
-ALIASES_EQUIPAS = {
-    "sporting lisbon": "sporting cp",
-    "sporting clube de portugal": "sporting cp",
-    "sl benfica": "benfica",
-    "fc porto": "porto",
-    "sc braga": "braga"
-}
+STOPWORDS = {"fc", "cf", "sl", "sc", "ac", "as", "cd", "ud", "rc", "rcd", "afc", "club", "clube", "sporting", "de", "do", "da", "dos", "das", "the", "united", "city", "real", "atletico", "athletic", "saint", "st"}
 
 
 def normalizar_texto(nome):
     txt = remover_acentos(str(nome)).lower().strip()
     txt = re.sub(r"[^a-z0-9\s]", " ", txt)
-    txt = " ".join(txt.split())
-    return ALIASES_EQUIPAS.get(txt, txt)
-
-
-def tokens_relevantes(nome):
-    norm = normalizar_texto(nome)
-    tokens = [t for t in norm.split() if t not in STOPWORDS_EQUIPAS and len(t) > 1]
-    return set(tokens) if tokens else set(norm.split())
+    return " ".join(txt.split())
 
 
 def equipas_coincidem(nome_a, nome_b):
@@ -218,18 +199,18 @@ def equipas_coincidem(nome_a, nome_b):
     norm_b = normalizar_texto(nome_b)
     if not norm_a or not norm_b:
         return False
-    if norm_a == norm_b:
+    if norm_a == norm_b or norm_a in norm_b or norm_b in norm_a:
         return True
-    if norm_a in norm_b or norm_b in norm_a:
-        return True
-    
-    tok_a = tokens_relevantes(norm_a)
-    tok_b = tokens_relevantes(norm_b)
-    if not tok_a or not tok_b:
-        return False
-    
-    # CORREÇÃO V9.2: Basta que qualquer token relevante relevante coincida ou esteja contido
-    return any(t in tok_b for t in tok_a) or any(t in tok_a for t in tok_b)
+
+    words_a = [w for w in norm_a.split() if w not in STOPWORDS and len(w) > 2]
+    words_b = [w for w in norm_b.split() if w not in STOPWORDS and len(w) > 2]
+
+    # Se qualquer palavra significativa de uma equipa estiver dentro da outra, considera match
+    for wa in words_a:
+        for wb in words_b:
+            if wa == wb or wa in wb or wb in wa:
+                return True
+    return False
 
 
 def jogo_coincide_com_titulo(team1, team2, titulo_poly):
@@ -249,18 +230,12 @@ def parse_timestamp_utc(valor):
     if isinstance(valor, (int, float)):
         try:
             return datetime.fromtimestamp(float(valor), tz=timezone.utc)
-        except (ValueError, OSError):
+        except Exception:
             return None
     try:
         return datetime.fromisoformat(str(valor).replace("Z", "+00:00"))
-    except ValueError:
+    except Exception:
         return None
-
-
-def formatar_data_pt(dt_obj):
-    if not dt_obj:
-        return "Data por confirmar"
-    return dt_obj.strftime("%d/%m/%Y as %H:%M UTC")
 
 
 # ============================================================
@@ -301,13 +276,7 @@ def registar_aposta_virtual(m_hash, jogo_nome, stake_poly, stake_sx, lucro_esper
 # 6. RECOLHA DE DADOS
 # ============================================================
 
-SPORT_KEYWORDS = [
-    " vs ", " vs. ", "nba", "euroleague", "premier league",
-    "champions league", "la liga", "serie a", "bundesliga",
-    "ligue 1", "primeira liga", "benfica", "porto", "sporting",
-    "ufc", "mma", "atp", "wta", "tennis", "basketball", "soccer",
-    "football", "nhl", "hockey", "nfl", "mlb", "baseball"
-]
+SPORT_KEYWORDS = [" vs ", " vs. ", "nba", "euroleague", "premier league", "champions league", "la liga", "serie a", "bundesliga", "ligue 1", "primeira liga", "benfica", "porto", "sporting", "ufc", "mma", "atp", "wta", "tennis", "basketball", "soccer", "football", "nhl", "hockey", "nfl", "mlb", "baseball"]
 
 
 def parece_evento_desportivo(texto):
@@ -367,7 +336,7 @@ def obter_jogos_polymarket():
                     continue
                 submercados.append({"id": str(m.get("id", "")), "question": m.get("question", titulo), "outcomes": outcomes, "token_ids": token_ids})
             if submercados:
-                jogos_poly.append({"event_id": ev_id, "title": titulo, "end_date": parse_timestamp_utc(ev.get("endDate") or ev.get("startDate")), "markets": submercados})
+                jogos_poly.append({"event_id": ev_id, "title": titulo, "markets": submercados})
             if len(jogos_poly) >= MAX_POLY_MARKETS:
                 return jogos_poly
     return jogos_poly
@@ -406,8 +375,7 @@ def obter_mercados_sx():
                 "outcome_one": out1,
                 "outcome_two": out2,
                 "sport": m.get("sportLabel", ""),
-                "league": m.get("leagueLabel", ""),
-                "game_time": parse_timestamp_utc(m.get("gameTime"))
+                "league": m.get("leagueLabel", "")
             })
         next_key = data.get("nextKey")
         if not next_key:
@@ -499,7 +467,7 @@ def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
 
 
 # ============================================================
-# 7. ANALISE COM CRUZAMENTO INTELIGENTE
+# 7. ANALISE COM MATCHING ULTRA FLEXIVEL
 # ============================================================
 
 def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
@@ -547,7 +515,7 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                     continue
 
                 mensagem = (
-                    "🛡️ [TESTE SMART V9.2 - ALERTA DE JOGO CASADO]\n\n"
+                    "🛡️ [TESTE ULTRA V9.3 - ALERTA FORÇADO]\n\n"
                     f"Jogo: {team1} vs {team2}\n"
                     f"Poly Title: {jogo_poly['title']}\n"
                     f"Poly Preco: {preco_bruto_poly*100:.2f}¢ | Odd: {odd_bruta_poly:.2f}\n"
@@ -596,7 +564,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"ROBO V9.2 ONLINE")
+        self.wfile.write(b"ROBO V9.3 ONLINE")
 
     def log_message(self, format, *args):
         return
