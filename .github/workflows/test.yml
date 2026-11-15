@@ -25,3 +25,6 @@ jobs:
 
       - name: Testar o robô
         run: python trafulha_arbitragem.py --self-test
+
+      - name: Testar o monitor e historico SQLite (offline)
+        run: python monitor_v11.py --self-test
