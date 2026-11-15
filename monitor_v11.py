@@ -543,7 +543,10 @@ def main(once=False):
                     if ((ws_feed is not None and ws_feed.wake.is_set())
                             or (poly_feed is not None and poly_feed.wake.is_set())):
                         break
-                    time.sleep(min(1.0, deadline - time.monotonic()))
+                    remaining = max(0.0, deadline - time.monotonic())
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(1.0, remaining))
                 elapsed = time.monotonic() - started
                 if elapsed < 8.0:
                     time.sleep(8.0 - elapsed)
