@@ -79,6 +79,10 @@ def open_database(path: str):
       last_seen_epoch INTEGER NOT NULL,
       roi_pct REAL NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS report_schedule (
+      report_key TEXT PRIMARY KEY,
+      last_report_epoch INTEGER NOT NULL
+    );
     """)
     conn.commit()
     return conn
@@ -258,42 +262,85 @@ def scan_pass(conn, pairs, offset: int, fx: float):
             "signals": signals, "next_offset": new_offset, "best": best}
 
 
-def summary(conn, since_hours=24):
+def summary(conn, since_hours=6, now_epoch=None):
+    """Resumo de uma janela móvel, sem duplicar as duas direções por confronto."""
+    current_epoch = time.time() if now_epoch is None else now_epoch
     cutoff = datetime.fromtimestamp(
-        time.time() - since_hours * 3600, tz=timezone.utc
+        current_epoch - since_hours * 3600, tz=timezone.utc
     ).isoformat(timespec="seconds")
-    n, priced, pos, best = conn.execute("""
-        SELECT COUNT(*), COUNT(buffered_roi_pct),
-               SUM(CASE WHEN buffered_roi_pct > 0 THEN 1 ELSE 0 END),
-               MAX(buffered_roi_pct)
+    n, priced, pos, best, unique_events, potential_signals = conn.execute("""
+        SELECT COUNT(*),
+               COUNT(buffered_roi_pct),
+               COALESCE(SUM(CASE WHEN buffered_roi_pct > 0 THEN 1 ELSE 0 END), 0),
+               MAX(buffered_roi_pct),
+               COUNT(DISTINCT poly_market || '|' || sx_market),
+               COUNT(DISTINCT CASE
+                 WHEN hypothetical_profit_eur > 0 AND hypothetical_total_eur > 0
+                 THEN poly_market || '|' || sx_market END)
         FROM observations WHERE observed_at >= ?
     """, (cutoff,)).fetchone()
-    unique = conn.execute("""
-        SELECT COUNT(DISTINCT pair_key) FROM observations WHERE observed_at >= ?
-    """, (cutoff,)).fetchone()[0]
-    pos = int(pos or 0)
     return {
-        "records": n, "priced": priced, "positive": pos, "unique": unique,
+        "records": int(n),
+        "priced": int(priced),
+        "positive": int(pos),
+        "unique": int(unique_events),
         "best": best,
+        "potential_signals": int(potential_signals),
     }
 
 
-def send_summary(conn, catalog_count, startup=False):
-    stats = summary(conn)
-    lines = [
-        "🧪 MONITOR V11 · SÓ LEITURA",
-        f"Mercados cruzados: {catalog_count // 2} confrontos",
-        f"Últimas 24h: {stats['records']} leituras",
-        f"Preços válidos: {stats['priced']}",
-        f"Margens indicativas +: {stats['positive']}",
-        f"Melhor margem após buffer: "
-        f"{stats['best']:+.2f}%" if stats["best"] is not None else
-        "Melhor margem após buffer: N/D",
-        "🔒 Sem apostas",
-    ]
-    telegram("\n".join(lines))
+def format_summary(stats, catalog_count, window_hours=6, fx_available=False):
+    """Formato curto do Telegram, sem confundir sinais com apostas feitas."""
+    best = f"{stats['best']:+.2f}%" if stats["best"] is not None else "N/D"
+    potentials = str(stats["potential_signals"]) if fx_available else "N/D (sem câmbio)"
+    return "\n".join([
+        f"📊 MONITOR V11 · ÚLTIMAS {window_hours:g}H",
+        f"🏟️ Confrontos analisados: {stats['unique']}",
+        f"📚 Odds válidas: {stats['priced']}/{stats['records']}",
+        f"📈 Melhor margem estimada: {best}",
+        f"🔎 Sinais potenciais: {potentials}",
+        "🔒 Só leitura · sem apostas",
+    ])
+
+
+def report_due(conn, now_epoch=None):
+    now_epoch = int(time.time() if now_epoch is None else now_epoch)
+    last = conn.execute("""
+        SELECT last_report_epoch FROM report_schedule WHERE report_key='six_hour'
+    """).fetchone()
+    return last is None or now_epoch - int(last[0]) >= SUMMARY_INTERVAL
+
+
+def record_report_attempt(conn, now_epoch=None):
+    now_epoch = int(time.time() if now_epoch is None else now_epoch)
+    with conn:
+        conn.execute("""
+            INSERT INTO report_schedule(report_key,last_report_epoch)
+            VALUES('six_hour', ?)
+            ON CONFLICT(report_key) DO UPDATE
+            SET last_report_epoch=excluded.last_report_epoch
+        """, (now_epoch,))
+
+
+def send_summary(conn, catalog_count, startup=False, now_epoch=None):
+    """Envia resumo de 6h; memoriza o envio para não repetir após reinício."""
+    now_epoch = time.time() if now_epoch is None else now_epoch
+    hours = SUMMARY_INTERVAL / 3600.0
+    stats = summary(conn, since_hours=hours, now_epoch=now_epoch)
+    message = format_summary(
+        stats, catalog_count, window_hours=hours, fx_available=bot.FX > 0
+    )
+    telegram(message)
+    record_report_attempt(conn, now_epoch)
+    LOG.info(
+        "Relatório Telegram de %.0fh: confrontos=%d, odds=%d/%d, "
+        "sinais potenciais=%d, melhor=%s",
+        hours, stats["unique"], stats["priced"], stats["records"],
+        stats["potential_signals"],
+        f"{stats['best']:+.2f}%" if stats["best"] is not None else "N/D",
+    )
     if startup:
-        LOG.info("Monitor ativo; resumo de arranque emitido.")
+        LOG.info("Monitor ativo; primeiro resumo periódico emitido.")
 
 
 def catalog():
@@ -328,6 +375,28 @@ def self_test():
         assert quote and hypo is None
         report = summary(conn)
         assert report["records"] == 1 and report["positive"] == 1
+        assert report["unique"] == 1 and report["priced"] == 1
+        assert report["potential_signals"] == 0
+
+        # Uma segunda direção do mesmo confronto não conta como novo jogo.
+        reverse = {**fake, "key": "poly:1/sx:1:reverse",
+                   "poly_label": "B", "sx_label": "A"}
+        insert_observation(
+            conn, reverse, "PRE_JOGO", [(0.56, 30)], [(0.55, 30)], 1.0, 0
+        )
+        report = summary(conn)
+        assert report["records"] == 2 and report["unique"] == 1
+        assert report["best"] > 0
+
+        msg = format_summary(report, 2, fx_available=False)
+        assert "Confrontos analisados: 1" in msg
+        assert "ÚLTIMAS 6H" in msg
+        assert "N/D (sem câmbio)" in msg
+        assert "sem apostas" in msg
+
+        assert report_due(conn)
+        record_report_attempt(conn)
+        assert not report_due(conn)
         assert conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 0
         conn.close()
     print("✅ Monitor V11: testes locais OK (sem APIs, sem apostas)")
@@ -348,7 +417,6 @@ def main(once=False):
     conn = open_database(DB)
     pairs, cursor = [], 0
     last_catalog = 0.0
-    last_summary = 0.0
     iteration = 0
     try:
         while True:
@@ -368,9 +436,8 @@ def main(once=False):
             cursor = result["next_offset"]
             iteration += 1
 
-            if once or iteration == 1 or time.monotonic() - last_summary >= SUMMARY_INTERVAL:
+            if once or report_due(conn):
                 send_summary(conn, len(pairs), startup=(iteration == 1))
-                last_summary = time.monotonic()
 
             # Preservar o histórico do último mês; não apagar resultados recentes.
             if iteration % 100 == 0:
