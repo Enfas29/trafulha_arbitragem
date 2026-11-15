@@ -13,10 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import trafulha_arbitragem as bot
 
 # Amostra limitada: não representa necessariamente todos os mercados.
-bot.MAX_POLY_SERIES = 24
-bot.MAX_EVENTS_PER_SERIES = 100
+bot.MAX_POLY_SERIES = 60
+bot.MAX_EVENTS_PER_SERIES = 150
 bot.MAX_SX_PAGES = 12
-MAX_PAIRS = 6
+MAX_PAIRS = 8
 MAX_FALLBACK_BOOKS = 6
 
 
@@ -123,6 +123,7 @@ def diagnose_matching(poly, sx):
     print("Desportos Poly:", dict(families_poly.most_common(12)))
     print("Desportos SX:", dict(families_sx.most_common(12)))
     print("Desportos presentes nos dois:", ", ".join(common) if common else "(nenhum)")
+    print("Atenção: estes nomes são categorias; partidas comuns dependem de datas/outcomes.")
     print("Tipos SX por desporto:", dict(types_sx.most_common(12)))
     for label, count in counts.most_common():
         print(f"  {label}: {count}")
