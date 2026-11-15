@@ -174,6 +174,21 @@ def main():
             errors.append("Matching: " + readable_error(exc))
     print(f"🔎 Pares candidatos (cada direção conta): {len(pairs)}")
     reasons = diagnose_matching(poly, sx)
+
+    # Cobertura: quantos mercados SX têm ao menos um evento Poly
+    # do mesmo desporto e com início a menos de 3 horas.
+    poly_by_sport = collections.defaultdict(list)
+    for p in poly:
+        poly_by_sport[p["sport"]].append(p)
+    time_overlap = [
+        m for m in sx
+        if any(bot.match_time(p["start"], m["start"])
+               for p in poly_by_sport.get(m["sport"], ()))
+    ]
+    print(f"🕒 Mercados SX com jogos Poly do mesmo desporto e janela horária: {len(time_overlap)}")
+    for m in time_overlap[:6]:
+        print(f"  SX candidato a verificar nomes: [{m['sport']}] "
+              f"{m['teams'][0]} vs {m['teams'][1]}")
     print("   Matching preliminar: as regras de liquidação ainda exigem validação.")
 
     poly_ok = sx_ok = price_tests = potential_positive = 0
@@ -256,12 +271,25 @@ def main():
                 ("Mercados Poly (amostra)", len(poly)),
                 ("Mercados SX (amostra)", len(sx)),
                 ("Pares candidatos", len(pairs)),
+                ("SX com mesmo desporto e janela horária", len(time_overlap)),
                 ("Livros Poly acessíveis", poly_ok),
                 ("Livros SX acessíveis", sx_ok),
                 ("Pares com liquidez dos dois lados", price_tests),
                 ("Margens indicativas positivas", potential_positive),
             ]:
                 f.write(f"| {label} | {value} |\n")
+            f.write("\n### Principais razões de exclusão\n\n")
+            for reason, count in reasons.most_common(6):
+                f.write(f"- {reason}: {count}\n")
+            f.write("\n### Desportos mais comuns\n\n")
+            f.write("- Poly: " + ", ".join(
+                f"{k} ({v})" for k, v in collections.Counter(
+                    m["sport"] for m in poly).most_common(8)
+            ) + "\n")
+            f.write("- SX: " + ", ".join(
+                f"{k} ({v})" for k, v in collections.Counter(
+                    m["sport"] for m in sx).most_common(8)
+            ) + "\n")
             f.write("\n" + conclusion + "\n\n**Sem apostas reais ou virtuais.**\n")
 
     if errors:
