@@ -79,6 +79,24 @@ def main():
                 assert any("Só leitura" in msg for msg in sent)
                 assert monitor.summary(monitor_db)["unique"] == 1
 
+                # Falhas de dados: só uma notificação após 30 minutos e
+                # nunca repetir a cada ciclo. A recuperação desarma o aviso.
+                assert monitor.update_health(
+                    monitor_db, checked=1, priced=1, now_epoch=1000
+                ) is None
+                assert monitor.update_health(
+                    monitor_db, checked=1, priced=0, now_epoch=2000
+                ) is None
+                assert monitor.update_health(
+                    monitor_db, checked=1, priced=0, now_epoch=3001
+                ) is not None
+                assert monitor.update_health(
+                    monitor_db, checked=1, priced=0, now_epoch=3002
+                ) is None
+                assert monitor.update_health(
+                    monitor_db, checked=1, priced=1, now_epoch=3003
+                ) is None
+
                 trade_id = paper_db.execute(
                     "SELECT id FROM paper_v12_trades"
                 ).fetchone()[0]
