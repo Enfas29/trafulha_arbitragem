@@ -1,1371 +1,758 @@
 
+"""Paper Trading V11.0 — Polymarket + SX Bet, apenas simulação.
+
+Requisitos: pip install requests websocket-client centrifuge-python aiohttp
+Configuração: SX_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, EUR_PER_USD.
+EXECUÇÃO REAL NÃO EXISTE NESTE PROGRAMA.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import math
 import os
 import re
-import json
-import time
+import sqlite3
 import threading
-import logging
+import time
 import unicodedata
-import difflib
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import quote
 
 import requests
-import websocket
-
-
-# ============================================================
-# PAPER TRADING V10.0 - ULTRA SMART MATCH
-# MODO EXCLUSIVO DE SIMULACAO
-# ============================================================
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()
-SX_API_KEY = os.getenv("SX_API_KEY", "").strip()
-POLY_API_KEY = os.getenv("POLY_API_KEY", "").strip()
-
-PAPER_INITIAL_BANKROLL_POLY = float(
-    os.getenv("PAPER_INITIAL_BANKROLL_POLY", "1000")
-)
-PAPER_INITIAL_BANKROLL_SX = float(
-    os.getenv("PAPER_INITIAL_BANKROLL_SX", "1000")
-)
-PAPER_STAKE_USD = float(os.getenv("PAPER_STAKE_USD", "100"))
-
-MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "-3.0"))
-SCAN_INTERVAL = max(5, int(os.getenv("SCAN_INTERVAL", "15")))
-
-MIN_POLY_VOLUME = float(os.getenv("MIN_POLY_VOLUME", "100"))
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "15"))
-
-POLY_FEE_BUFFER_PCT = float(os.getenv("POLY_FEE_BUFFER_PCT", "1.0"))
-SX_FEE_BUFFER_PCT = float(os.getenv("SX_FEE_BUFFER_PCT", "0.0"))
-
-MAX_POLY_PAGES = int(os.getenv("MAX_POLY_PAGES", "15"))
-MAX_POLY_MARKETS = int(os.getenv("MAX_POLY_MARKETS", "400"))
-MAX_MATCH_LOGS = int(os.getenv("MAX_MATCH_LOGS", "30"))
-
-AUTO_BET = False
 
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
-POLY_CLOB_WS = (
-    "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-)
-SX_BASE = "https://api.sx.bet"
+POLY_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+SX_API = "https://api.sx.bet"
+SX_WS = "wss://realtime.sx.bet/connection/websocket"
+
+SX_KEY = os.getenv("SX_API_KEY", "").strip()
+TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+FX = float(os.getenv("EUR_PER_USD", "0"))
+
+INITIAL_EUR = 1000.0
+MAX_TOTAL_EUR = 100.0
+MIN_TOTAL_EUR = 5.0
+MIN_NET_ROI = 0.015              # 1,5% após buffers
+POLY_FEE_BUFFER = 0.010        # estimativa prudente; não é taxa oficial
+SX_FEE_BUFFER = 0.010          # estimativa prudente; não é taxa oficial
+SCANNER_SECONDS = 10          # fallback REST, mais rápido com sinais WS
+CATALOG_SECONDS = 240        # atualizar novas partidas/mercados
+MAX_SX_PAGES = 30
+MAX_POLY_SERIES = 70
+MAX_EVENTS_PER_SERIES = 150
+MAX_PAIRS_PER_SCAN = 25       # controla requests; aumenta gradualmente
+MAX_LIVE_AGE_H = 8
+MAX_FUTURE_H = 168            # jogos nos próximos 7 dias
+MAX_START_DIFF_H = 3
+MAX_SNAPSHOT_GAP_S = 6
+DB_FILE = os.getenv("PAPER_DB", "paper_v11.sqlite3")
+
+# Só mercados binários de vencedor, nunca spreads/totais ou 1X2 com empate.
+# Tipo 52 = 12; tipo 226 = 12 incluindo prolongamento.
+ALLOWED_SX_TYPES = {52, 226}
+# Futebol e hóquei podem ter empate/regras diferentes: excluir até validar
+# contratos de liquidação nos dois lados. Continua a descobri-los nos catálogos.
+EXCLUDED_SETTLEMENT_SPORTS = {"soccer", "hockey"}
+
+LOG = logging.getLogger("paper_v11")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+HTTP = requests.Session()
+HTTP.headers.update({"User-Agent": "PaperTradingV11/1.0", "Accept": "application/json"})
+if SX_KEY:
+    HTTP.headers.update({"x-sx-api-key": SX_KEY})
+
+wake = threading.Event()
+watch_lock = threading.Lock()
+watched_assets: set[str] = set()
+watched_sx_hashes: set[str] = set()
+poly_ws_client = None
 
 
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-
-logger = logging.getLogger("PaperTradingV10")
-
-session = requests.Session()
-
-session.headers.update({
-    "User-Agent": "PaperTradingV10/1.0",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache"
-})
-
-if SX_API_KEY:
-    session.headers["x-sx-api-key"] = SX_API_KEY
-
-if POLY_API_KEY:
-    session.headers["POLY_API_KEY"] = POLY_API_KEY
+def get_json(url, params=None, timeout=12):
+    r = HTTP.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict) and data.get("status") == "failure":
+        raise ValueError(f"API failure: {data.get('message', data)}")
+    return data
 
 
-# ============================================================
-# ESTADO GLOBAL
-# ============================================================
-
-state_lock = threading.RLock()
-wallet_lock = threading.Lock()
-orderbook_lock = threading.Lock()
-ws_lock = threading.Lock()
-
-live_orderbooks = {}
-subscribed_tokens = set()
-ws_app = None
-
-paper_wallet = {
-    "poly": {
-        "initial": PAPER_INITIAL_BANKROLL_POLY,
-        "available": PAPER_INITIAL_BANKROLL_POLY,
-        "invested": 0.0,
-        "profit": 0.0
-    },
-    "sx": {
-        "initial": PAPER_INITIAL_BANKROLL_SX,
-        "available": PAPER_INITIAL_BANKROLL_SX,
-        "invested": 0.0,
-        "profit": 0.0
-    },
-    "bets_placed": 0,
-    "history": [],
-    "apostas_realizadas_hashes": set()
-}
-
-scanner_status = {
-    "running": True,
-    "last_scan": None,
-    "last_error": None,
-    "poly_events_found": 0,
-    "poly_markets_found": 0,
-    "sx_markets_found": 0,
-    "matched_games": 0,
-    "unmatched_sx_markets": 0,
-    "alerts_sent": 0,
-    "ws_connected": False,
-    "mode": "PAPER_TRADING_V10.0"
-}
+def telegram(message):
+    if not (TG_TOKEN and TG_CHAT):
+        LOG.info("Telegram não configurado | %s", message.replace("\n", " | "))
+        return
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT, "text": message, "disable_web_page_preview": True},
+            timeout=10,
+        )
+        response.raise_for_status()
+        if response.json().get("ok") is not True:
+            raise ValueError(response.text[:200])
+    except Exception as exc:
+        LOG.error("Telegram falhou: %s", exc)
 
 
-# ============================================================
-# 1. MATCHING INTELIGENTE DE EQUIPAS
-# ============================================================
-
-def remover_acentos(texto):
-    nfkd = unicodedata.normalize("NFKD", str(texto))
-
-    return "".join(
-        c for c in nfkd
-        if not unicodedata.combining(c)
-    )
-
-
-def normalizar_texto(nome):
-    txt = remover_acentos(nome).lower().strip()
-    txt = txt.replace("&", " and ")
-    txt = re.sub(r"[^a-z0-9]+", " ", txt)
-
-    return " ".join(txt.split())
+def values(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+            return decoded if isinstance(decoded, list) else []
+        except ValueError:
+            return []
+    return []
 
 
-ALIASES_EQUIPAS = {
-    "man city": "manchester city",
-    "man utd": "manchester united",
-    "man united": "manchester united",
-    "man u": "manchester united",
-    "spurs": "tottenham hotspur",
+def ascii_name(name):
+    text = unicodedata.normalize("NFKD", str(name or ""))
+    text = "".join(c for c in text if not unicodedata.combining(c)).lower()
+    text = text.replace("&", " and ")
+    text = re.sub(r"[^a-z0-9 ]+", " ", text)
+    text = re.sub(r"\b(fc|cf|afc|sc|bc|the)\b", " ", text)
+    return " ".join(text.split())
+
+
+ALIASES = {
     "psg": "paris saint germain",
-    "paris sg": "paris saint germain",
-    "atleti": "atletico madrid",
-    "atletico": "atletico madrid",
-    "bayern": "bayern munich",
-    "sporting": "sporting cp",
-    "porto": "fc porto",
-    "benfica": "sl benfica",
-    "barca": "barcelona",
-    "juve": "juventus",
-    "ajax": "ajax amsterdam",
-    "roma": "as roma",
-    "napoli": "ssc napoli",
-    "wolves": "wolverhampton wanderers",
-    "newcastle": "newcastle united",
-    "west ham": "west ham united",
-    "athletic": "athletic bilbao"
+    "man utd": "manchester united",
+    "man city": "manchester city",
+    "ny knicks": "new york knicks",
+    "la lakers": "los angeles lakers",
+    "gs warriors": "golden state warriors",
 }
 
 
-GENERIC_TEAM_WORDS = {
-    "fc", "cf", "sc", "ac", "afc",
-    "club", "clube", "football", "futebol",
-    "the", "team", "basketball",
-    "women", "woman", "womens",
-    "u18", "u19", "u20", "u21", "u23",
-    "reserves"
-}
+def comparable(name):
+    n = ascii_name(name)
+    return ascii_name(ALIASES.get(n, n))
 
 
-def normalizar_equipa(nome):
-    txt = normalizar_texto(nome)
-
-    if not txt:
-        return ""
-
-    txt = ALIASES_EQUIPAS.get(txt, txt)
-
-    words = [
-        w for w in txt.split()
-        if w not in GENERIC_TEAM_WORDS
-    ]
-
-    return " ".join(words)
-
-
-def equipas_coincidem(nome_a, nome_b):
-
-    a = normalizar_equipa(nome_a)
-    b = normalizar_equipa(nome_b)
-
+def same_team(a, b):
+    a, b = comparable(a), comparable(b)
     if not a or not b:
         return False
-
     if a == b:
         return True
-
-    wa = set(a.split())
-    wb = set(b.split())
-
-    comuns = wa & wb
-
-    if comuns:
-
-        for word in comuns:
-
-            if len(word) >= 5:
-
-                if len(wa) == 1 or len(wb) == 1:
-                    return True
-
-        if len(comuns) >= 2:
-            return True
-
-    ratio = difflib.SequenceMatcher(
-        None, a, b
-    ).ratio()
-
-    if min(len(a), len(b)) >= 8 and ratio >= 0.88:
-        return True
-
-    return False
+    aa, bb = a.split(), b.split()
+    # Último nome individual ou alcunha da equipa; exige as duas equipas do evento.
+    small, large = (aa, bb) if len(aa) <= len(bb) else (bb, aa)
+    return len(small) == 1 and len(small[0]) >= 5 and small[0] == large[-1]
 
 
-def separar_equipas_titulo(titulo):
+def parse_title(title):
+    # Ex.: "NBA: Lakers vs Celtics", "Player A @ Player B"
+    text = str(title).split(":", 1)[-1].strip()
+    parts = re.split(r"\s+(?:vs\.?|v\.?|@)\s+", text, maxsplit=1, flags=re.I)
+    if len(parts) != 2:
+        return None
+    return (parts[0].strip(), parts[1].strip())
 
-    txt = str(titulo or "").strip()
 
-    patterns = [
-        r"\s+vs\.?\s+",
-        r"\s+v\.?\s+",
-        r"\s+@\s+",
-        r"\s+at\s+"
-    ]
+def sport_family(label):
+    name = ascii_name(label)
+    for keys, family in [
+        (("nba", "wnba", "ncaa basketball", "basketball", "ncaab"), "basketball"),
+        (("nfl", "cfb", "american football", "ncaaf"), "american_football"),
+        (("tennis", "atp", "wta", "challenger"), "tennis"),
+        (("mlb", "baseball", "kbo"), "baseball"),
+        (("nhl", "hockey"), "hockey"),
+        (("soccer", "epl", "la liga", "ucl", "football", "liga", "serie a"), "soccer"),
+        (("ufc", "mma", "boxing"), "combat"),
+        (("cricket",), "cricket"),
+        (("esport", "counter strike", "dota", "league of legends"), "esports"),
+        (("rugby",), "rugby"),
+        (("volleyball",), "volleyball"),
+    ]:
+        if any(k in name for k in keys):
+            return family
+    return name
 
-    for pattern in patterns:
 
-        parts = re.split(
-            pattern,
-            txt,
-            maxsplit=1,
-            flags=re.IGNORECASE
-        )
-
-        if len(parts) == 2:
-
-            left = parts[0].strip()
-            right = parts[1].strip()
-
-            if left and right:
-                return left, right
-
+def unix_time(value):
+    try:
+        if isinstance(value, (int, float)) or (isinstance(value, str) and value.isdigit()):
+            v = float(value)
+            return v / 1000 if v > 10**11 else v
+        if isinstance(value, str) and value:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (ValueError, OverflowError):
+        pass
     return None
 
 
-def jogo_coincide_com_titulo(
-    team1,
-    team2,
-    titulo_poly
-):
-
-    parts = separar_equipas_titulo(titulo_poly)
-
-    if not parts:
-        return False
-
-    a, b = parts
-
-    direct = (
-        equipas_coincidem(team1, a)
-        and equipas_coincidem(team2, b)
-    )
-
-    reverse = (
-        equipas_coincidem(team1, b)
-        and equipas_coincidem(team2, a)
-    )
-
-    return direct or reverse
+def match_time(poly_ts, sx_ts):
+    return bool(poly_ts and sx_ts and abs(poly_ts - sx_ts) <= MAX_START_DIFF_H * 3600)
 
 
-# ============================================================
-# 2. HTTP E TELEGRAM
-# ============================================================
-
-def http_get(url, params=None, timeout=20):
-
-    response = session.get(
-        url,
-        params=params,
-        timeout=timeout
-    )
-
-    response.raise_for_status()
-
-    return response.json()
-
-
-def converter_lista(value):
-
-    if isinstance(value, str):
-
-        try:
-            decoded = json.loads(value)
-
-            return decoded if isinstance(decoded, list) else []
-
-        except (json.JSONDecodeError, TypeError):
-            return []
-
-    return value if isinstance(value, list) else []
-
-
-def enviar_alerta_telegram(mensagem):
-
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-
-        logger.error(
-            "Telegram não configurado: falta TOKEN ou CHAT_ID."
-        )
-
-        return False
-
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendMessage"
-    )
-
-    try:
-
-        response = session.post(
-            url,
-            json={
-                "chat_id": CHAT_ID,
-                "text": mensagem,
-                "disable_web_page_preview": True
-            },
-            timeout=15
-        )
-
-        if not response.ok:
-
-            logger.error(
-                "Telegram HTTP %s: %s",
-                response.status_code,
-                response.text[:500]
-            )
-
-            return False
-
-        payload = response.json()
-
-        if not payload.get("ok"):
-
-            logger.error(
-                "Telegram recusou a mensagem: %s",
-                payload
-            )
-
-            return False
-
-        logger.info("Alerta enviado ao Telegram.")
-
-        return True
-
-    except requests.RequestException:
-
-        logger.exception(
-            "Falha de ligação ao Telegram."
-        )
-
-        return False
-
-
-def testar_telegram():
-
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-
-        logger.warning(
-            "Telegram não testado: configura TOKEN e CHAT_ID."
-        )
-
-        return
-
-    enviar_alerta_telegram(
-        "🟢 PAPER TRADING V10.0 ONLINE\n"
-        "Scanner iniciado em modo de simulação.\n"
-        "Nenhuma aposta real será realizada."
-    )
-
-
-# ============================================================
-# 3. WEBSOCKET POLYMARKET
-# ============================================================
-
-def atualizar_orderbook_cache(token_id, asks, bids=None):
-
-    valid_asks = []
-
-    for level in asks or []:
-
-        try:
-
-            price = float(level.get("price"))
-            size = float(level.get("size"))
-
-            if 0 < price < 1 and size > 0:
-
-                valid_asks.append({
-                    "price": price,
-                    "size": size
-                })
-
-        except (TypeError, ValueError, AttributeError):
+def discover_poly():
+    metadata = get_json(POLY_GAMMA + "/sports")
+    sports = metadata if isinstance(metadata, list) else []
+    series = {}
+    for row in sports:
+        if not isinstance(row, dict):
             continue
+        sport = sport_family(row.get("sport") or row.get("name"))
+        for sid in re.findall(r"\d+", str(row.get("series", ""))):
+            series[sid] = sport
 
-    if not valid_asks:
-        return
+    result = []
+    seen = set()
+    for sid, family in list(series.items())[:MAX_POLY_SERIES]:
+        try:
+            events = get_json(POLY_GAMMA + "/events", {
+                "active": "true", "closed": "false", "series_id": sid,
+                "limit": MAX_EVENTS_PER_SERIES, "offset": 0,
+            })
+        except Exception as exc:
+            LOG.warning("Gamma series %s: %s", sid, exc)
+            continue
+        for event in events if isinstance(events, list) else []:
+            if str(event.get("id")) in seen:
+                continue
+            seen.add(str(event.get("id")))
+            teams = parse_title(event.get("title", ""))
+            if not teams:
+                continue
+            for m in event.get("markets", []) or []:
+                if m.get("closed") or m.get("active") is False:
+                    continue
+                outs = values(m.get("outcomes"))
+                ids = values(m.get("positionIds")) if m.get("version") == "v2" else values(m.get("clobTokenIds"))
+                if len(outs) != 2 or len(ids) != 2:
+                    continue
+                # Sem Yes/No: um NO pode não equivaler à vitória do adversário.
+                if {ascii_name(x) for x in outs} == {"yes", "no"}:
+                    continue
+                if not ((same_team(outs[0], teams[0]) and same_team(outs[1], teams[1]))
+                        or (same_team(outs[1], teams[0]) and same_team(outs[0], teams[1]))):
+                    continue
+                start = unix_time(m.get("gameStartTime") or event.get("startTime") or event.get("gameStartTime"))
+                if not start:
+                    continue
+                result.append({
+                    "id": str(m.get("id")), "sport": family, "teams": teams,
+                    "title": event.get("title", ""), "start": start,
+                    "outcomes": outs, "assets": [str(x) for x in ids],
+                    "slug": event.get("slug", ""),
+                    "type": m.get("sportsMarketType"),
+                })
+    LOG.info("Polymarket: %d mercados binários desportivos elegíveis", len(result))
+    return result
 
-    best = min(
-        valid_asks,
-        key=lambda x: x["price"]
-    )
 
-    liquidity = sum(
-        x["price"] * x["size"]
-        for x in valid_asks
-    )
+def discover_sx():
+    all_markets, page_key = [], None
+    for _ in range(MAX_SX_PAGES):
+        params = {"type": "52,226", "pageSize": 100, "onlyMainLine": "true"}
+        if page_key:
+            params["paginationKey"] = page_key
+        data = get_json(SX_API + "/markets/active", params).get("data", {})
+        batch = data.get("markets", [])
+        if not batch:
+            break
+        for m in batch:
+            if (m.get("status") != "ACTIVE" or m.get("type") not in ALLOWED_SX_TYPES
+                    or not m.get("marketHash") or not m.get("teamOneName")
+                    or not m.get("teamTwoName")):
+                continue
+            game = unix_time(m.get("gameTime"))
+            if not game:
+                continue
+            all_markets.append({
+                "hash": m["marketHash"], "teams": (m["teamOneName"], m["teamTwoName"]),
+                "outcomes": (m.get("outcomeOneName", ""), m.get("outcomeTwoName", "")),
+                "start": game, "sport": sport_family(m.get("sportLabel", "")),
+                "type": m["type"], "league": m.get("leagueLabel", ""),
+                "live_enabled": bool(m.get("liveEnabled")),
+            })
+        page_key = data.get("nextKey")
+        if not page_key:
+            break
+    LOG.info("SX Bet: %d mercados 2-way ativos", len(all_markets))
+    return all_markets
 
-    with orderbook_lock:
 
-        live_orderbooks[str(token_id)] = {
-            "price": best["price"],
-            "size": best["size"],
-            "liquidity_usd": liquidity,
-            "checked_at": datetime.now(timezone.utc).isoformat(),
-            "source": "websocket"
-        }
+def pair_markets(poly, sx):
+    result = []
+    for s in sx:
+        if s["sport"] in EXCLUDED_SETTLEMENT_SPORTS:
+            continue
+        a, b = s["teams"]
+        # Para não misturar "tempo regulamentar" com "inclui prolongamento",
+        # restringimos neste protótipo ao moneyline com prolongamento da SX.
+        if s["sport"] in {"basketball", "american_football"}:
+            if s["type"] != 226:
+                continue
+        elif s["type"] != 52:
+            continue
+        candidates = []
+        for p in poly:
+            if p["sport"] != s["sport"] or not match_time(p["start"], s["start"]):
+                continue
+            x, y = p["teams"]
+            if not ((same_team(a, x) and same_team(b, y)) or
+                    (same_team(a, y) and same_team(b, x))):
+                continue
+            poly_index = {}
+            for idx, label in enumerate(p["outcomes"]):
+                for i, team in enumerate((a, b)):
+                    if same_team(label, team):
+                        poly_index[i] = idx
+            if len(poly_index) != 2 or poly_index[0] == poly_index[1]:
+                continue
+            # SX outcomes devem ser literalmente os dois participantes.
+            if not (same_team(s["outcomes"][0], a) and same_team(s["outcomes"][1], b)):
+                continue
+            candidates.append((p, poly_index))
+        if len(candidates) == 1:
+            p, mapping = candidates[0]
+            for target in (0, 1):
+                result.append({
+                    "poly": p, "sx": s, "poly_asset": p["assets"][mapping[target]],
+                    "poly_label": p["outcomes"][mapping[target]],
+                    "sx_target": 1 - target,  # SX aposta no adversário
+                    "sx_label": s["outcomes"][1 - target],
+                    "key": f"{p['id']}:{s['hash']}:{target}",
+                })
+    LOG.info("Matching confirmado por nome, desporto e hora: %d pares", len(result))
+    return result
 
 
-def processar_mensagem_ws(ws, message):
+def poly_book(asset):
+    data = get_json(POLY_CLOB + "/book", {"token_id": asset}, timeout=7)
+    asks = []
+    for level in data.get("asks", []):
+        try:
+            price, shares = float(level["price"]), float(level["size"])
+            if 0 < price < 1 and shares > 0:
+                asks.append((price, shares))
+        except (KeyError, ValueError, TypeError):
+            pass
+    asks.sort()
+    return asks, time.monotonic()
 
-    try:
 
-        payload = json.loads(message)
+def sx_book(market_hash, target):
+    """Para apostar num outcome, consumir as ordens do outcome contrário.
 
-        items = (
-            payload
-            if isinstance(payload, list)
-            else [payload]
+    Retorna níveis (preço por unidade de payout, capacidade de payout).
+    """
+    raw = get_json(SX_API + "/orderbook-v3/snapshot/market", {
+        "marketHash": market_hash,
+    }, timeout=7)
+    data = raw["data"]
+    other_side = "outcomeTwo" if target == 0 else "outcomeOne"
+    levels = []
+    for level in data.get(other_side, []) or []:
+        try:
+            maker = int(level["percentageOdds"])
+            size = int(level["size"]) / 1_000_000
+            if not (0 < maker < 10**20) or size <= 0:
+                continue
+            maker_p = maker / 10**20
+            taker_p = 1 - maker_p
+            # Taker payout capacity = resting stake / maker probability.
+            levels.append((taker_p, size / maker_p))
+        except (ValueError, TypeError, KeyError, ZeroDivisionError):
+            continue
+    levels.sort()
+    return levels, time.monotonic()
+
+
+def cost_for_payout(levels, payout):
+    need, cost = payout, 0.0
+    for price, capacity in levels:
+        take = min(need, capacity)
+        cost += take * price
+        need -= take
+        if need <= 1e-7:
+            return cost
+    return None
+
+
+@dataclass
+class Quote:
+    payout: float
+    poly_usd: float
+    sx_usd: float
+    fees_usd: float
+    profit_usd: float
+    roi: float
+
+
+def price_quote(poly_levels, sx_levels, free_poly, free_sx):
+    if not poly_levels or not sx_levels or FX <= 0:
+        return None
+    poly_capacity = sum(cap for _, cap in poly_levels)
+    sx_capacity = sum(cap for _, cap in sx_levels)
+    max_payout = min(poly_capacity, sx_capacity, 20000.0)
+    max_usd = MAX_TOTAL_EUR / FX
+    low, high = 0.0, max_payout
+
+    def simulate(q):
+        pc = cost_for_payout(poly_levels, q)
+        sc = cost_for_payout(sx_levels, q)
+        if pc is None or sc is None:
+            return None
+        fees = pc * POLY_FEE_BUFFER + sc * SX_FEE_BUFFER
+        if pc * (1 + POLY_FEE_BUFFER) > free_poly or sc * (1 + SX_FEE_BUFFER) > free_sx:
+            return None
+        if pc + sc + fees > max_usd:
+            return None
+        profit = q - pc - sc - fees
+        return Quote(q, pc, sc, fees, profit, profit / (pc + sc + fees))
+
+    best = None
+    for _ in range(35):
+        mid = (low + high) / 2
+        quote = simulate(mid)
+        if quote:
+            low, best = mid, quote
+        else:
+            high = mid
+    if not best or (best.poly_usd + best.sx_usd) * FX < MIN_TOTAL_EUR:
+        return None
+    return best if best.roi >= MIN_NET_ROI else None
+
+
+def initialize_db(conn):
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS wallets (
+            platform TEXT PRIMARY KEY, free_usd REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            match_key TEXT UNIQUE NOT NULL, created_utc TEXT NOT NULL,
+            sport TEXT NOT NULL, event TEXT NOT NULL, poly_label TEXT NOT NULL,
+            sx_label TEXT NOT NULL, poly_asset TEXT NOT NULL, sx_hash TEXT NOT NULL,
+            poly_cost REAL NOT NULL, sx_cost REAL NOT NULL,
+            fee_buffer REAL NOT NULL, payout REAL NOT NULL,
+            estimated_profit REAL NOT NULL, status TEXT NOT NULL DEFAULT 'OPEN',
+            settled_side TEXT
+        );
+    """)
+    previous_fx = conn.execute("SELECT value FROM meta WHERE key='fx'").fetchone()
+    if previous_fx and abs(float(previous_fx[0]) - FX) > 1e-9:
+        raise ValueError("EUR_PER_USD mudou; usa um novo PAPER_DB para reiniciar a simulação")
+    conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES ('fx',?)", (str(FX),))
+    for name in ("poly", "sx"):
+        conn.execute(
+            "INSERT OR IGNORE INTO wallets(platform,free_usd) VALUES (?,?)",
+            (name, INITIAL_EUR / FX),
         )
+    conn.commit()
 
-        for item in items:
 
-            if not isinstance(item, dict):
+def balances(conn):
+    return {name: amount for name, amount in conn.execute("SELECT platform,free_usd FROM wallets")}
+
+
+def book_paper(conn, pair, q):
+    # Transação única: nada é debitado se não houver saldo em ambos.
+    with conn:
+        exists = conn.execute("SELECT 1 FROM trades WHERE match_key=?", (pair["key"],)).fetchone()
+        if exists:
+            return None
+        free = balances(conn)
+        poly_charge = q.poly_usd * (1 + POLY_FEE_BUFFER)
+        sx_charge = q.sx_usd * (1 + SX_FEE_BUFFER)
+        if free["poly"] + 1e-7 < poly_charge or free["sx"] + 1e-7 < sx_charge:
+            return None
+        conn.execute("UPDATE wallets SET free_usd=free_usd-? WHERE platform='poly'", (poly_charge,))
+        conn.execute("UPDATE wallets SET free_usd=free_usd-? WHERE platform='sx'", (sx_charge,))
+        cursor = conn.execute("""
+            INSERT INTO trades(match_key,created_utc,sport,event,poly_label,sx_label,
+                poly_asset,sx_hash,poly_cost,sx_cost,fee_buffer,payout,estimated_profit,status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'OPEN')
+        """, (pair["key"], datetime.now(timezone.utc).isoformat(),
+              pair["sx"]["sport"], " vs ".join(pair["sx"]["teams"]),
+              pair["poly_label"], pair["sx_label"], pair["poly_asset"],
+              pair["sx"]["hash"], q.poly_usd, q.sx_usd,
+              q.fees_usd, q.payout, q.profit_usd))
+    return cursor.lastrowid
+
+
+def settle(conn, trade_id, winner):
+    # Liquidação manual, somente depois de confirmar regras e resultado nas duas fontes.
+    row = conn.execute("""SELECT status,poly_cost,sx_cost,fee_buffer,payout
+                          FROM trades WHERE id=?""", (trade_id,)).fetchone()
+    if not row or row[0] != "OPEN":
+        raise ValueError("Operação inexistente ou já liquidada")
+    _, poly, sx, fees, payout = row
+    with conn:
+        if winner == "poly":
+            conn.execute("UPDATE wallets SET free_usd=free_usd+? WHERE platform='poly'", (payout,))
+        elif winner == "sx":
+            conn.execute("UPDATE wallets SET free_usd=free_usd+? WHERE platform='sx'", (payout,))
+        elif winner == "void":
+            # Estimativa: devolução dos stakes, com buffers de fees não recuperados.
+            conn.execute("UPDATE wallets SET free_usd=free_usd+? WHERE platform='poly'", (poly,))
+            conn.execute("UPDATE wallets SET free_usd=free_usd+? WHERE platform='sx'", (sx,))
+        else:
+            raise ValueError("Usa poly, sx ou void")
+        conn.execute("UPDATE trades SET status='SETTLED', settled_side=? WHERE id=?", (winner, trade_id))
+    LOG.info("Liquidação manual #%s: %s | %s", trade_id, winner, balances(conn))
+
+
+def notify_trade(pair, q, trade_id):
+    s = pair["sx"]
+    now = time.time()
+    stage = "APÓS INÍCIO*" if s["start"] <= now else "PRÉ-JOGO"
+    telegram(
+        f"✅ PAPER #{trade_id} · {stage}\n"
+        f"{s['sport'].upper()} | {s['teams'][0]} vs {s['teams'][1]}\n"
+        f"Poly: {pair['poly_label']} · {q.poly_usd * FX:.2f}€\n"
+        f"SX: {pair['sx_label']} · {q.sx_usd * FX:.2f}€\n"
+        f"Total: {(q.poly_usd + q.sx_usd + q.fees_usd) * FX:.2f}€\n"
+        f"Lucro estimado: +{q.profit_usd * FX:.2f}€ ({q.roi * 100:.2f}%)\n"
+        "🧪 Simulado, não liquidado"
+    )
+
+
+def check_pairs(conn, pairs, cursor_offset=0):
+    if not pairs:
+        return 0
+    budget = MAX_PAIRS_PER_SCAN
+    checked = 0
+    current = time.time()
+    for pair in pairs[cursor_offset:] + pairs[:cursor_offset]:
+        if checked >= budget:
+            break
+        s = pair["sx"]
+        if not (current - MAX_LIVE_AGE_H*3600 <= s["start"] <= current + MAX_FUTURE_H*3600):
+            continue
+        if s["start"] < current and not s["live_enabled"]:
+            continue
+        if conn.execute("SELECT 1 FROM trades WHERE match_key=?", (pair["key"],)).fetchone():
+            continue
+        checked += 1
+        try:
+            poly_levels, t1 = poly_book(pair["poly_asset"])
+            sx_levels, t2 = sx_book(s["hash"], pair["sx_target"])
+            if abs(t1 - t2) > MAX_SNAPSHOT_GAP_S:
+                continue
+            money = balances(conn)
+            q = price_quote(poly_levels, sx_levels, money["poly"], money["sx"])
+            if not q:
+                continue
+            trade_id = book_paper(conn, pair, q)
+            if trade_id:
+                LOG.info("PAPER #%s | %s | ROI líquido estimado %.2f%%",
+                         trade_id, " vs ".join(s["teams"]), 100 * q.roi)
+                notify_trade(pair, q, trade_id)
+        except Exception as exc:
+            LOG.warning("Falha leitura %s: %s", s["hash"][:12], exc)
+    return checked
+
+
+def poly_stream():
+    try:
+        import websocket
+    except ImportError:
+        LOG.warning("Instala websocket-client para receber gatilhos Polymarket")
+        return
+    while True:
+        try:
+            with watch_lock:
+                assets = list(watched_assets)[:500]
+            if not assets:
+                time.sleep(5)
                 continue
 
-            event_type = (
-                item.get("event_type")
-                or item.get("type")
+            def on_open(ws):
+                global poly_ws_client
+                with watch_lock:
+                    poly_ws_client = ws
+                    latest_assets = list(watched_assets)[:500]
+                ws.send(json.dumps({"assets_ids": latest_assets, "type": "market"}))
+                def ping_loop():
+                    while ws.keep_running:
+                        try:
+                            ws.send("PING")
+                        except Exception:
+                            break
+                        time.sleep(10)
+                threading.Thread(target=ping_loop, daemon=True).start()
+
+            def on_message(_ws, msg):
+                if msg == "PONG":
+                    return
+                try:
+                    payload = json.loads(msg)
+                    items = payload if isinstance(payload, list) else [payload]
+                    if any(isinstance(x, dict) and x.get("event_type") in
+                           ("book", "price_change") for x in items):
+                        wake.set()
+                except (ValueError, TypeError):
+                    return
+
+            def on_close(ws, *_):
+                global poly_ws_client
+                with watch_lock:
+                    if poly_ws_client is ws:
+                        poly_ws_client = None
+
+            ws = websocket.WebSocketApp(
+                POLY_WS, on_open=on_open, on_message=on_message,
+                on_error=lambda _w, e: LOG.warning("Poly WS: %s", e),
+                on_close=on_close,
             )
-
-            if (
-                event_type == "book"
-                or (
-                    "asks" in item
-                    and "asset_id" in item
-                )
-            ):
-
-                token_id = (
-                    item.get("asset_id")
-                    or item.get("market")
-                )
-
-                if token_id:
-
-                    atualizar_orderbook_cache(
-                        token_id,
-                        item.get("asks", []),
-                        item.get("bids", [])
-                    )
-
-    except Exception:
-
-        logger.exception(
-            "Erro ao interpretar mensagem WebSocket."
-        )
-
-
-def ao_abrir_ws(ws):
-
-    logger.info(
-        "WebSocket Polymarket ligado."
-    )
-
-    with state_lock:
-        scanner_status["ws_connected"] = True
-
-    with ws_lock:
-        tokens = list(subscribed_tokens)
-
-    if tokens:
-
-        try:
-
-            ws.send(json.dumps({
-                "type": "market",
-                "assets_ids": tokens,
-                "custom_feature_enabled": True
-            }))
-
-            logger.info(
-                "WebSocket subscrito a %d tokens.",
-                len(tokens)
-            )
-
-        except Exception:
-
-            logger.exception(
-                "Falha ao subscrever tokens."
-            )
-
-
-def ao_fechar_ws(
-    ws,
-    close_status_code,
-    close_msg
-):
-
-    logger.warning(
-        "WebSocket fechado. Código=%s Motivo=%s",
-        close_status_code,
-        close_msg
-    )
-
-    with state_lock:
-        scanner_status["ws_connected"] = False
-
-
-def ao_erro_ws(ws, error):
-
-    logger.error(
-        "WebSocket Polymarket: %s",
-        error
-    )
-
-
-def subscrever_tokens_poly(token_ids):
-
-    novos = []
-
-    with ws_lock:
-
-        for token in token_ids:
-
-            token = str(token)
-
-            if token and token not in subscribed_tokens:
-
-                subscribed_tokens.add(token)
-                novos.append(token)
-
-    if not novos:
-        return
-
-    current_ws = ws_app
-
-    if current_ws and scanner_status.get("ws_connected"):
-
-        try:
-
-            current_ws.send(json.dumps({
-                "assets_ids": novos,
-                "operation": "subscribe"
-            }))
-
-            logger.info(
-                "Subscrição incremental: %d tokens.",
-                len(novos)
-            )
-
-        except Exception:
-
-            logger.exception(
-                "Não foi possível subscrever novos tokens."
-            )
-
-
-def correr_websocket_poly():
-
-    global ws_app
-
-    while True:
-
-        try:
-
-            app = websocket.WebSocketApp(
-                POLY_CLOB_WS,
-                on_open=ao_abrir_ws,
-                on_message=processar_mensagem_ws,
-                on_close=ao_fechar_ws,
-                on_error=ao_erro_ws
-            )
-
-            ws_app = app
-
-            app.run_forever(
-                ping_interval=20,
-                ping_timeout=10
-            )
-
-        except Exception:
-
-            logger.exception(
-                "Erro no ciclo WebSocket."
-            )
-
-        with state_lock:
-            scanner_status["ws_connected"] = False
-
+            ws.run_forever(ping_interval=0)
+        except Exception as exc:
+            LOG.warning("Reconexão Poly WS: %s", exc)
         time.sleep(5)
 
-# ============================================================
-# POLYMARKET — RECOLHA DE EVENTOS E MERCADOS
-# ============================================================
 
-def parece_evento_desportivo(texto):
-    value = f" {str(texto).lower()} "
-    return any(keyword in value for keyword in SPORT_KEYWORDS)
-
-
-def obter_jogos_polymarket():
-    jogos = []
-    vistos = set()
-    total_markets = 0
-
-    for page in range(MAX_POLY_PAGES):
-        try:
-            events = http_get(
-                f"{POLY_GAMMA}/events",
-                params={
-                    "active": "true",
-                    "closed": "false",
-                    "order": "volume24hr",
-                    "ascending": "false",
-                    "limit": 100,
-                    "offset": page * 100
-                },
-                timeout=20
-            )
-        except Exception:
-            logger.exception("Falha a obter eventos Gamma (página %d).", page)
-            break
-
-        if not isinstance(events, list) or not events:
-            break
-
-        for event in events:
-            event_id = str(event.get("id", ""))
-            if event_id in vistos:
-                continue
-            vistos.add(event_id)
-
-            title = event.get("title", "")
-            description = event.get("description", "")
-
-            if not parece_evento_desportivo(f"{title} {description}"):
-                continue
-
-            submarkets = []
-
-            for market in event.get("markets", []) or []:
-                if market.get("closed") is True or market.get("active") is False:
-                    continue
-
-                outcomes = converter_lista(market.get("outcomes"))
-                token_ids = converter_lista(market.get("clobTokenIds"))
-
-                if len(outcomes) != 2 or len(token_ids) != 2:
-                    continue
-
-                submarkets.append({
-                    "id": str(market.get("id", "")),
-                    "question": market.get("question") or title,
-                    "outcomes": outcomes,
-                    "token_ids": [str(x) for x in token_ids],
-                    "volume": float(
-                        market.get("volumeNum") or market.get("volume") or 0
-                    )
-                })
-
-                total_markets += 1
-
-            if submarkets:
-                jogos.append({
-                    "event_id": event_id,
-                    "title": title,
-                    "markets": submarkets
-                })
-
-            if total_markets >= MAX_POLY_MARKETS:
-                with state_lock:
-                    scanner_status["poly_events_found"] = len(jogos)
-                    scanner_status["poly_markets_found"] = total_markets
-                return jogos
-
-    with state_lock:
-        scanner_status["poly_events_found"] = len(jogos)
-        scanner_status["poly_markets_found"] = total_markets
-
-    logger.info(
-        "Polymarket: %d eventos desportivos, %d mercados binários.",
-        len(jogos), total_markets
-    )
-
-    return jogos
-
-
-# ============================================================
-# SX BET — RECOLHA DE MERCADOS
-# ============================================================
-
-def obter_mercados_sx():
-    markets = []
-    next_key = None
-
-    for _ in range(8):
-        params = {"onlyMainLine": "true"}
-
-        if next_key:
-            params["paginationKey"] = next_key
-
-        try:
-            response = http_get(
-                f"{SX_BASE}/markets/active",
-                params=params,
-                timeout=20
-            )
-        except Exception:
-            logger.exception("Falha a obter mercados SX Bet.")
-            break
-
-        data = response.get("data", {}) if isinstance(response, dict) else {}
-        listing = data.get("markets", []) if isinstance(data, dict) else []
-
-        if not listing:
-            break
-
-        for market in listing:
-            if market.get("status") != "ACTIVE":
-                continue
-
-            if market.get("type") not in (1, 52, 226):
-                continue
-
-            team1 = market.get("teamOneName", "")
-            team2 = market.get("teamTwoName", "")
-            outcome1 = market.get("outcomeOneName", "")
-            outcome2 = market.get("outcomeTwoName", "")
-            market_hash = market.get("marketHash", "")
-
-            if not all([team1, team2, outcome1, outcome2, market_hash]):
-                continue
-
-            markets.append({
-                "market_hash": market_hash,
-                "team_one": team1,
-                "team_two": team2,
-                "outcome_one": outcome1,
-                "outcome_two": outcome2,
-                "sport": market.get("sportLabel", ""),
-                "league": market.get("leagueLabel", "")
-            })
-
-        next_key = data.get("nextKey")
-
-        if not next_key:
-            break
-
-    with state_lock:
-        scanner_status["sx_markets_found"] = len(markets)
-
-    logger.info("SX Bet: %d mercados ativos elegíveis.", len(markets))
-    return markets
-
-
-# ============================================================
-# SX BET — CONVERSÃO DOS NÍVEIS DE ODDS
-# ============================================================
-
-def extrair_niveis_lado_sx(raw_side):
-    items = [raw_side] if isinstance(raw_side, dict) else (
-        raw_side if isinstance(raw_side, list) else []
-    )
-
-    levels = []
-    fee_factor = 1.0 - (SX_FEE_BUFFER_PCT / 100.0)
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-
-        raw_odds = item.get("percentageOdds")
-        raw_size = item.get("size")
-
-        if raw_size is None:
-            raw_size = item.get("totalBetSize")
-
-        if raw_odds is None or raw_size is None:
-            continue
-
-        try:
-            maker_prob = float(raw_odds) / 1e20
-            maker_stake = float(raw_size) / 1e6
-        except (TypeError, ValueError):
-            continue
-
-        if not (0.01 < maker_prob < 0.99) or maker_stake <= 0:
-            continue
-
-        taker_prob = 1.0 - maker_prob
-        taker_odd = 1.0 + (
-            (1.0 / taker_prob) - 1.0
-        ) * fee_factor
-
-        taker_liquidity = maker_stake * (taker_prob / maker_prob)
-
-        if taker_liquidity > 0:
-            levels.append({
-                "odd": taker_odd,
-                "liquidity_usdc": taker_liquidity
-            })
-
-    levels.sort(key=lambda item: item["odd"], reverse=True)
-    return levels
-
-
-def registar_livro_sx(market_hash, block, best_by_market):
-    if not market_hash or not isinstance(block, dict):
+async def sx_stream_async():
+    if not SX_KEY:
+        return
+    try:
+        import aiohttp
+        from centrifuge import Client, SubscriptionEventHandler
+    except ImportError:
+        LOG.warning("Instala centrifuge-python aiohttp para SX WS")
         return
 
-    side_one = extrair_niveis_lado_sx(block.get("outcomeTwo"))
-    side_two = extrair_niveis_lado_sx(block.get("outcomeOne"))
+    async def token(ctx=None):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                SX_API + "/user/realtime-token-v3/api-key",
+                headers={"x-sx-api-key": SX_KEY}, timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                resp.raise_for_status()
+                return (await resp.json())["token"]
+
+    async def update(ctx):
+        if isinstance(ctx.data, dict):
+            with watch_lock:
+                relevant = ctx.data.get("marketHash") in watched_sx_hashes
+            if relevant:
+                wake.set()
 
-    sides = best_by_market.setdefault(market_hash, {})
-
-    if side_one:
-        best_odd = side_one[0]["odd"]
-
-        sides["outcome_one"] = {
-            "odd": best_odd,
-            "liquidity_usdc": sum(
-                x["liquidity_usdc"]
-                for x in side_one
-                if abs(x["odd"] - best_odd) < 0.002
-            )
-        }
-
-    if side_two:
-        best_odd = side_two[0]["odd"]
-
-        sides["outcome_two"] = {
-            "odd": best_odd,
-            "liquidity_usdc": sum(
-                x["liquidity_usdc"]
-                for x in side_two
-                if abs(x["odd"] - best_odd) < 0.002
-            )
-        }
-
-
-def obter_melhores_odds_sx(relevant_markets):
-    best_by_market = {}
-
-    hashes = list(dict.fromkeys(
-        market["market_hash"] for market in relevant_markets
-    ))
-
-    for i in range(0, len(hashes), 50):
-        batch = hashes[i:i + 50]
-
-        try:
-            response = session.get(
-                f"{SX_BASE}/orders-v3/odds/best",
-                params={"marketHashes": ",".join(batch)},
-                timeout=20
-            )
-
-            if response.status_code == 400:
-                response = session.get(
-                    f"{SX_BASE}/orders-v3/odds/best",
-                    params=[
-                        ("marketHashes", value)
-                        for value in batch
-                    ],
-                    timeout=20
-                )
-
-            response.raise_for_status()
-
-            payload = response.json()
-            data = (
-                payload.get("data", payload)
-                if isinstance(payload, dict)
-                else payload
-            )
-
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, dict):
-                        registar_livro_sx(
-                            item.get("marketHash"),
-                            item,
-                            best_by_market
-                        )
-
-            elif isinstance(data, dict):
-                for key, value in data.items():
-                    if isinstance(value, dict):
-                        registar_livro_sx(
-                            value.get("marketHash") or key,
-                            value,
-                            best_by_market
-                        )
-
-        except Exception:
-            logger.exception(
-                "Falha a obter odds SX (lote %d).",
-                i // 50 + 1
-            )
-
-    return best_by_market
-
-
-# ============================================================
-# POLYMARKET — ORDER BOOK ATUALIZADO VIA REST
-# ============================================================
-
-def obter_livro_poly_fresco(token_id):
-    try:
-        book = http_get(
-            f"{POLY_CLOB}/book",
-            params={"token_id": str(token_id)},
-            timeout=8
-        )
-
-        asks = book.get("asks", []) or []
-        valid = []
-
-        for level in asks:
-            try:
-                price = float(level["price"])
-                size = float(level["size"])
-
-                if 0 < price < 1 and size > 0:
-                    valid.append({
-                        "price": price,
-                        "size": size
-                    })
-
-            except (KeyError, TypeError, ValueError):
-                continue
-
-        if not valid:
-            return None
-
-        valid.sort(key=lambda item: item["price"])
-        best = valid[0]
-
-        # Soma do valor USD de todos os níveis de venda.
-        liquidity = sum(
-            item["price"] * item["size"]
-            for item in valid
-        )
-
-        result = {
-            "price": best["price"],
-            "size": best["size"],
-            "liquidity_usd": liquidity,
-            "checked_at": datetime.now(timezone.utc).isoformat(),
-            "source": "rest"
-        }
-
-        with orderbook_lock:
-            live_orderbooks[str(token_id)] = result
-
-        return result
-
-    except requests.RequestException as exc:
-        logger.warning(
-            "Não foi possível obter orderbook Poly %s: %s",
-            token_id,
-            exc
-        )
-        return None
-
-
-# ============================================================
-# MATCHING DOS OUTCOMES POLYMARKET COM A SX BET
-# ============================================================
-
-def extrair_opcoes_poly_para_sx(poly_event, sx_market):
-    team1 = sx_market["team_one"]
-    team2 = sx_market["team_two"]
-    options = {}
-
-    for market in poly_event["markets"]:
-        outcomes = market["outcomes"]
-        token_ids = market["token_ids"]
-
-        if len(outcomes) != 2 or len(token_ids) != 2:
-            continue
-
-        for index, outcome in enumerate(outcomes):
-            match1 = equipas_coincidem(outcome, team1)
-            match2 = equipas_coincidem(outcome, team2)
-
-            if match1 and not match2:
-                options["sx_one"] = {
-                    "token_id": token_ids[index],
-                    "label": f"{team1} ({outcome})",
-                    "poly_outcome": outcome,
-                    "question": market["question"]
-                }
-
-            elif match2 and not match1:
-                options["sx_two"] = {
-                    "token_id": token_ids[index],
-                    "label": f"{team2} ({outcome})",
-                    "poly_outcome": outcome,
-                    "question": market["question"]
-                }
-
-    return options
-
-
-# ============================================================
-# ANÁLISE DE CRUZAMENTOS E ALERTAS TELEGRAM
-# ============================================================
-
-def analisar_cruzamento(jogos_poly, mercados_sx, odds_sx):
-    alerts_sent = 0
-    matched_hashes = set()
-    unmatched_logged = 0
-
-    for sx_market in mercados_sx:
-        market_hash = sx_market["market_hash"]
-        sides_sx = odds_sx.get(market_hash)
-
-        if not sides_sx:
-            continue
-
-        team1 = sx_market["team_one"]
-        team2 = sx_market["team_two"]
-
-        matched_event = None
-        matched_options = None
-
-        for poly_event in jogos_poly:
-            if not jogo_coincide_com_titulo(
-                team1,
-                team2,
-                poly_event["title"]
-            ):
-                continue
-
-            options = extrair_opcoes_poly_para_sx(
-                poly_event,
-                sx_market
-            )
-
-            if options:
-                matched_event = poly_event
-                matched_options = options
-                break
-
-        if not matched_event:
-            if unmatched_logged < MAX_MATCH_LOGS:
-                logger.info(
-                    "SEM MATCH | SX='%s' vs '%s' | "
-                    "procurar título Poly compatível",
-                    team1,
-                    team2
-                )
-                unmatched_logged += 1
-
-            continue
-
-        matched_hashes.add(market_hash)
-
-        logger.info(
-            "MATCH OK | SX='%s' vs '%s' | Poly='%s' | outcomes=%s",
-            team1,
-            team2,
-            matched_event["title"],
-            [
-                v.get("poly_outcome")
-                for v in matched_options.values()
-            ]
-        )
-
-        pairs = [
-            ("sx_one", "outcome_two", sx_market["outcome_two"]),
-            ("sx_two", "outcome_one", sx_market["outcome_one"])
-        ]
-
-        for poly_key, sx_key, sx_label in pairs:
-            if poly_key not in matched_options or sx_key not in sides_sx:
-                continue
-
-            poly_option = matched_options[poly_key]
-            sx_option = sides_sx[sx_key]
-
-            poly_book = obter_livro_poly_fresco(
-                poly_option["token_id"]
-            )
-
-            if not poly_book:
-                logger.info(
-                    "SEM ASK | %s | token=%s",
-                    poly_option["label"],
-                    poly_option["token_id"]
-                )
-                continue
-
-            poly_price = poly_book["price"]
-            sx_odd = sx_option["odd"]
-
-            if poly_price <= 0 or sx_odd <= 1:
-                continue
-
-            # Estimativa simplificada da margem.
-            implied_sum = poly_price + (1.0 / sx_odd)
-            profit_pct = (
-                (1.0 / implied_sum) - 1.0
-            ) * 100.0
-
-            poly_liquidity = poly_book["liquidity_usd"]
-            sx_liquidity = sx_option["liquidity_usdc"]
-
-            if poly_liquidity < MIN_LIQUIDITY_USD:
-                logger.info(
-                    "IGNORADO - liquidez Poly baixa: $%.2f",
-                    poly_liquidity
-                )
-                continue
-
-            if profit_pct < MIN_PROFIT_PCT:
-                continue
-
-            message = (
-                "🛡️ PAPER TRADING V10.0 — ALERTA DE TESTE\n\n"
-                f"Jogo: {team1} vs {team2}\n"
-                f"Polymarket: {matched_event['title']}\n"
-                f"Outcome Poly: {poly_option['poly_outcome']}\n"
-                f"Pergunta Poly: {poly_option['question']}\n\n"
-                f"BUY Poly: {poly_price * 100:.2f}¢\n"
-                f"Odd SX: {sx_odd:.3f}\n"
-                f"Margem estimada: {profit_pct:.2f}%\n\n"
-                f"Liquidez Poly (asks): ${poly_liquidity:.2f}\n"
-                f"Liquidez SX: ${sx_liquidity:.2f}\n"
-                f"Preço consultado: {poly_book['checked_at']}\n"
-                f"Fonte do preço: {poly_book['source']}\n\n"
-                "MODO SIMULAÇÃO — NÃO REALIZAR APOSTAS REAIS.\n"
-                "Confirma manualmente preço e liquidez antes de "
-                "qualquer avaliação."
-            )
-
-            if enviar_alerta_telegram(message):
-                alerts_sent += 1
-
-            # Um alerta por mercado SX em cada ciclo.
-            break
-
-    with state_lock:
-        scanner_status["matched_games"] = len(matched_hashes)
-        scanner_status["unmatched_sx_markets"] = max(
-            0,
-            len(mercados_sx) - len(matched_hashes)
-        )
-        scanner_status["alerts_sent"] += alerts_sent
-
-    return alerts_sent
-
-# ============================================================
-# SCANNER — CICLO DE ANÁLISE
-# ============================================================
-
-def ciclo_scanner():
-    started = datetime.now(timezone.utc)
-    logger.info("========== INÍCIO DO SCAN V10.0 ==========")
-
-    jogos_poly = obter_jogos_polymarket()
-    mercados_sx = obter_mercados_sx()
-
-    # Subscrever os tokens encontrados no WebSocket.
-    all_tokens = []
-
-    for event in jogos_poly:
-        for market in event["markets"]:
-            all_tokens.extend(market["token_ids"])
-
-    subscrever_tokens_poly(all_tokens)
-
-    relevant_sx = [
-        sx_market
-        for sx_market in mercados_sx
-        if any(
-            jogo_coincide_com_titulo(
-                sx_market["team_one"],
-                sx_market["team_two"],
-                poly_event["title"]
-            )
-            for poly_event in jogos_poly
-        )
-    ]
-
-    logger.info(
-        "Resumo recolha | Poly events=%d | SX markets=%d | SX relevantes=%d",
-        len(jogos_poly),
-        len(mercados_sx),
-        len(relevant_sx)
-    )
-
-    odds_sx = (
-        obter_melhores_odds_sx(relevant_sx)
-        if relevant_sx
-        else {}
-    )
-
-    alerts = analisar_cruzamento(
-        jogos_poly,
-        relevant_sx,
-        odds_sx
-    )
-
-    elapsed = (
-        datetime.now(timezone.utc) - started
-    ).total_seconds()
-
-    with state_lock:
-        scanner_status["last_scan"] = (
-            datetime.now(timezone.utc).isoformat()
-        )
-        scanner_status["last_error"] = None
-
-    logger.info(
-        "FIM DO SCAN | alertas=%d | duração=%.1fs",
-        alerts,
-        elapsed
-    )
-
-
-# ============================================================
-# SCANNER CONTÍNUO
-# ============================================================
-
-def correr_robo_continuo():
     while True:
         try:
-            ciclo_scanner()
-
+            client = Client(SX_WS, get_token=token)
+            await client.connect()
+            handler = SubscriptionEventHandler(on_publication=update)
+            sub = client.new_subscription("best_odds_v3:global", handler)
+            await sub.subscribe()
+            await asyncio.Future()
         except Exception as exc:
-            logger.exception("Erro inesperado no scanner.")
-
-            with state_lock:
-                scanner_status["last_error"] = str(exc)
-
-        time.sleep(SCAN_INTERVAL)
+            LOG.warning("SX WS a reconectar: %s", exc)
+            await asyncio.sleep(7)
 
 
-# ============================================================
-# HEALTH CHECK
-# ============================================================
+def main():
+    if FX <= 0:
+        raise SystemExit("Configura EUR_PER_USD (EUR por 1 USD) para não fingir paridade EUR/USDC")
+    if not SX_KEY:
+        raise SystemExit("Configura SX_API_KEY para consultar orderbook V3 da SX Bet")
+    conn = sqlite3.connect(DB_FILE)
+    initialize_db(conn)
+    threading.Thread(target=poly_stream, daemon=True).start()
+    threading.Thread(target=lambda: asyncio.run(sx_stream_async()), daemon=True).start()
+    telegram("🟢 PAPER V11 ligado\nPolymarket + SX Bet | Modo simulação")
+    pairs, last_catalog, offset = [], 0, 0
+    while True:
+        now = time.monotonic()
+        if now - last_catalog >= CATALOG_SECONDS:
+            try:
+                poly, sx = discover_poly(), discover_sx()
+                pairs = pair_markets(poly, sx)
+                with watch_lock:
+                    old = set(watched_assets)
+                    new = {p["poly_asset"] for p in pairs}
+                    new = set(list(new)[:500])
+                    watched_assets.clear()
+                    watched_assets.update(new)
+                    watched_sx_hashes.clear()
+                    watched_sx_hashes.update(p["sx"]["hash"] for p in pairs)
+                    ws = poly_ws_client
+                if ws is not None:
+                    for operation, assets in (("unsubscribe", old - new), ("subscribe", new - old)):
+                        if assets:
+                            try:
+                                ws.send(json.dumps({"assets_ids": list(assets), "operation": operation}))
+                            except Exception as exc:
+                                LOG.warning("WS Poly atualizar ativos: %s", exc)
+                last_catalog = now
+                LOG.info("Saldo livre (USDC estimado): %s", balances(conn))
+            except Exception as exc:
+                LOG.exception("Erro no catálogo: %s", exc)
+                last_catalog = now - CATALOG_SECONDS + 30
+        try:
+            checked = check_pairs(conn, pairs, offset)
+            offset = (offset + checked) % len(pairs) if pairs else 0
+        except Exception:
+            LOG.exception("Falha no scanner")
+        wake.wait(timeout=SCANNER_SECONDS)
+        wake.clear()
+        # Proteção simples contra floods de mensagens da WS.
+        time.sleep(2)
 
-class SimpleHandler(BaseHTTPRequestHandler):
 
-    def do_GET(self):
-        with state_lock:
-            status = dict(scanner_status)
+def self_test():
+    assert same_team("Celtics", "Boston Celtics")
+    assert not same_team("Boston Celtics", "Los Angeles Lakers")
+    assert parse_title("NBA: Boston Celtics vs Los Angeles Lakers") == (
+        "Boston Celtics", "Los Angeles Lakers")
+    assert sport_family("NFL") == "american_football"
+    # Poly 0.45, SX 0.50 -> payout 100, custo 95, buffers ~0.95
+    old_fx = globals()["FX"]
+    globals()["FX"] = 1.0
+    try:
+        q = price_quote([(0.45, 200)], [(0.50, 200)], 1000, 1000)
+        assert q and 0 < q.profit_usd < 6
+        assert (q.poly_usd + q.sx_usd + q.fees_usd) <= 100.0001
+        assert cost_for_payout([(0.4, 10), (0.6, 10)], 15) == 7.0
+        # Não inventar margem sem profundidade suficiente.
+        assert price_quote([(0.6, 10)], [(0.6, 10)], 1000, 1000) is None
+        fake_poly = [{"id": "p1", "sport": "tennis", "teams": ("Novak Djokovic", "Carlos Alcaraz"),
+                      "title": "Djokovic vs Alcaraz", "start": 1890000000,
+                      "outcomes": ["Djokovic", "Alcaraz"], "assets": ["a", "b"]}]
+        fake_sx = [{"hash": "sx1", "sport": "tennis",
+                    "teams": ("Novak Djokovic", "Carlos Alcaraz"),
+                    "outcomes": ("Novak Djokovic", "Carlos Alcaraz"), "start": 1890000000,
+                    "type": 52, "league": "ATP", "live_enabled": False}]
+        pairs = pair_markets(fake_poly, fake_sx)
+        assert len(pairs) == 2 and pairs[0]["sx_target"] == 1
+        test_db = sqlite3.connect(":memory:")
+        initialize_db(test_db)
+        trade_id = book_paper(test_db, pairs[0], q)
+        assert trade_id == 1 and balances(test_db)["poly"] < 1000
+        assert book_paper(test_db, pairs[0], q) is None
+        settle(test_db, trade_id, "poly")
+        assert test_db.execute("SELECT status FROM trades WHERE id=1").fetchone()[0] == "SETTLED"
+    finally:
+        globals()["FX"] = old_fx
+    print("✅ Testes locais OK (sem ligação às APIs)")
 
-        body = (
-            "PAPER TRADING V10.0 ONLINE\n"
-            f"Mode: {status['mode']}\n"
-            f"WebSocket: {status['ws_connected']}\n"
-            f"Last scan: {status['last_scan']}\n"
-            f"Poly events: {status['poly_events_found']}\n"
-            f"SX markets: {status['sx_markets_found']}\n"
-            f"Matched games: {status['matched_games']}\n"
-            f"Alerts sent: {status['alerts_sent']}\n"
-            f"Last error: {status['last_error']}\n"
-            "AUTO_BET: False\n"
-        ).encode("utf-8")
-
-        self.send_response(200)
-        self.send_header(
-            "Content-Type",
-            "text/plain; charset=utf-8"
-        )
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format, *args):
-        return
-
-
-# ============================================================
-# ARRANQUE DO PROGRAMA
-# ============================================================
 
 if __name__ == "__main__":
-    logger.info("A iniciar PAPER TRADING V10.0.")
-    logger.info(
-        "AUTO_BET=%s (deve permanecer False)",
-        AUTO_BET
-    )
-
-    if AUTO_BET:
-        raise RuntimeError(
-            "Proteção: AUTO_BET tem de permanecer False."
-        )
-
-    # Testa o Telegram antes de iniciar o scanner.
-    testar_telegram()
-
-    # WebSocket da Polymarket.
-    threading.Thread(
-        target=correr_websocket_poly,
-        daemon=True,
-        name="polymarket-websocket"
-    ).start()
-
-    # Scanner de mercados.
-    threading.Thread(
-        target=correr_robo_continuo,
-        daemon=True,
-        name="paper-scanner"
-    ).start()
-
-    # Endpoint simples para monitorização.
-    port = int(os.environ.get("PORT", "10000"))
-
-    server = ThreadingHTTPServer(
-        ("0.0.0.0", port),
-        SimpleHandler
-    )
-
-    logger.info(
-        "Health server ativo na porta %d.",
-        port
-    )
-
-    server.serve_forever()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--settle", type=int, help="ID da simulação a liquidar manualmente")
+    parser.add_argument("--winner", choices=["poly", "sx", "void"])
+    args = parser.parse_args()
+    if args.self_test:
+        self_test()
+    elif args.settle is not None:
+        if FX <= 0 or not args.winner:
+            parser.error("Liquidação exige EUR_PER_USD e --winner poly|sx|void")
+        db = sqlite3.connect(DB_FILE)
+        initialize_db(db)
+        settle(db, args.settle, args.winner)
+    else:
+        main()
