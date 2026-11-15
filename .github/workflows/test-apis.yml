@@ -1,0 +1,84 @@
+
+name: Testar APIs e Telegram
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  testar-ligacoes:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar requests
+        run: pip install requests
+
+      - name: Testar plataformas e Telegram
+        env:
+          SX_API_KEY: ${{ secrets.SX_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+
+          key = os.environ["SX_API_KEY"]
+          token = os.environ["TELEGRAM_TOKEN"]
+          chat = os.environ["TELEGRAM_CHAT_ID"]
+
+          assert all([key, token, chat]), "Faltam Secrets!"
+
+          # 1. Polymarket
+          r = requests.get(
+              "https://gamma-api.polymarket.com/events",
+              params={"active": "true", "closed": "false", "limit": 5},
+              timeout=20
+          )
+          r.raise_for_status()
+          events = r.json()
+          assert isinstance(events, list)
+          print(f"✅ Polymarket: {len(events)} eventos recebidos")
+
+          # 2. SX Bet
+          r = requests.get(
+              "https://api.sx.bet/markets/active",
+              params={"pageSize": 5, "onlyMainLine": "true"},
+              timeout=20
+          )
+          r.raise_for_status()
+          markets = r.json()["data"]["markets"]
+          print(f"✅ SX Bet: {len(markets)} mercados recebidos")
+
+          # 3. Autenticação SX Bet
+          r = requests.get(
+              "https://api.sx.bet/user/realtime-token-v3/api-key",
+              headers={"x-sx-api-key": key},
+              timeout=20
+          )
+          r.raise_for_status()
+          print("✅ SX Bet: chave API aceite")
+
+          # 4. Telegram
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+          r = requests.post(
+              url,
+              json={
+                  "chat_id": chat,
+                  "text": "🟢 PAPER V11\n✅ Telegram ligado\n🧪 Modo simulação"
+              },
+              timeout=20
+          )
+          r.raise_for_status()
+          assert r.json().get("ok")
+          print("✅ Telegram: mensagem enviada")
+
+          print("✅ TESTE DE LIGAÇÕES CONCLUÍDO")
+          PY
