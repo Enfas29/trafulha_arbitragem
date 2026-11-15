@@ -160,23 +160,60 @@ def parse_title(title):
 
 
 def sport_family(label):
+    """Classifica sem confundir NFL com futebol e sem inventar ligas."""
     name = ascii_name(label)
-    for keys, family in [
-        (("nba", "wnba", "ncaa basketball", "basketball", "ncaab"), "basketball"),
-        (("nfl", "cfb", "american football", "ncaaf"), "american_football"),
-        (("tennis", "atp", "wta", "challenger"), "tennis"),
-        (("mlb", "baseball", "kbo"), "baseball"),
-        (("nhl", "hockey"), "hockey"),
-        (("soccer", "epl", "la liga", "ucl", "football", "liga", "serie a"), "soccer"),
-        (("ufc", "mma", "boxing"), "combat"),
-        (("cricket",), "cricket"),
-        (("esport", "counter strike", "dota", "league of legends"), "esports"),
-        (("rugby",), "rugby"),
-        (("volleyball",), "volleyball"),
-    ]:
-        if any(k in name for k in keys):
+    if not name:
+        return "unknown"
+    if name.startswith("cric") or name in {"cricket"}:
+        return "cricket"
+    if name.startswith("hb") or "handball" in name:
+        return "handball"
+    if name in {"nba", "wnba", "ncaab", "ncaaw"} or any(
+        x in name for x in ("basketball", "ncaa basketball")
+    ):
+        return "basketball"
+    if name in {"nfl", "cfb", "ncaaf"} or any(
+        x in name for x in ("american football", "college football")
+    ):
+        return "american_football"
+    if any(x in name for x in ("tennis", "atp", "wta", "challenger")):
+        return "tennis"
+    if name in {"mlb", "kbo", "npb"} or "baseball" in name:
+        return "baseball"
+    if name == "nhl" or "hockey" in name:
+        return "hockey"
+    if any(x in name for x in ("soccer", "epl", "la liga", "ucl", "football league", "premier league")):
+        return "soccer"
+    if any(x in name for x in ("ufc", "mma", "boxing", "mixed martial")):
+        return "combat"
+    if any(x in name for x in ("esport", "counter strike", "dota", "league of legends")):
+        return "esports"
+    for family in ("rugby", "volleyball"):
+        if family in name:
             return family
+    # 'football' isolado é ambíguo; depende do sportId ou da liga.
     return name
+
+
+def sx_sport_family(market):
+    """sportId da SX tem prioridade sobre sportLabel (que pode dizer 'Football')."""
+    try:
+        sx_id = int(market.get("sportId", market.get("sportID", -1)))
+    except (TypeError, ValueError):
+        sx_id = -1
+    by_id = {
+        1: "american_football", 2: "basketball",
+        3: "baseball", 4: "hockey", 5: "soccer", 6: "combat",
+    }
+    if sx_id in by_id:
+        return by_id[sx_id]
+    label = ascii_name(market.get("sportLabel", ""))
+    if label in {"american football", "gridiron", "nfl"}:
+        return "american_football"
+    if label in {"association football", "soccer"}:
+        return "soccer"
+    # Sem id, 'football' é ambíguo: não forçar soccer ou NFL.
+    return sport_family(label)
 
 
 def unix_time(value):
@@ -206,9 +243,25 @@ def discover_poly():
         for sid in re.findall(r"\d+", str(row.get("series", ""))):
             series[sid] = sport
 
+    # Dar prioridade a ligas com maior probabilidade de mercados comparáveis.
+    # Não depender da posição arbitrária da lista devolvida por /sports.
+    sport_priority = {
+        "basketball": 0, "american_football": 1, "tennis": 2,
+        "baseball": 3, "cricket": 4, "combat": 5, "esports": 6,
+        "soccer": 7, "hockey": 8, "rugby": 9, "volleyball": 10,
+        "handball": 11,
+    }
+    selected_series = sorted(
+        series.items(),
+        key=lambda item: (sport_priority.get(item[1], 99), int(item[0])),
+    )[:MAX_POLY_SERIES]
+    LOG.info(
+        "Gamma series: %d conhecidas, %d selecionadas (prioridade NBA/NFL/ténis)",
+        len(series), len(selected_series)
+    )
     result = []
     seen = set()
-    for sid, family in list(series.items())[:MAX_POLY_SERIES]:
+    for sid, family in selected_series:
         try:
             events = get_json(POLY_GAMMA + "/events", {
                 "active": "true", "closed": "false", "series_id": sid,
@@ -272,7 +325,7 @@ def discover_sx():
             all_markets.append({
                 "hash": m["marketHash"], "teams": (m["teamOneName"], m["teamTwoName"]),
                 "outcomes": (m.get("outcomeOneName", ""), m.get("outcomeTwoName", "")),
-                "start": game, "sport": sport_family(m.get("sportLabel", "")),
+                "start": game, "sport": sx_sport_family(m),
                 "type": m["type"], "league": m.get("leagueLabel", ""),
                 "live_enabled": bool(m.get("liveEnabled")),
             })
@@ -709,6 +762,10 @@ def self_test():
     assert parse_title("NBA: Boston Celtics vs Los Angeles Lakers") == (
         "Boston Celtics", "Los Angeles Lakers")
     assert sport_family("NFL") == "american_football"
+    assert sx_sport_family({"sportId": 1, "sportLabel": "Football"}) == "american_football"
+    assert sx_sport_family({"sportId": 5, "sportLabel": "Soccer"}) == "soccer"
+    assert sport_family("cricadt10") == "cricket"
+    assert sport_family("hbnbi") == "handball"
     # Poly 0.45, SX 0.50 -> payout 100, custo 95, buffers ~0.95
     old_fx = globals()["FX"]
     globals()["FX"] = 1.0
