@@ -66,8 +66,7 @@ LOG = logging.getLogger("paper_v11")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": "PaperTradingV11/1.0", "Accept": "application/json"})
-if SX_KEY:
-    HTTP.headers.update({"x-sx-api-key": SX_KEY})
+# Nunca colocar a chave SX nos cabeçalhos globais: também usamos Gamma/CLOB.
 
 wake = threading.Event()
 watch_lock = threading.Lock()
@@ -77,7 +76,11 @@ poly_ws_client = None
 
 
 def get_json(url, params=None, timeout=12):
-    r = HTTP.get(url, params=params, timeout=timeout)
+    # Aplicar a chave somente a api.sx.bet, nunca a hosts terceiros.
+    sx_headers = {"x-sx-api-key": SX_KEY} if (
+        SX_KEY and url.startswith(SX_API + "/")
+    ) else None
+    r = HTTP.get(url, params=params, headers=sx_headers, timeout=timeout)
     r.raise_for_status()
     data = r.json()
     if isinstance(data, dict) and data.get("status") == "failure":
@@ -811,6 +814,7 @@ def main():
 
 
 def self_test():
+    assert "x-sx-api-key" not in HTTP.headers
     assert same_team("Celtics", "Boston Celtics")
     assert not same_team("Boston Celtics", "Los Angeles Lakers")
     assert parse_title("NBA: Boston Celtics vs Los Angeles Lakers") == (
