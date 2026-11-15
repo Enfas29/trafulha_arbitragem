@@ -195,35 +195,67 @@ def sport_family(label):
     return name
 
 
+SX_SPORTS_BY_ID = None
+
+
 def sx_sport_family(market):
-    """sportId da SX tem prioridade sobre sportLabel (que pode dizer 'Football')."""
-    try:
-        sx_id = int(market.get("sportId", market.get("sportID", -1)))
-    except (TypeError, ValueError):
-        sx_id = -1
-    # SX Bet /sports: 1 Basketball, 2 Hockey, 3 Baseball,
-    # 4 Golf, 5 Soccer, 6 Tennis, 7 MMA, 8 American Football, 9 eSports.
-    # Não confundir estes IDs com os IDs de outras APIs desportivas.
-    by_id = {
-        1: "basketball", 2: "hockey", 3: "baseball",
-        4: "golf", 5: "soccer", 6: "tennis",
-        7: "combat", 8: "american_football",
-        9: "esports",
-    }
-    if sx_id in by_id:
-        return by_id[sx_id]
-    # A liga pode esclarecer um sportLabel genérico, por exemplo "Football".
-    league_family = sport_family(market.get("leagueLabel", ""))
-    if league_family in {"american_football", "basketball", "baseball",
-                         "hockey", "soccer", "tennis", "combat"}:
-        return league_family
+    """Preferir rótulo fornecido pela SX; IDs são consultados dinamicamente.
+
+    Os números de IDs variam entre exemplos e versões da documentação;
+    nunca adivinhar a modalidade a partir de um número fixo.
+    """
     label = ascii_name(market.get("sportLabel", ""))
-    if label in {"american football", "gridiron", "nfl"}:
+    if label in {"football", "american football", "gridiron"}:
         return "american_football"
-    if label in {"association football", "soccer"}:
+    if label in {"soccer", "association football"}:
         return "soccer"
-    # Sem id, 'football' é ambíguo: não forçar soccer ou NFL.
-    return sport_family(label)
+    if label in {"e sports", "esports"}:
+        return "esports"
+    if label in {"mixed martial arts", "mma"}:
+        return "combat"
+    if label:
+        return sport_family(label)
+
+    league_family = sport_family(market.get("leagueLabel", ""))
+    if league_family in {
+        "american_football", "basketball", "baseball", "hockey",
+        "soccer", "tennis", "combat", "cricket", "esports",
+    }:
+        return league_family
+
+    global SX_SPORTS_BY_ID
+    try:
+        sport_id = int(market.get("sportId", market.get("sportID")))
+    except (TypeError, ValueError):
+        return "unknown"
+
+    if SX_SPORTS_BY_ID is None:
+        SX_SPORTS_BY_ID = {}
+        try:
+            payload = get_json(SX_API + "/sports", timeout=8)
+            data = payload.get("data", payload) if isinstance(payload, dict) else payload
+            if isinstance(data, dict):
+                data = data.get("sports", data.get("items", []))
+            if isinstance(data, list):
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    sid = item.get("sportId", item.get("sportID"))
+                    sname = item.get("label", item.get("sportLabel", ""))
+                    try:
+                        sx_id = int(sid)
+                    except (TypeError, ValueError):
+                        continue
+                    sname = ascii_name(sname)
+                    if sname == "football":
+                        SX_SPORTS_BY_ID[sx_id] = "american_football"
+                    elif sname == "e sports":
+                        SX_SPORTS_BY_ID[sx_id] = "esports"
+                    else:
+                        SX_SPORTS_BY_ID[sx_id] = sport_family(sname)
+        except Exception as exc:
+            LOG.warning("Não foi possível ler /sports da SX: %s", type(exc).__name__)
+    return SX_SPORTS_BY_ID.get(sport_id, "unknown")
 
 
 def unix_time(value):
@@ -772,11 +804,11 @@ def self_test():
     assert parse_title("NBA: Boston Celtics vs Los Angeles Lakers") == (
         "Boston Celtics", "Los Angeles Lakers")
     assert sport_family("NFL") == "american_football"
-    assert sx_sport_family({"sportId": 1, "sportLabel": "Basketball"}) == "basketball"
-    assert sx_sport_family({"sportId": 5, "sportLabel": "Soccer"}) == "soccer"
-    assert sx_sport_family({"sportId": 6, "sportLabel": "Tennis"}) == "tennis"
-    assert sx_sport_family({"sportId": 7, "sportLabel": "Mixed Martial Arts"}) == "combat"
-    assert sx_sport_family({"sportId": 8, "sportLabel": "Football"}) == "american_football"
+    assert sx_sport_family({"sportLabel": "Basketball"}) == "basketball"
+    assert sx_sport_family({"sportLabel": "Soccer"}) == "soccer"
+    assert sx_sport_family({"sportLabel": "Tennis"}) == "tennis"
+    assert sx_sport_family({"sportLabel": "Mixed Martial Arts"}) == "combat"
+    assert sx_sport_family({"sportLabel": "Football", "sportId": 8}) == "american_football"
     assert sport_family("cricadt10") == "cricket"
     assert sport_family("hbnbi") == "handball"
     assert sx_sport_family({"sportLabel": "Football", "leagueLabel": "NFL"}) == "american_football"
