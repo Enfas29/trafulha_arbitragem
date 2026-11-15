@@ -208,6 +208,7 @@ def main():
         errors.append("SX Bet: " + readable_error(exc))
 
     print(f"📊 Polymarket: {len(poly)} mercados elegíveis na amostra")
+    print("🔐 Filtro Polymarket: apenas sportsMarketType=moneyline")
     print(f"📊 SX Bet: {len(sx)} mercados ativos na amostra")
     if poly:
         print("   Desportos Poly:", dict(collections.Counter(m["sport"] for m in poly).most_common(8)))
@@ -315,9 +316,12 @@ def main():
     if summary_file:
         with open(summary_file, "a", encoding="utf-8") as f:
             f.write("## Diagnóstico V11 — Só leitura\n\n")
+            f.write("> Apenas mercados **moneyline** Polymarket; "
+                    "outros mercados são excluídos por segurança.\n\n")
             f.write("| Verificação | Resultado |\n|---|---|\n")
             for label, value in [
                 ("Mercados Poly (amostra)", len(poly)),
+                ("Filtro Poly", "sportsMarketType=moneyline"),
                 ("Mercados SX (amostra)", len(sx)),
                 ("Pares candidatos", len(pairs)),
                 ("Confrontos distintos aceites", unique_pairs),
