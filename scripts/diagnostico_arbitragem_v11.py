@@ -324,7 +324,9 @@ def main():
     print(f"🧮 Margens brutas positivas (sem qualquer taxa ou custo): {gross_positive}")
     print(f"    Buffers V11: Poly {bot.POLY_FEE_BUFFER*100:.1f}% e SX {bot.SX_FEE_BUFFER*100:.1f}% do custo de cada aposta; não são taxas oficiais.")
     if gross_samples:
-        print(f"    Melhor margem bruta: {max(gross_samples):+.2f}% | mediana: {statistics.median(gross_samples):+.2f}%")
+        print(f"    Melhor margem bruta: {max(gross_samples):+.4f}% | mediana: {statistics.median(gross_samples):+.4f}%")
+    print("    Nota: +0.0000% pode ser zero ou um valor negativo arredondado.")
+    print("    0 margens brutas positivas => não há vantagem bruta comprovada.")
     print("    Não usar margem bruta como autorização para apostar.")
     if roi_samples:
         rois = [entry[0] for entry in roi_samples]
@@ -390,7 +392,7 @@ def main():
                 ("Margens efetivamente calculadas", priced_count),
                 ("Margens indicativas positivas após buffers", potential_positive),
                 ("Margens brutas positivas antes de custos", gross_positive),
-                ("Melhor margem bruta sem custos", f"{max(gross_samples):+.2f}%" if gross_samples else "N/D"),
+                ("Melhor margem bruta sem custos (4 casas)", f"{max(gross_samples):+.4f}%" if gross_samples else "N/D"),
                 ("Melhor margem indicativa", f"{max([r[0] for r in roi_samples]):+.2f}%" if roi_samples else "N/D"),
                 ("Mediana das margens", f"{statistics.median([r[0] for r in roi_samples]):+.2f}%" if roi_samples else "N/D"),
             ]:
