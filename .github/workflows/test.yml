@@ -37,3 +37,6 @@ jobs:
 
       - name: Testar WebSocket Polymarket V12 (offline)
         run: python poly_ws_v12.py
+
+      - name: Testar fluxo integral do Paper V12 (offline)
+        run: python test_integration_v12.py
