@@ -32,6 +32,8 @@ CATALOG_INTERVAL = max(180, int(os.getenv("MONITOR_CATALOG_SECONDS", "600")))
 MAX_PAIRS = min(60, max(1, int(os.getenv("MONITOR_PAIRS_PER_PASS", "15"))))
 ALERT_COOLDOWN = max(300, int(os.getenv("MONITOR_ALERT_COOLDOWN_SECONDS", "1800")))
 SUMMARY_INTERVAL = max(3600, int(os.getenv("MONITOR_SUMMARY_SECONDS", "21600")))
+OUTAGE_THRESHOLD = max(900, int(os.getenv("MONITOR_OUTAGE_SECONDS", "1800")))
+OUTAGE_REPEAT = max(1800, int(os.getenv("MONITOR_OUTAGE_REPEAT_SECONDS", "3600")))
 MAX_SKEW = 6.0
 MIN_ROI = bot.MIN_NET_ROI
 PAPER_V12_ENABLED = os.getenv("PAPER_V12_ENABLED", "0").strip().lower() in {"1", "true", "yes"}
@@ -88,6 +90,9 @@ def open_database(path: str):
     CREATE TABLE IF NOT EXISTS report_schedule (
       report_key TEXT PRIMARY KEY,
       last_report_epoch INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS monitor_health (
+      key TEXT PRIMARY KEY, epoch INTEGER NOT NULL
     );
     """)
     conn.commit()
@@ -404,6 +409,55 @@ def send_summary(conn, catalog_count, startup=False, now_epoch=None, paper_conn=
         LOG.info("Monitor ativo; primeiro resumo periódico emitido.")
 
 
+def update_health(conn, checked, priced, now_epoch=None):
+    """Devolve alerta curto se ficarmos sem odds válidas muito tempo.
+
+    Persistente: não reinicia o relógio da falha após reiniciar o Railway.
+    """
+    now_epoch = int(time.time() if now_epoch is None else now_epoch)
+    if priced > 0:
+        with conn:
+            conn.execute("""
+                INSERT INTO monitor_health(key,epoch) VALUES ('last_valid',?)
+                ON CONFLICT(key) DO UPDATE SET epoch=excluded.epoch
+            """, (now_epoch,))
+        return None
+    if checked <= 0:
+        # Sem mercados verificados nesta passagem, não afirmar falha das APIs.
+        return None
+    row = conn.execute(
+        "SELECT epoch FROM monitor_health WHERE key='last_valid'"
+    ).fetchone()
+    if row is None:
+        with conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO monitor_health(key,epoch) VALUES ('start',?)",
+                (now_epoch,),
+            )
+        row = conn.execute(
+            "SELECT epoch FROM monitor_health WHERE key='start'"
+        ).fetchone()
+    last_valid = int(row[0])
+    if now_epoch - last_valid < OUTAGE_THRESHOLD:
+        return None
+    previous = conn.execute(
+        "SELECT epoch FROM monitor_health WHERE key='last_warning'"
+    ).fetchone()
+    if previous is not None and now_epoch - int(previous[0]) < OUTAGE_REPEAT:
+        return None
+    with conn:
+        conn.execute("""
+            INSERT INTO monitor_health(key,epoch) VALUES ('last_warning',?)
+            ON CONFLICT(key) DO UPDATE SET epoch=excluded.epoch
+        """, (now_epoch,))
+    return (
+        "⚠️ MONITOR V11/V12\n"
+        f"Sem odds válidas há pelo menos {OUTAGE_THRESHOLD // 60} min.\n"
+        "Verificar logs do Railway e APIs.\n"
+        "🔒 Sem apostas"
+    )
+
+
 def catalog():
     poly = bot.discover_poly()
     sx = bot.discover_sx()
@@ -516,6 +570,10 @@ def main(once=False):
                                hot_sx_hashes=hot_hashes,
                                hot_poly_assets=hot_assets)
             cursor = result["next_offset"]
+            outage_notice = update_health(conn, result["checked"], result["priced"])
+            if outage_notice:
+                LOG.warning("Sem odds válidas durante o período de alerta.")
+                telegram(outage_notice)
             iteration += 1
 
             if once or report_due(conn):
