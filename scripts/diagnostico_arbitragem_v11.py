@@ -144,6 +144,53 @@ def diagnose_matching(poly, sx):
     return counts
 
 
+def audit_candidate_uniqueness(poly, sx, pairs):
+    """Audita correspondências ambíguas, sem alterar o matching."""
+    by_sport = collections.defaultdict(list)
+    for p in poly:
+        by_sport[p["sport"]].append(p)
+
+    unique_count = multi_count = eligible_count = 0
+    ambiguous = []
+    for m in sx:
+        if m["sport"] in bot.EXCLUDED_SETTLEMENT_SPORTS:
+            continue
+        expected_type = 226 if m["sport"] in {"basketball", "american_football"} else 52
+        if m["type"] != expected_type:
+            continue
+        a, b = m["teams"]
+        candidates = []
+        for p in by_sport.get(m["sport"], ()):
+            if not bot.match_time(m["start"], p["start"]):
+                continue
+            x, y = p["teams"]
+            if not ((bot.same_team(a, x) and bot.same_team(b, y))
+                    or (bot.same_team(a, y) and bot.same_team(b, x))):
+                continue
+            candidates.append(p)
+        if candidates:
+            eligible_count += 1
+        if len(candidates) == 1:
+            unique_count += 1
+        elif len(candidates) > 1:
+            multi_count += 1
+            if len(ambiguous) < 6:
+                ambiguous.append((m, candidates))
+
+    actual = sorted({(p["poly"]["id"], p["sx"]["hash"]) for p in pairs})
+    print(f"✔ Eventos Poly/SX aceites (únicos): {len(actual)}")
+    print(f"🔎 SX com candidatos de mesmo desporto, nomes e hora: {eligible_count}")
+    print(f"   Apenas 1 mercado Polymarket correspondente: {unique_count}")
+    print(f"   Mais de 1 mercado Polymarket correspondente: {multi_count}")
+    for m, candidates in ambiguous:
+        kinds = sorted({str(p.get("type")) for p in candidates})
+        print(f"   AMBÍGUO: {m['teams'][0]} vs {m['teams'][1]} "
+              f"({m['sport']}) | {len(candidates)} mercados Poly | "
+              f"tipos Poly: {', '.join(kinds[:5])}")
+    print("🔒 Mercados ambíguos NÃO são convertidos em pares automaticamente.")
+    return len(actual), eligible_count, unique_count, multi_count
+
+
 def main():
     if not os.getenv("SX_API_KEY"):
         raise SystemExit("❌ Falta o GitHub Secret SX_API_KEY")
@@ -174,6 +221,7 @@ def main():
             errors.append("Matching: " + readable_error(exc))
     print(f"🔎 Pares candidatos (cada direção conta): {len(pairs)}")
     reasons = diagnose_matching(poly, sx)
+    unique_pairs, named_time, unique_potential, ambiguous_count = audit_candidate_uniqueness(poly, sx, pairs)
 
     # Cobertura: quantos mercados SX têm ao menos um evento Poly
     # do mesmo desporto e com início a menos de 3 horas.
@@ -255,6 +303,7 @@ def main():
         "🧪 TESTE V11 · SÓ LEITURA\n"
         f"Poly: {len(poly)} | SX: {len(sx)}\n"
         f"Pares candidatos: {len(pairs)}\n"
+        f"Confrontos aceites: {unique_pairs}\n"
         f"Livros: Poly {poly_ok} | SX {sx_ok}\n"
         f"Margens + indicativas: {potential_positive}\n"
         + conclusion + "\n"
@@ -271,6 +320,9 @@ def main():
                 ("Mercados Poly (amostra)", len(poly)),
                 ("Mercados SX (amostra)", len(sx)),
                 ("Pares candidatos", len(pairs)),
+                ("Confrontos distintos aceites", unique_pairs),
+                ("Mercados SX candidatos por nome/desporto/hora", named_time),
+                ("SX com múltiplos mercados Poly possíveis", ambiguous_count),
                 ("SX com mesmo desporto e janela horária", len(time_overlap)),
                 ("Livros Poly acessíveis", poly_ok),
                 ("Livros SX acessíveis", sx_ok),
