@@ -35,7 +35,7 @@ SX_WS = "wss://realtime.sx.bet/connection/websocket"
 SX_KEY = os.getenv("SX_API_KEY", "").strip()
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-FX = float(os.getenv("EUR_PER_USD", "0"))
+FX = float(os.getenv("EUR_PER_USD", "0") or "0")  # Variável vazia no CI = sem cotação
 
 INITIAL_EUR = 1000.0
 MAX_TOTAL_EUR = 100.0
