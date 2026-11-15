@@ -29,6 +29,11 @@ jobs:
       - name: Testes do historico e calculos (offline)
         run: python monitor_v11.py --self-test
 
+      - name: Garantir arranque sem cotacao configurada
+        env:
+          EUR_PER_USD: ""
+        run: python -c "import trafulha_arbitragem as bot; assert bot.FX == 0.0"
+
       - name: Uma passagem real das APIs sem apostas
         env:
           SX_API_KEY: ${{ secrets.SX_API_KEY }}
