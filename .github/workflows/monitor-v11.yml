@@ -1,0 +1,50 @@
+name: Testar Monitor Continuo V11
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: teste-monitor-v11
+  cancel-in-progress: false
+
+jobs:
+  monitor-read-only:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Obter codigo
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: python -m pip install -r requirements.txt
+
+      - name: Testes do historico e calculos (offline)
+        run: python monitor_v11.py --self-test
+
+      - name: Uma passagem real das APIs sem apostas
+        env:
+          SX_API_KEY: ${{ secrets.SX_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EUR_PER_USD: ${{ vars.EUR_PER_USD }}
+          MONITOR_POLY_SERIES: "40"
+          MONITOR_PAIRS_PER_PASS: "15"
+          MONITOR_DB: "monitor_v11.sqlite3"
+        run: python monitor_v11.py --once
+
+      - name: Guardar exemplo do historico SQLite
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-v11-diagnostico
+          path: monitor_v11.sqlite3
+          if-no-files-found: ignore
+          retention-days: 3
