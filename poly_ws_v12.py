@@ -23,6 +23,8 @@ class PolyBookHints:
         self.hot = set()
         self.running = False
         self.socket = None
+        self.valid_updates = 0
+        self.last_update_epoch = None
 
     def update(self, assets):
         selection = tuple(dict.fromkeys(str(a) for a in assets if a))[:MAX_ASSETS]
@@ -38,10 +40,19 @@ class PolyBookHints:
 
     def mark(self, asset):
         asset = str(asset)
+        first_valid = False
         with self.lock:
             if asset in self.assets:
                 self.hot.add(asset)
                 self.wake.set()
+                self.valid_updates += 1
+                self.last_update_epoch = time.time()
+                first_valid = self.valid_updates == 1
+        if first_valid:
+            LOG.info(
+                "Poly WS V12: primeiro evento de livro recebido "
+                "(REST continua a confirmar as odds)."
+            )
 
     def take_hot(self):
         with self.lock:
@@ -89,6 +100,11 @@ class PolyBookHints:
                     self.socket = ws
                     selected = self.assets
                 ws.send(json.dumps({"type": "market", "assets_ids": list(selected)}))
+                LOG.info(
+                    "Poly WS V12: ligação estabelecida; subscrição enviada "
+                    "para %d tokens. A aguardar primeiro evento de livro.",
+                    len(selected),
+                )
 
                 def heartbeats():
                     while ws.keep_running:
@@ -145,11 +161,14 @@ def self_test():
     assert watcher.assets == ("a", "b")
     watcher.consume(json.dumps({"event_type": "book", "asset_id": "a"}))
     assert watcher.take_hot() == {"a"}
+    assert watcher.valid_updates == 1
+    assert watcher.last_update_epoch is not None
     watcher.consume(json.dumps({
         "event_type": "price_change",
         "price_changes": [{"asset_id": "b"}, {"asset_id": "unknown"}],
     }))
     assert watcher.take_hot() == {"b"}
+    assert watcher.valid_updates == 2
     watcher.consume("not-json")
     assert not watcher.wake.is_set()
     print("✅ Poly WS V12: teste local de sinais e subscrições OK")
