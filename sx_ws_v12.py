@@ -28,6 +28,7 @@ class SXBookHints:
         self.hot = set()
         self.running = False
         self.last_message_epoch = None
+        self.received_events = 0
 
     def update(self, hashes):
         chosen = tuple(dict.fromkeys(str(h) for h in hashes if h))[:MAX_WATCHED]
@@ -35,11 +36,19 @@ class SXBookHints:
             self.watched = chosen
 
     def signal(self, market_hash):
+        first_event = False
         with self.lock:
             if market_hash in self.watched:
                 self.hot.add(market_hash)
                 self.last_message_epoch = time.time()
+                self.received_events += 1
+                first_event = self.received_events == 1
                 self.wake.set()
+        if first_event:
+            LOG.info(
+                "SX WS V12: primeiro evento de livro recebido "
+                "(REST continua a confirmar as odds)."
+            )
 
     def take_hot(self):
         with self.lock:
@@ -75,15 +84,29 @@ class SXBookHints:
             try:
                 client = Client(SX_WS, get_token=self.get_token)
                 await client.connect()
+                subscriptions = []
                 for market_hash in selected:
                     async def on_update(ctx, market_hash=market_hash):
                         self.signal(market_hash)
-                    listener = SubscriptionEventHandler(on_publication=on_update)
+
+                    async def on_subscribed(ctx, market_hash=market_hash):
+                        LOG.info("SX WS V12: canal de livro subscrito (%s).",
+                                 market_hash[:12])
+
+                    listener = SubscriptionEventHandler(
+                        on_publication=on_update,
+                        on_subscribed=on_subscribed,
+                    )
                     sub = client.new_subscription(
                         f"orderbook_v3:{market_hash}", listener
                     )
+                    subscriptions.append(sub)
                     await sub.subscribe()
-                LOG.info("SX WS V12: %d canais de livros subscritos.", len(selected))
+                LOG.info(
+                    "SX WS V12: conexão iniciada; %d subscrições solicitadas. "
+                    "A aguardar eventos.",
+                    len(subscriptions),
+                )
                 while self.running:
                     await asyncio.sleep(3)
                     with self.lock:
@@ -124,6 +147,8 @@ def self_test():
     f.signal("b")
     assert f.wake.is_set()
     assert f.take_hot() == {"b"}
+    assert f.received_events == 1
+    assert f.last_message_epoch is not None
     assert not f.wake.is_set()
     f.update(["c"])
     assert f.watched == ("c",)
