@@ -67,6 +67,82 @@ def readable_error(exc):
     return type(exc).__name__ + (f" HTTP {code}" if code else "")
 
 
+
+def diagnose_matching(poly, sx):
+    """Explica porque mercados não emparelham, sem alterar os filtros de segurança."""
+    counts = collections.Counter()
+    families_poly = collections.Counter(p["sport"] for p in poly)
+    families_sx = collections.Counter(s["sport"] for s in sx)
+    types_sx = collections.Counter((s["sport"], s["type"]) for s in sx)
+    common = sorted(set(families_poly) & set(families_sx))
+    near = []
+
+    for s in sx:
+        a, b = s["teams"]
+        named = [
+            p for p in poly
+            if (bot.same_team(a, p["teams"][0]) and bot.same_team(b, p["teams"][1]))
+            or (bot.same_team(a, p["teams"][1]) and bot.same_team(b, p["teams"][0]))
+        ]
+        if not named:
+            counts["Sem os dois nomes correspondentes"] += 1
+            continue
+
+        same_sport = [p for p in named if p["sport"] == s["sport"]]
+        if not same_sport:
+            counts["Desporto identificado de forma diferente"] += 1
+            near.append(("DESPORTO", s, named[0]))
+            continue
+
+        same_time = [p for p in same_sport if bot.match_time(p["start"], s["start"])]
+        if not same_time:
+            counts["Horários demasiado afastados"] += 1
+            near.append(("HORÁRIO", s, same_sport[0]))
+            continue
+
+        if s["sport"] in bot.EXCLUDED_SETTLEMENT_SPORTS:
+            counts["Excluído por regras de liquidação"] += 1
+            near.append(("LIQUIDAÇÃO", s, same_time[0]))
+            continue
+
+        expected_type = 226 if s["sport"] in {"basketball", "american_football"} else 52
+        if s["type"] != expected_type:
+            counts["Tipo de mercado SX não admitido"] += 1
+            near.append(("TIPO SX", s, same_time[0]))
+            continue
+
+        if not (bot.same_team(s["outcomes"][0], a) and bot.same_team(s["outcomes"][1], b)):
+            counts["Outcomes SX não identificados"] += 1
+            near.append(("OUTCOMES", s, same_time[0]))
+            continue
+
+        counts["Possível par a investigar manualmente"] += 1
+        near.append(("REVER MARKET TYPE POLY", s, same_time[0]))
+
+    print("\n========== PORQUE NÃO HÁ MATCH ==========")
+    print("Desportos Poly:", dict(families_poly.most_common(12)))
+    print("Desportos SX:", dict(families_sx.most_common(12)))
+    print("Desportos presentes nos dois:", ", ".join(common) if common else "(nenhum)")
+    print("Tipos SX por desporto:", dict(types_sx.most_common(12)))
+    for label, count in counts.most_common():
+        print(f"  {label}: {count}")
+    print("Exemplos públicos de mercados Poly:")
+    for p in poly[:6]:
+        print(f"  [{p['sport']}] {p['teams'][0]} vs {p['teams'][1]}")
+    print("Exemplos públicos de mercados SX:")
+    for s in sx[:6]:
+        print(f"  [{s['sport']}, tipo {s['type']}] {s['teams'][0]} vs {s['teams'][1]}")
+    if near:
+        print("Pares de nomes iguais que ficaram bloqueados:")
+        for reason, s, p in near[:8]:
+            gap_h = abs(s["start"] - p["start"]) / 3600
+            print(f"  {reason}: {s['teams'][0]} vs {s['teams'][1]} "
+                  f"| SX={s['sport']} tipo={s['type']} "
+                  f"| Poly={p['sport']} | diferença horário={gap_h:.1f}h")
+    print("==========================================\n")
+    return counts
+
+
 def main():
     if not os.getenv("SX_API_KEY"):
         raise SystemExit("❌ Falta o GitHub Secret SX_API_KEY")
@@ -96,6 +172,7 @@ def main():
         except Exception as exc:
             errors.append("Matching: " + readable_error(exc))
     print(f"🔎 Pares candidatos (cada direção conta): {len(pairs)}")
+    reasons = diagnose_matching(poly, sx)
     print("   Matching preliminar: as regras de liquidação ainda exigem validação.")
 
     poly_ok = sx_ok = price_tests = potential_positive = 0
