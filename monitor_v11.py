@@ -20,6 +20,7 @@ from pathlib import Path
 
 import trafulha_arbitragem as bot
 import paper_v12 as paper
+import sx_ws_v12 as sx_hints
 
 LOG = logging.getLogger("monitor_v11")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -33,6 +34,7 @@ SUMMARY_INTERVAL = max(3600, int(os.getenv("MONITOR_SUMMARY_SECONDS", "21600")))
 MAX_SKEW = 6.0
 MIN_ROI = bot.MIN_NET_ROI
 PAPER_V12_ENABLED = os.getenv("PAPER_V12_ENABLED", "0").strip().lower() in {"1", "true", "yes"}
+SX_WS_V12_ENABLED = os.getenv("SX_WS_V12_ENABLED", "0").strip().lower() in {"1", "true", "yes"}
 
 # Continua a usar os filtros conservadores de winner/moneyline do V11.
 bot.MAX_POLY_SERIES = min(120, max(10, int(os.getenv("MONITOR_POLY_SERIES", "60"))))
@@ -213,13 +215,19 @@ def select_pairs(pairs):
     )
 
 
-def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None):
+def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None, hot_sx_hashes=None):
     if not pairs:
         return {"checked": 0, "priced": 0, "positive": 0, "signals": 0,
                 "next_offset": 0, "best": None}
     total = len(pairs)
     window = [pairs[(offset + n) % total] for n in range(min(MAX_PAIRS, total))]
     new_offset = (offset + len(window)) % total
+    if hot_sx_hashes:
+        # No máximo duas posições com sinais WS por passagem; o resto
+        # mantém a rotação REST, mesmo que a SX envie milhares de mensagens.
+        priority = [p for p in pairs if p["sx"]["hash"] in hot_sx_hashes][:2]
+        seen = {p["key"] for p in priority}
+        window = (priority + [p for p in window if p["key"] not in seen])[:MAX_PAIRS]
     checked = priced = positive = signals = 0
     best = None
     now = time.time()
@@ -454,6 +462,10 @@ def main(once=False):
         )
 
     conn = open_database(DB)
+    ws_feed = sx_hints.SXBookHints() if SX_WS_V12_ENABLED else None
+    if ws_feed is not None and not ws_feed.start():
+        LOG.warning("SX WS V12 solicitado mas sem SX_API_KEY: usar apenas REST.")
+        ws_feed = None
     paper_conn = paper.open_database() if PAPER_V12_ENABLED and fx > 0 else None
     if PAPER_V12_ENABLED and paper_conn is None:
         LOG.warning("PAPER V12 pediu ativação, mas EUR_PER_USD inválido/ausente: desativado.")
@@ -470,6 +482,8 @@ def main(once=False):
                 try:
                     pairs = catalog()
                     cursor = cursor % len(pairs) if pairs else 0
+                    if ws_feed is not None:
+                        ws_feed.update(p["sx"]["hash"] for p in pairs[:24])
                     last_catalog = time.monotonic()
                 except Exception as exc:
                     LOG.error("Erro a atualizar catálogo: %s", type(exc).__name__)
@@ -477,7 +491,9 @@ def main(once=False):
                     if once:
                         raise
 
-            result = scan_pass(conn, pairs, cursor, fx, paper_conn=paper_conn)
+            hot_hashes = ws_feed.take_hot() if ws_feed is not None else set()
+            result = scan_pass(conn, pairs, cursor, fx, paper_conn=paper_conn,
+                               hot_sx_hashes=hot_hashes)
             cursor = result["next_offset"]
             iteration += 1
 
@@ -496,10 +512,20 @@ def main(once=False):
             if once:
                 print("✅ Passagem única concluída; só leitura, sem apostas.")
                 break
-            time.sleep(max(1.0, INTERVAL - (time.monotonic() - started)))
+            wait_seconds = max(1.0, INTERVAL - (time.monotonic() - started))
+            if ws_feed is None:
+                time.sleep(wait_seconds)
+            else:
+                # WS é um gatilho, não fonte de preços. Evitar loops com spam.
+                ws_feed.wake.wait(wait_seconds)
+                elapsed = time.monotonic() - started
+                if elapsed < 8.0:
+                    time.sleep(8.0 - elapsed)
     except KeyboardInterrupt:
         LOG.info("Monitor interrompido.")
     finally:
+        if ws_feed is not None:
+            ws_feed.stop()
         conn.close()
         if paper_conn is not None:
             paper_conn.close()
