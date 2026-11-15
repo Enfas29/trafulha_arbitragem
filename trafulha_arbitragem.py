@@ -13,7 +13,7 @@ import websocket
 
 
 # ============================================================
-# 1. CONFIGURACOES (PAPER TRADING V9.1 - DEBUG MATCHING)
+# 1. CONFIGURACOES (PAPER TRADING V9.2 - SMART MATCHING)
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -25,10 +25,10 @@ PAPER_INITIAL_BANKROLL_POLY = float(os.getenv("PAPER_INITIAL_BANKROLL_POLY", "10
 PAPER_INITIAL_BANKROLL_SX = float(os.getenv("PAPER_INITIAL_BANKROLL_SX", "1000"))
 PAPER_STAKE_USD = float(os.getenv("PAPER_STAKE_USD", "100"))
 
-MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "-3.0"))  # Mantido para teste de alertas
+MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "-3.0"))
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "15"))
 
-MIN_POLY_VOLUME = float(os.getenv("MIN_POLY_VOLUME", "100"))   # Reduzido para teste
+MIN_POLY_VOLUME = float(os.getenv("MIN_POLY_VOLUME", "100"))
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "15"))
 
 POLY_FEE_BUFFER_PCT = float(os.getenv("POLY_FEE_BUFFER_PCT", "1.0"))
@@ -52,7 +52,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("ArbitragePaperBotV91")
+logger = logging.getLogger("ArbitragePaperBotV92")
 
 session = requests.Session()
 session.headers.update({
@@ -92,7 +92,7 @@ scanner_status = {
     "best_margin_pct": None,
     "opportunities": 0,
     "ws_connected": False,
-    "mode": "WEB3_PAPER_TRADING_DEBUG_V9.1"
+    "mode": "WEB3_PAPER_TRADING_SMART_MATCH_V9.2"
 }
 
 
@@ -160,7 +160,7 @@ def correr_websocket_poly():
 
 
 # ============================================================
-# 4. UTILITARIOS DE NORMALIZACAO
+# 4. UTILITARIOS DE NORMALIZACAO INTELIGENTE
 # ============================================================
 
 def http_get(url, params=None, timeout=20):
@@ -220,15 +220,16 @@ def equipas_coincidem(nome_a, nome_b):
         return False
     if norm_a == norm_b:
         return True
-    if len(norm_a) >= 4 and len(norm_b) >= 4:
-        if norm_a in norm_b or norm_b in norm_a:
-            return True
+    if norm_a in norm_b or norm_b in norm_a:
+        return True
+    
     tok_a = tokens_relevantes(norm_a)
     tok_b = tokens_relevantes(norm_b)
     if not tok_a or not tok_b:
         return False
-    intersecao = tok_a.intersection(tok_b)
-    return len(intersecao) >= min(len(tok_a), len(tok_b))
+    
+    # CORREÇÃO V9.2: Basta que qualquer token relevante relevante coincida ou esteja contido
+    return any(t in tok_b for t in tok_a) or any(t in tok_a for t in tok_b)
 
 
 def jogo_coincide_com_titulo(team1, team2, titulo_poly):
@@ -297,7 +298,7 @@ def registar_aposta_virtual(m_hash, jogo_nome, stake_poly, stake_sx, lucro_esper
 
 
 # ============================================================
-# 6. RECOLHA DE DADOS E DEBUG
+# 6. RECOLHA DE DADOS
 # ============================================================
 
 SPORT_KEYWORDS = [
@@ -498,17 +499,11 @@ def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
 
 
 # ============================================================
-# 7. ANALISE COM DEBUG DE CRUZAMENTO
+# 7. ANALISE COM CRUZAMENTO INTELIGENTE
 # ============================================================
 
 def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
     alertas_enviados = 0
-    
-    # DEBUG: Mostrar alguns exemplos de nomes recolhidos para confirmar correspondência
-    if jogos_poly:
-        logger.info("DEBUG POLY SAMPLE: %s", [j['title'] for j in jogos_poly[:3]])
-    if mercados_sx:
-        logger.info("DEBUG SX SAMPLE: %s", [f"{m['team_one']} vs {m['team_two']}" for m in mercados_sx[:3]])
 
     for sx_m in mercados_sx:
         m_hash = sx_m["market_hash"]
@@ -548,12 +543,11 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 soma_prob_bruta = (1.0 / odd_bruta_poly) + (1.0 / odd_bruta_sx)
                 lucro_pct_bruto = ((1.0 / soma_prob_bruta) - 1.0) * 100.0
 
-                # Como colocámos MIN_PROFIT_PCT = -3.0, qualquer margem superior a -3% vai disparar alerta
                 if lucro_pct_bruto < MIN_PROFIT_PCT:
                     continue
 
                 mensagem = (
-                    "🛡️ [TESTE DEBUG V9.1 - ALERTAS FORÇADOS]\n\n"
+                    "🛡️ [TESTE SMART V9.2 - ALERTA DE JOGO CASADO]\n\n"
                     f"Jogo: {team1} vs {team2}\n"
                     f"Poly Title: {jogo_poly['title']}\n"
                     f"Poly Preco: {preco_bruto_poly*100:.2f}¢ | Odd: {odd_bruta_poly:.2f}\n"
@@ -602,7 +596,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"ROBO V9.1 ONLINE")
+        self.wfile.write(b"ROBO V9.2 ONLINE")
 
     def log_message(self, format, *args):
         return
