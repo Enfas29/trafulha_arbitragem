@@ -31,3 +31,6 @@ jobs:
 
       - name: Testar V12 de paper trading (offline, sem APIs)
         run: python paper_v12.py --self-test
+
+      - name: Testar sinais WebSocket V12 (offline)
+        run: python sx_ws_v12.py
