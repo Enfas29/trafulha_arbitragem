@@ -13,6 +13,7 @@ desligadas até os testes serem confirmados.
   não pode criar duas operações.
 - Exposição virtual total aberta limitada a 500 €.
 - O cálculo percorre os níveis do livro, em vez de confiar apenas na melhor odd.
+- Se o scanner ficar sem odds válidas durante 30 minutos de tentativas, envia uma mensagem de saúde no Telegram, com intervalo mínimo de uma hora entre avisos.
 - A taxa Polymarket utiliza o parâmetro desportivo publicado de 5% aplicado
   a preço × (1 − preço) × shares, acrescido de reserva adversa de 1,25%
   em ambas as pernas. **Não substitui a verificação da taxa do contrato.**
@@ -92,12 +93,23 @@ simular fills e não executam apostas**.
     SX_WS_V12_ENABLED=1
     POLY_WS_V12_ENABLED=1
 
+    MONITOR_OUTAGE_SECONDS=1800
+    MONITOR_OUTAGE_REPEAT_SECONDS=3600
+
 Ambos são **experimentais** e estão desligados por defeito.
 Testar primeiro cada integração isoladamente no Railway. Em caso de
 falha de subscrição, o REST continua ativo. São acompanhados no máximo
 12 mercados SX e 24 tokens Polymarket simultaneamente, enquanto os
 restantes continuam em rotação REST. A frequência depende de rede,
 limites da API e créditos do Railway: não é execução instantânea.
+
+## Mensagens antigas «PAPER TRADING V10.0 ONLINE»
+
+O V12 não envia essa mensagem. Se continuar a recebê-la, há outro processo
+antigo ativo em algum serviço/servidor/conta que usa o mesmo bot Telegram.
+Localizar o serviço antigo (por exemplo Render, outra app Railway, GitHub
+Actions recorrente ou PC local) e parar **apenas esse processo**. O V12 não
+consegue desligar processos externos de forma segura por si.
 
 ## Por validar antes de qualquer execução com dinheiro real
 
