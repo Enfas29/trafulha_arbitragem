@@ -28,3 +28,6 @@ jobs:
 
       - name: Testar o monitor e historico SQLite (offline)
         run: python monitor_v11.py --self-test
+
+      - name: Testar V12 de paper trading (offline, sem APIs)
+        run: python paper_v12.py --self-test
