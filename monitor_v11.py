@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import trafulha_arbitragem as bot
+import paper_v12 as paper
 
 LOG = logging.getLogger("monitor_v11")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -31,6 +32,7 @@ ALERT_COOLDOWN = max(300, int(os.getenv("MONITOR_ALERT_COOLDOWN_SECONDS", "1800"
 SUMMARY_INTERVAL = max(3600, int(os.getenv("MONITOR_SUMMARY_SECONDS", "21600")))
 MAX_SKEW = 6.0
 MIN_ROI = bot.MIN_NET_ROI
+PAPER_V12_ENABLED = os.getenv("PAPER_V12_ENABLED", "0").strip().lower() in {"1", "true", "yes"}
 
 # Continua a usar os filtros conservadores de winner/moneyline do V11.
 bot.MAX_POLY_SERIES = min(120, max(10, int(os.getenv("MONITOR_POLY_SERIES", "60"))))
@@ -211,7 +213,7 @@ def select_pairs(pairs):
     )
 
 
-def scan_pass(conn, pairs, offset: int, fx: float):
+def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None):
     if not pairs:
         return {"checked": 0, "priced": 0, "positive": 0, "signals": 0,
                 "next_offset": 0, "best": None}
@@ -247,6 +249,34 @@ def scan_pass(conn, pairs, offset: int, fx: float):
                     positive += 1
                 if maybe_alert(conn, pair, quote, hypothetical, int(time.time())):
                     signals += 1
+
+                # A simulação é independente do relatório de odds. Nunca faz
+                # chamadas de escrita à Polymarket ou SX Bet.
+                if paper_conn is not None:
+                    paper_stage = ("PRE_JOGO" if stage == "PRE_JOGO"
+                                   else "LIVE_NAO_CONFIRMADO")
+                    booked = paper.try_paper_entry(
+                        paper_conn, pair, poly_levels, sx_levels, fx,
+                        paper_stage, abs(t_poly - t_sx)
+                    )
+                    if booked:
+                        shadow_id, shadow_quote = booked
+                        LOG.info(
+                            "PAPER V12 #%d | %s | %.2f EUR | "
+                            "lucro condicional +%.2f EUR | ROI %.2f%%",
+                            shadow_id, " vs ".join(sx["teams"]),
+                            shadow_quote.total_eur, shadow_quote.profit_eur,
+                            100 * shadow_quote.roi,
+                        )
+                        telegram(
+                            f"🧪 PAPER V12 #{shadow_id} · NÃO REAL\n"
+                            f"{sx['sport']} | {sx['teams'][0]} vs {sx['teams'][1]}\n"
+                            f"Poly: {pair['poly_label']} {shadow_quote.poly_debit_cents/100:.2f}€\n"
+                            f"SX: {pair['sx_label']} {shadow_quote.sx_debit_cents/100:.2f}€\n"
+                            f"Total: {shadow_quote.total_eur:.2f}€\n"
+                            f"Lucro condicional: +{shadow_quote.profit_eur:.2f}€\n"
+                            "⚠️ Fills presumidos · liquidação por validar"
+                        )
         except Exception as exc:
             LOG.warning(
                 "Book falhou em %s (%s)",
@@ -322,7 +352,7 @@ def record_report_attempt(conn, now_epoch=None):
         """, (now_epoch,))
 
 
-def send_summary(conn, catalog_count, startup=False, now_epoch=None):
+def send_summary(conn, catalog_count, startup=False, now_epoch=None, paper_conn=None):
     """Envia resumo de 6h; memoriza o envio para não repetir após reinício."""
     now_epoch = time.time() if now_epoch is None else now_epoch
     hours = SUMMARY_INTERVAL / 3600.0
@@ -330,6 +360,15 @@ def send_summary(conn, catalog_count, startup=False, now_epoch=None):
     message = format_summary(
         stats, catalog_count, window_hours=hours, fx_available=bot.FX > 0
     )
+    if paper_conn is not None:
+        totals = paper.paper_summary(paper_conn)
+        message += (
+            f"\n🧾 Paper: {totals['open_trades']} abertas · "
+            f"{totals['settled']} liquidadas"
+            f"\n💰 Livre: Poly {totals['poly_free_eur']:.2f}€ | "
+            f"SX {totals['sx_free_eur']:.2f}€"
+            "\n⚠️ Saldos virtuais"
+        )
     telegram(message)
     record_report_attempt(conn, now_epoch)
     LOG.info(
@@ -415,6 +454,12 @@ def main(once=False):
         )
 
     conn = open_database(DB)
+    paper_conn = paper.open_database() if PAPER_V12_ENABLED and fx > 0 else None
+    if PAPER_V12_ENABLED and paper_conn is None:
+        LOG.warning("PAPER V12 pediu ativação, mas EUR_PER_USD inválido/ausente: desativado.")
+    if paper_conn is not None:
+        LOG.info("PAPER V12 ATIVO: 1000 EUR virtuais por plataforma, "
+                 "máximo 100 EUR total por operação, sem apostas reais.")
     pairs, cursor = [], 0
     last_catalog = 0.0
     iteration = 0
@@ -432,12 +477,13 @@ def main(once=False):
                     if once:
                         raise
 
-            result = scan_pass(conn, pairs, cursor, fx)
+            result = scan_pass(conn, pairs, cursor, fx, paper_conn=paper_conn)
             cursor = result["next_offset"]
             iteration += 1
 
             if once or report_due(conn):
-                send_summary(conn, len(pairs), startup=(iteration == 1))
+                send_summary(conn, len(pairs), startup=(iteration == 1),
+                             paper_conn=paper_conn)
 
             # Preservar o histórico do último mês; não apagar resultados recentes.
             if iteration % 100 == 0:
@@ -455,6 +501,8 @@ def main(once=False):
         LOG.info("Monitor interrompido.")
     finally:
         conn.close()
+        if paper_conn is not None:
+            paper_conn.close()
 
 
 if __name__ == "__main__":
