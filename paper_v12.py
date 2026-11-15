@@ -233,7 +233,15 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None):
         return None
     if pair["sx"]["sport"] not in ALLOWED_SPORTS:
         return None
-    if pair["poly"].get("type", "").lower() != "moneyline":
+    if str(pair["poly"].get("type") or "").lower() != "moneyline":
+        return None
+    # Uma diferença grande de horário é indício de mercado diferente.
+    if abs(float(pair["poly"].get("start", 0)) -
+           float(pair["sx"].get("start", 0))) > 1800:
+        return None
+    if pair["poly"].get("sport") != pair["sx"].get("sport"):
+        return None
+    if str(pair["poly_label"]).strip().lower() == str(pair["sx_label"]).strip().lower():
         return None
     if quote.total_cents > MAX_TRADE_CENTS or quote.roi < MIN_NET_ROI:
         return None
@@ -388,9 +396,10 @@ def self_test():
     assert quote_for_payout([(0.43, 10)], [(0.50, 10)], 10, 0.91).poly_fee_cents > 0
 
     sample = {
-        "poly": {"id": "poly-1", "type": "moneyline"},
+        "poly": {"id": "poly-1", "type": "moneyline",
+                 "sport": "basketball", "start": 1800000000},
         "sx": {"hash": "sx-1", "sport": "basketball",
-               "teams": ("Lakers", "Celtics")},
+               "teams": ("Lakers", "Celtics"), "start": 1800000000},
         "poly_label": "Lakers", "sx_label": "Celtics",
     }
     with tempfile.TemporaryDirectory() as temp:
@@ -398,6 +407,14 @@ def self_test():
         ident = book_shadow_trade(db, sample, q, "PRE_JOGO", now_epoch=1000)
         assert ident == 1
         assert book_shadow_trade(db, sample, q, "PRE_JOGO") is None
+        # Duplicação, modalidade diferente, horário e tipo de mercado
+        # nunca podem ser admitidos.
+        bad = {**sample, "poly": {**sample["poly"], "type": "spread"}}
+        assert book_shadow_trade(db, bad, q, "PRE_JOGO") is None
+        bad = {**sample, "poly": {**sample["poly"], "sport": "tennis"}}
+        assert book_shadow_trade(db, bad, q, "PRE_JOGO") is None
+        bad = {**sample, "poly": {**sample["poly"], "start": 1800004000}}
+        assert book_shadow_trade(db, bad, q, "PRE_JOGO") is None
         balances = free_balances(db)
         assert balances["poly"] == INITIAL_CENTS - q.poly_debit_cents
         assert balances["sx"] == INITIAL_CENTS - q.sx_debit_cents
