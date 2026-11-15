@@ -34,3 +34,6 @@ jobs:
 
       - name: Testar sinais WebSocket V12 (offline)
         run: python sx_ws_v12.py
+
+      - name: Testar WebSocket Polymarket V12 (offline)
+        run: python poly_ws_v12.py
