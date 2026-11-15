@@ -111,8 +111,14 @@ def normalize_quote(poly_levels, sx_levels):
     if pc is None or sc is None or pc + sc <= 0:
         return None
     gross = 100.0 * (capacity - pc - sc) / (pc + sc)
-    buffered_cost = pc * (1.0 + bot.POLY_FEE_BUFFER) + sc * (1.0 + bot.SX_FEE_BUFFER)
-    buffered = 100.0 * (capacity - buffered_cost) / buffered_cost
+    # Margem de referência do V12: taxa taker desportiva Poly e
+    # buffers adversos separados para cada perna.
+    model = paper.quote_for_payout(
+        poly_levels, sx_levels, capacity, bot.FX if bot.FX > 0 else 1.0
+    )
+    if model is None:
+        return None
+    buffered = 100.0 * model.roi
     return capacity, gross, buffered
 
 
@@ -124,9 +130,9 @@ def hypothetical_100_eur(poly_levels, sx_levels, fx: float):
     if fx <= 0:
         return None
     bot.FX = fx
-    return bot.price_quote(
-        poly_levels, sx_levels,
-        bot.INITIAL_EUR / fx, bot.INITIAL_EUR / fx,
+    return paper.select_shadow_quote(
+        poly_levels, sx_levels, fx,
+        paper.INITIAL_CENTS, paper.INITIAL_CENTS,
     )
 
 
@@ -156,9 +162,8 @@ def insert_observation(conn, pair, stage, poly_levels, sx_levels, skew, fx):
             quote[1] if quote else None,
             quote[2] if quote else None,
             skew,
-            (hypothetical.poly_usd + hypothetical.sx_usd
-             + hypothetical.fees_usd) * fx if hypothetical else None,
-            hypothetical.profit_usd * fx if hypothetical else None,
+            hypothetical.total_eur if hypothetical else None,
+            hypothetical.profit_eur if hypothetical else None,
             note,
         ))
     return quote, hypothetical
@@ -189,8 +194,7 @@ def maybe_alert(conn, pair, quote, hypothetical, now):
                         roi_pct=excluded.roi_pct
         """, (pair["key"], now, 100 * hypothetical.roi))
     s = pair["sx"]
-    total = (hypothetical.poly_usd + hypothetical.sx_usd
-             + hypothetical.fees_usd) * bot.FX
+    total = hypothetical.total_eur
     telegram(
         "🔎 SINAL V11 · NÃO EXECUTADO\n"
         f"{s['sport']} | {s['teams'][0]} vs {s['teams'][1]}\n"
@@ -255,7 +259,11 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None, hot_sx_hashe
                 best = quote[2] if best is None else max(best, quote[2])
                 if quote[2] > 0:
                     positive += 1
-                if maybe_alert(conn, pair, quote, hypothetical, int(time.time())):
+                # Evitar duas mensagens por uma oportunidade: quando PAPER V12
+                # está ativo, só a operação shadow emite alerta individual.
+                if paper_conn is None and maybe_alert(
+                    conn, pair, quote, hypothetical, int(time.time())
+                ):
                     signals += 1
 
                 # A simulação é independente do relatório de odds. Nunca faz
