@@ -5,6 +5,7 @@ Zero correspondências não é sucesso de arbitragem: é um diagnóstico incompl
 """
 
 import collections
+import statistics
 import os
 import sys
 from pathlib import Path
@@ -16,7 +17,7 @@ import trafulha_arbitragem as bot
 bot.MAX_POLY_SERIES = 60
 bot.MAX_EVENTS_PER_SERIES = 150
 bot.MAX_SX_PAGES = 12
-MAX_PAIRS = 8
+MAX_PAIRS = 40
 MAX_FALLBACK_BOOKS = 6
 
 
@@ -191,6 +192,25 @@ def audit_candidate_uniqueness(poly, sx, pairs):
     return len(actual), eligible_count, unique_count, multi_count
 
 
+def select_price_sample(pairs, limit):
+    """Amostra de desportos equilibrada; testa ambos os lados do mesmo jogo."""
+    groups = collections.defaultdict(lambda: collections.defaultdict(list))
+    for pair in pairs:
+        groups[pair["sx"]["sport"]][pair["sx"]["hash"]].append(pair)
+
+    by_sport = {sport: list(events.values()) for sport, events in groups.items()}
+    selected = []
+    while len(selected) < limit and any(by_sport.values()):
+        for sport in sorted(by_sport):
+            if not by_sport[sport]:
+                continue
+            event_pairs = by_sport[sport].pop(0)
+            selected.extend(event_pairs[:limit - len(selected)])
+            if len(selected) >= limit:
+                break
+    return selected
+
+
 def main():
     if not os.getenv("SX_API_KEY"):
         raise SystemExit("❌ Falta o GitHub Secret SX_API_KEY")
@@ -240,10 +260,15 @@ def main():
               f"{m['teams'][0]} vs {m['teams'][1]}")
     print("   Matching preliminar: as regras de liquidação ainda exigem validação.")
 
-    poly_ok = sx_ok = price_tests = potential_positive = 0
+    selected_pairs = select_price_sample(pairs, MAX_PAIRS)
+    print(f"🎯 Preços: {len(selected_pairs)} direções selecionadas "
+          f"de {len(pairs)} possíveis (amostra equilibrada por desporto)")
+    print("   A estimativa usa payout comum de até 10 USDC, não stake de 100 €.")
+    poly_ok = sx_ok = price_tests = potential_positive = priced_count = 0
     examples = []
+    roi_samples = []
     seen_poly, seen_sx = set(), set()
-    for pair in pairs[:MAX_PAIRS]:
+    for pair in selected_pairs:
         try:
             pa = pair["poly_asset"]
             sh = pair["sx"]["hash"]
@@ -256,10 +281,12 @@ def main():
             price_tests += int(bool(poly_levels and sx_levels))
             roi = percentage_quote(poly_levels, sx_levels)
             if roi is not None:
+                priced_count += 1
+                roi_samples.append((roi, pair["sx"]["sport"],
+                                    pair["sx"]["teams"][0], pair["sx"]["teams"][1],
+                                    pair["poly_label"], pair["sx_label"]))
                 if roi > 0:
                     potential_positive += 1
-                if len(examples) < 3:
-                    examples.append(f"  {pair['sx']['teams'][0]} vs {pair['sx']['teams'][1]}: margem indicativa {roi:+.2f}%")
         except Exception as exc:
             print("⚠️ Livro de par candidato:", readable_error(exc))
 
@@ -284,8 +311,19 @@ def main():
     print(f"📚 Livros acessíveis: Polymarket {poly_ok} | SX Bet {sx_ok}")
     print(f"💹 Pares com liquidez em ambos os lados: {price_tests}")
     print(f"📈 Margens indicativas positivas na amostra: {potential_positive}")
-    for line in examples:
-        print(line)
+    if roi_samples:
+        rois = [entry[0] for entry in roi_samples]
+        print("📉 Margens calculáveis (indicativas): "
+              f"{priced_count}/{len(selected_pairs)} | "
+              f"mín={min(rois):+.2f}% | mediana={statistics.median(rois):+.2f}% "
+              f"| máx={max(rois):+.2f}%")
+        print("Melhores 5 margens na amostra (não são oportunidades validadas):")
+        for roi, sport, a, b, poly_name, sx_name in sorted(
+                roi_samples, reverse=True)[:5]:
+            print(f"  {roi:+.2f}% | [{sport}] {a} vs {b} "
+                  f"| Poly:{poly_name} | SX:{sx_name}")
+    else:
+        print("⚠️ Não foi possível calcular margens com a profundidade disponível.")
 
     if errors:
         conclusion = "❌ Falha na recolha: " + "; ".join(errors)
@@ -305,6 +343,7 @@ def main():
         f"Poly: {len(poly)} | SX: {len(sx)}\n"
         f"Pares candidatos: {len(pairs)}\n"
         f"Confrontos aceites: {unique_pairs}\n"
+        f"Preços avaliados: {priced_count}/{len(selected_pairs)}\n"
         f"Livros: Poly {poly_ok} | SX {sx_ok}\n"
         f"Margens + indicativas: {potential_positive}\n"
         + conclusion + "\n"
@@ -330,10 +369,23 @@ def main():
                 ("SX com mesmo desporto e janela horária", len(time_overlap)),
                 ("Livros Poly acessíveis", poly_ok),
                 ("Livros SX acessíveis", sx_ok),
+                ("Direções de aposta selecionadas para preço", len(selected_pairs)),
                 ("Pares com liquidez dos dois lados", price_tests),
+                ("Margens efetivamente calculadas", priced_count),
                 ("Margens indicativas positivas", potential_positive),
+                ("Melhor margem indicativa", f"{max([r[0] for r in roi_samples]):+.2f}%" if roi_samples else "N/D"),
+                ("Mediana das margens", f"{statistics.median([r[0] for r in roi_samples]):+.2f}%" if roi_samples else "N/D"),
             ]:
                 f.write(f"| {label} | {value} |\n")
+            f.write("\nAmostra de preços com payout comum de até 10 USDC. "
+                    "Margens apenas indicativas; liquidação e execução não validadas.\n")
+            if roi_samples:
+                f.write("\n### Melhores margens observadas na amostra\n\n")
+                for roi, sport, a, b, poly_name, sx_name in sorted(
+                    roi_samples, reverse=True
+                )[:6]:
+                    f.write(f"- {roi:+.2f}% — {sport}: {a} vs {b} "
+                            f"(Poly: {poly_name}; SX: {sx_name})\n")
             f.write("\n### Principais razões de exclusão\n\n")
             for reason, count in reasons.most_common(6):
                 f.write(f"- {reason}: {count}\n")
