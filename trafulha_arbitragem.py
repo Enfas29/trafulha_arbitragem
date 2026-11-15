@@ -201,9 +201,14 @@ def sx_sport_family(market):
         sx_id = int(market.get("sportId", market.get("sportID", -1)))
     except (TypeError, ValueError):
         sx_id = -1
+    # SX Bet /sports: 1 Basketball, 2 Hockey, 3 Baseball,
+    # 4 Golf, 5 Soccer, 6 Tennis, 7 MMA, 8 American Football, 9 eSports.
+    # Não confundir estes IDs com os IDs de outras APIs desportivas.
     by_id = {
-        1: "american_football", 2: "basketball",
-        3: "baseball", 4: "hockey", 5: "soccer", 6: "combat",
+        1: "basketball", 2: "hockey", 3: "baseball",
+        4: "golf", 5: "soccer", 6: "tennis",
+        7: "combat", 8: "american_football",
+        9: "esports",
     }
     if sx_id in by_id:
         return by_id[sx_id]
@@ -767,8 +772,11 @@ def self_test():
     assert parse_title("NBA: Boston Celtics vs Los Angeles Lakers") == (
         "Boston Celtics", "Los Angeles Lakers")
     assert sport_family("NFL") == "american_football"
-    assert sx_sport_family({"sportId": 1, "sportLabel": "Football"}) == "american_football"
+    assert sx_sport_family({"sportId": 1, "sportLabel": "Basketball"}) == "basketball"
     assert sx_sport_family({"sportId": 5, "sportLabel": "Soccer"}) == "soccer"
+    assert sx_sport_family({"sportId": 6, "sportLabel": "Tennis"}) == "tennis"
+    assert sx_sport_family({"sportId": 7, "sportLabel": "Mixed Martial Arts"}) == "combat"
+    assert sx_sport_family({"sportId": 8, "sportLabel": "Football"}) == "american_football"
     assert sport_family("cricadt10") == "cricket"
     assert sport_family("hbnbi") == "handball"
     assert sx_sport_family({"sportLabel": "Football", "leagueLabel": "NFL"}) == "american_football"
