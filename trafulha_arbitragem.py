@@ -207,6 +207,11 @@ def sx_sport_family(market):
     }
     if sx_id in by_id:
         return by_id[sx_id]
+    # A liga pode esclarecer um sportLabel genérico, por exemplo "Football".
+    league_family = sport_family(market.get("leagueLabel", ""))
+    if league_family in {"american_football", "basketball", "baseball",
+                         "hockey", "soccer", "tennis", "combat"}:
+        return league_family
     label = ascii_name(market.get("sportLabel", ""))
     if label in {"american football", "gridiron", "nfl"}:
         return "american_football"
@@ -766,6 +771,7 @@ def self_test():
     assert sx_sport_family({"sportId": 5, "sportLabel": "Soccer"}) == "soccer"
     assert sport_family("cricadt10") == "cricket"
     assert sport_family("hbnbi") == "handball"
+    assert sx_sport_family({"sportLabel": "Football", "leagueLabel": "NFL"}) == "american_football"
     # Poly 0.45, SX 0.50 -> payout 100, custo 95, buffers ~0.95
     old_fx = globals()["FX"]
     globals()["FX"] = 1.0
