@@ -4,16 +4,16 @@ import json
 import time
 import threading
 import logging
-import hashlib
 import unicodedata
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
+import websocket
 
 
 # ============================================================
-#  1. CONFIGURACOES (PAPER TRADING V8.6 - EXACT PRICE SYNC)
+# 1. CONFIGURACOES (PAPER TRADING V9.0 - WEBSOCKET CLOB)
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -26,7 +26,7 @@ PAPER_INITIAL_BANKROLL_SX = float(os.getenv("PAPER_INITIAL_BANKROLL_SX", "1000")
 PAPER_STAKE_USD = float(os.getenv("PAPER_STAKE_USD", "100"))
 
 MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.5"))
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "20"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "15"))
 
 MIN_POLY_VOLUME = float(os.getenv("MIN_POLY_VOLUME", "1000"))
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "15"))
@@ -40,19 +40,19 @@ MAX_POLY_MARKETS = int(os.getenv("MAX_POLY_MARKETS", "400"))
 AUTO_BET = False
 
 POLY_GAMMA = "https://gamma-api.polymarket.com"
-POLY_CLOB = "https://clob.polymarket.com"
+POLY_CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 SX_BASE = "https://api.sx.bet"
 
 
 # ============================================================
-#  2. LOGGING E ESTADO DA CARTEIRA DUPLA
+# 2. LOGGING E ESTADO GLOBAL
 # ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("ArbitragePaperBotV86")
+logger = logging.getLogger("ArbitragePaperBotV90")
 
 session = requests.Session()
 session.headers.update({
@@ -69,6 +69,10 @@ if POLY_API_KEY:
 
 state_lock = threading.Lock()
 wallet_lock = threading.Lock()
+orderbook_cache_lock = threading.Lock()
+
+# Dicionário em memória para guardar o melhor ask em tempo real de cada token_id
+live_orderbooks = {}
 
 paper_wallet = {
     "poly": {
@@ -98,15 +102,100 @@ scanner_status = {
     "matched_games": 0,
     "best_margin_pct": None,
     "opportunities": 0,
-    "sx_odds_endpoint": None,
-    "mode": "WEB3_PAPER_TRADING_EXACT_SYNC_V8.6"
+    "ws_connected": False,
+    "mode": "WEB3_PAPER_TRADING_WEBSOCKET_V9.0"
 }
 
 diagnostico_inicial_feito = False
 
 
 # ============================================================
-#  3. UTILITARIOS HTTP E NORMALIZACAO
+# 3. WEBSOCKET DA POLYMARKET (CLIENTE EM BACKGROUND)
+# ============================================================
+
+def processar_mensagem_ws(ws, message):
+    try:
+        data = json.loads(message)
+        # O CLOB envia eventos de livro de ordens (book ou price_change)
+        items = data if isinstance(data, list) else [data]
+        
+        with orderbook_cache_lock:
+            for item in items:
+                event_type = item.get("event_type", item.get("type"))
+                token_id = item.get("asset_id") or item.get("token_id")
+                
+                if not token_id and "market" in item:
+                    token_id = item.get("market")
+
+                asks = item.get("asks", [])
+                if not token_id or not asks:
+                    continue
+
+                asks_validos = []
+                for nivel in asks:
+                    try:
+                        preco = float(nivel["price"])
+                        quantidade = float(nivel["size"])
+                        if 0 < preco < 1 and quantidade > 0:
+                            asks_validos.append({"price": preco, "size": quantidade})
+                    except (ValueError, TypeError, KeyError):
+                        continue
+
+                if asks_validos:
+                    melhor_ask = min(asks_validos, key=lambda x: x["price"])
+                    live_orderbooks[str(token_id)] = {
+                        "price": melhor_ask["price"],
+                        "size": melhor_ask["size"],
+                        "liquidity_usd": melhor_ask["price"] * melhor_ask["size"],
+                        "checked_at": datetime.now(timezone.utc).isoformat()
+                    }
+    except Exception as e:
+        logger.error("Erro ao processar mensagem WebSocket: %s", e)
+
+
+def ao_abrir_ws(ws):
+    logger.info("Ligado ao WebSocket CLOB da Polymarket!")
+    with state_lock:
+        scanner_status["ws_connected"] = True
+
+
+def ao_fechar_ws(ws, close_status_code, close_msg):
+    logger.warning("WebSocket Polymarket fechado. Código: %s | Motivo: %s", close_status_code, close_msg)
+    with state_lock:
+        scanner_status["ws_connected"] = False
+
+
+def correr_websocket_poly():
+    while True:
+        try:
+            ws = websocket.WebSocketApp(
+                POLY_CLOB_WS,
+                on_open=ao_abrir_ws,
+                on_message=processar_mensagem_ws,
+                on_close=ao_fechar_ws
+            )
+            # Executa com ping automático para manter a ligação ativa
+            ws.run_forever(ping_interval=30, ping_timeout=10)
+        except Exception as e:
+            logger.error("Erro na thread do WebSocket: %s", e)
+        time.sleep(5)
+
+
+def subscrever_tokens_websocket(ws_app, token_ids):
+    if not token_ids:
+        return
+    try:
+        payload = {
+            "assets_ids": token_ids,
+            "type": "market"
+        }
+        ws_app.send(json.dumps(payload))
+    except Exception:
+        pass
+
+
+# ============================================================
+# 4. UTILITARIOS HTTP E NORMALIZACAO
 # ============================================================
 
 def http_get(url, params=None, timeout=20):
@@ -155,39 +244,7 @@ ALIASES_EQUIPAS = {
     "ac milan": "milan",
     "atletico madrid": "atletico",
     "bayern munich": "bayern",
-    "borussia dortmund": "dortmund",
-    "atlanta hawks": "hawks",
-    "boston celtics": "celtics",
-    "brooklyn nets": "nets",
-    "charlotte hornets": "hornets",
-    "chicago bulls": "bulls",
-    "cleveland cavaliers": "cavaliers",
-    "dallas mavericks": "mavericks",
-    "denver nuggets": "nuggets",
-    "detroit pistons": "pistons",
-    "golden state warriors": "warriors",
-    "houston rockets": "rockets",
-    "indiana pacers": "pacers",
-    "los angeles clippers": "clippers",
-    "la clippers": "clippers",
-    "los angeles lakers": "lakers",
-    "la lakers": "lakers",
-    "memphis grizzlies": "grizzlies",
-    "miami heat": "heat",
-    "milwaukee bucks": "bucks",
-    "minnesota timberwolves": "timberwolves",
-    "new orleans pelicans": "pelicans",
-    "new york knicks": "knicks",
-    "oklahoma city thunder": "thunder",
-    "orlando magic": "magic",
-    "philadelphia 76ers": "76ers",
-    "phoenix suns": "suns",
-    "portland trail blazers": "trail blazers",
-    "sacramento kings": "kings",
-    "san antonio spurs": "spurs",
-    "toronto raptors": "raptors",
-    "utah jazz": "jazz",
-    "washington wizards": "wizards"
+    "borussia dortmund": "dortmund"
 }
 
 
@@ -254,7 +311,7 @@ def formatar_data_pt(dt_obj):
 
 
 # ============================================================
-#  4. TELEGRAM E GESTAO DA CARTEIRA
+# 5. TELEGRAM E GESTAO DA CARTEIRA
 # ============================================================
 
 def enviar_alerta_telegram(mensagem):
@@ -306,7 +363,7 @@ def registar_aposta_virtual(m_hash, jogo_nome, stake_poly, stake_sx, lucro_esper
 
 
 # ============================================================
-#  5. POLYMARKET - LEITURA CLOB V8.6 (COM LOG DE PERGUNTAS)
+# 6. RECOLHA DE DADOS POLYMARKET E SX BET
 # ============================================================
 
 SPORT_KEYWORDS = [
@@ -323,9 +380,15 @@ def parece_evento_desportivo(texto):
     return any(k in t for k in SPORT_KEYWORDS)
 
 
-def obter_preco_real_clob(token_id):
+def obter_preco_websocket_ou_rest(token_id):
+    """Lê em prioridade do cache em tempo real do WebSocket; se não existir, recorre ao REST."""
+    with orderbook_cache_lock:
+        if token_id in live_orderbooks:
+            return live_orderbooks[token_id]
+
+    # Fallback REST caso o WebSocket ainda não tenha recebido pacotes deste token
     try:
-        book = http_get(f"{POLY_CLOB}/book", params={"token_id": token_id}, timeout=8)
+        book = http_get(f"https://clob.polymarket.com/book", params={"token_id": token_id}, timeout=6)
         asks = book.get("asks", [])
         if not asks:
             return None
@@ -344,19 +407,18 @@ def obter_preco_real_clob(token_id):
             return None
 
         melhor_ask = min(asks_validos, key=lambda x: x["price"])
-        return {
+        res = {
             "price": melhor_ask["price"],
             "size": melhor_ask["size"],
             "liquidity_usd": melhor_ask["price"] * melhor_ask["size"],
             "checked_at": datetime.now(timezone.utc).isoformat()
         }
+        with orderbook_cache_lock:
+            live_orderbooks[token_id] = res
+        return res
     except Exception:
         return None
 
-
-# ============================================================
-#  6. RECOLHA DE JOGOS E MERCADOS (FILTRO DE MONEYLINE EXATO)
-# ============================================================
 
 def obter_jogos_polymarket():
     jogos_poly = []
@@ -411,7 +473,6 @@ def obter_jogos_polymarket():
                 q_lower = str(m.get("question", "")).lower()
                 g_lower = str(m.get("groupItemTitle", "")).lower()
 
-                # FILTRO EXTREMO: Apenas aceitar mercados cujo título/pergunta indique claramente vencedor da partida principal
                 is_moneyline = any(w in q_lower for w in ["win the match", "winner", "vence", "moneyline", "match winner"]) or (
                     " vs " in q_lower and not any(w in q_lower for w in ["spread", "over", "under", "total", "handicap", "map", "set", "quarter", "half", "period"])
                 )
@@ -517,7 +578,7 @@ def obter_mercados_sx():
 
 
 # ============================================================
-#  7. LEITURA DAS ODDS SX BET
+# 7. LEITURA DE ODDS SX BET
 # ============================================================
 
 def _extrair_niveis_lado_obv3(lado_raw):
@@ -623,14 +684,12 @@ def _parsear_payload_obv3(data, melhores_por_mercado, m_hash_fallback=None):
             _registar_livro_mercado_obv3(mh, v, melhores_por_mercado)
 
 
-def obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=False):
+def obter_melhores_odds_sx(mercados_relevantes):
     melhores_por_mercado = {}
     if not mercados_relevantes:
         return melhores_por_mercado
 
     hashes_unicos = list(dict.fromkeys(m["market_hash"] for m in mercados_relevantes))
-    rota_usada = None
-    diag_msg = None
 
     for i in range(0, len(hashes_unicos), 50):
         lote = hashes_unicos[i:i + 50]
@@ -651,48 +710,14 @@ def obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=False):
                 payload = resp.json()
                 data = payload.get("data", payload) if isinstance(payload, dict) else payload
                 _parsear_payload_obv3(data, melhores_por_mercado)
-                rota_usada = "/orders-v3/odds/best"
-                if diag_msg is None:
-                    diag_msg = f"/orders-v3/odds/best -> HTTP 200: {json.dumps(data, ensure_ascii=False)[:260]}"
-            elif diag_msg is None:
-                diag_msg = f"/orders-v3/odds/best -> HTTP {resp.status_code}: {resp.text[:160]}"
-        except Exception as e:
-            if diag_msg is None:
-                diag_msg = f"/orders-v3/odds/best -> ERR: {e}"
-
-    if not melhores_por_mercado:
-        for m_hash in hashes_unicos[:40]:
-            try:
-                resp = session.get(
-                    f"{SX_BASE}/orderbook-v3/snapshot/market",
-                    params={"marketHash": m_hash},
-                    timeout=12
-                )
-                if resp.ok:
-                    payload = resp.json()
-                    data = payload.get("data", payload) if isinstance(payload, dict) else payload
-                    _parsear_payload_obv3(data, melhores_por_mercado, m_hash_fallback=m_hash)
-                    if rota_usada is None:
-                        rota_usada = "/orderbook-v3/snapshot/market"
-                    if diag_msg is None or "HTTP 200" not in diag_msg:
-                        diag_msg = f"/orderbook-v3/snapshot/market -> HTTP 200: {json.dumps(data, ensure_ascii=False)[:260]}"
-                elif diag_msg is None:
-                    diag_msg = f"/orderbook-v3/snapshot/market -> HTTP {resp.status_code}: {resp.text[:160]}"
-            except Exception:
-                continue
-
-    if rota_usada:
-        with state_lock:
-            scanner_status["sx_odds_endpoint"] = rota_usada
-
-    if log_diagnostico and diag_msg:
-        logger.info("Diagnostico SX OBv3 | %s", diag_msg)
+        except Exception:
+            continue
 
     return melhores_por_mercado
 
 
 # ============================================================
-#  8. MAPEAMENTO E CRUZAMENTO
+# 8. MAPEAMENTO E CRUZAMENTO
 # ============================================================
 
 def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
@@ -717,12 +742,11 @@ def extrair_opcoes_poly_para_sx(jogo_poly, sx_market):
 
 
 # ============================================================
-#  9. ANALISE DE ARBITRAGEM V8.6
+# 9. ANALISE DE ARBITRAGEM V9.0
 # ============================================================
 
 def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
     alertas_enviados = 0
-    fator_min = max(0.5, 1.0 + (MIN_PROFIT_PCT / 100.0))
 
     for sx_m in mercados_sx:
         m_hash = sx_m["market_hash"]
@@ -769,7 +793,8 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 if opt_sx["liquidity_usdc"] < MIN_LIQUIDITY_USD:
                     continue
 
-                ask = obter_preco_real_clob(opt_p["token_id"])
+                # CONSULTA EM TEMPO REAL (WEBSOCKET CACHE OU FALLBACK REST)
+                ask = obter_preco_websocket_ou_rest(opt_p["token_id"])
                 if not ask:
                     continue
 
@@ -778,13 +803,8 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                     continue
 
                 preco_bruto_poly = ask["price"]
-                
                 if not (0.01 < preco_bruto_poly < 0.99):
                     continue
-
-                # LOG DE DIAGNÓSTICO PARA VERIFICAR A PERGUNTA E PREÇO LIDO
-                logger.info("POLY CHECK | Jogo: %s vs %s | Pergunta: %s | Token ID: %s | Preço CLOB: %.2f¢",
-                            team1, team2, opt_p['question'], opt_p['token_id'], preco_bruto_poly * 100)
 
                 odd_bruta_poly = 1.0 / preco_bruto_poly
                 odd_bruta_sx = opt_sx["odd"]
@@ -839,14 +859,14 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
                 )
 
                 mensagem = (
-                    "🛡️ [PAPER TRADING - EXACT SYNC V8.6]\n\n"
+                    "🛡️ [PAPER TRADING - WEBSOCKET V9.0]\n\n"
                     f"Jogo: {team1} vs {team2}\n"
                     f"Mercado Poly: {opt_p['question']}\n"
                     f"Competicao: {sx_m['sport']} - {sx_m['league']}\n"
                     f"Data e Hora: {formatar_data_pt(dt_sx or dt_poly)}\n\n"
                     "Lado 1 (Polymarket - USDC):\n"
                     f"- Aposta: {opt_p['label']}\n"
-                    f"- Preco BUY validado: {preco_cents:.2f}¢ ({preco_bruto_poly:.4f} USDC)\n"
+                    f"- Preco BUY validado (WS): {preco_cents:.2f}¢ ({preco_bruto_poly:.4f} USDC)\n"
                     f"- Odd Bruta: {odd_bruta_poly:.4f} | Odd apos buffer: {odd_liq_poly:.4f}\n"
                     f"- Liquidez no melhor ASK: ${ask['liquidity_usd']:.2f} USDC\n"
                     f"- Cotacao confirmada (UTC): {hora_cotacao}\n"
@@ -874,17 +894,10 @@ def analisar_cruzamento_web3(jogos_poly, mercados_sx, odds_sx, stats):
 
 
 # ============================================================
-#  10. CICLO PRINCIPAL DO SCANNER
+# 10. CICLO PRINCIPAL
 # ============================================================
 
 def ciclo_scanner():
-    global diagnostico_inicial_feito
-    with wallet_lock:
-        banca_poly = paper_wallet["poly"]["available"]
-        banca_sx = paper_wallet["sx"]["available"]
-
-    logger.info("A iniciar scanner Paper Trading V8.6 (Poly Disp: $%.2f | SX Disp: $%.2f).", banca_poly, banca_sx)
-
     stats = {"jogos_casados": 0, "melhor_margem": None}
     jogos_poly = obter_jogos_polymarket()
     mercados_sx = obter_mercados_sx()
@@ -894,20 +907,12 @@ def ciclo_scanner():
         if any(jogo_coincide_com_titulo(sx_m["team_one"], sx_m["team_two"], jp["title"]) for jp in jogos_poly)
     ]
 
-    fazer_diag = not diagnostico_inicial_feito
-    odds_sx = obter_melhores_odds_sx(mercados_relevantes, log_diagnostico=fazer_diag) if mercados_relevantes else {}
-
-    if fazer_diag:
-        diagnostico_inicial_feito = True
-        logger.info("Diagnostico Cruzamento | Pares por nome: %s | Mercados SX com odds OBv3: %s", len(mercados_relevantes), len(odds_sx))
-
+    odds_sx = obter_melhores_odds_sx(mercados_relevantes) if mercados_relevantes else {}
     total_alertas = analisar_cruzamento_web3(jogos_poly, mercados_relevantes, odds_sx, stats)
 
     melhor_str = f"{stats['melhor_margem']:.2f}%" if stats["melhor_margem"] is not None else "N/A"
     logger.info(
-        "Ciclo concluido | Poly Disp: $%.2f | SX Disp: $%.2f | Casados: %d | Melhor margem: %s | Alertas: %d",
-        paper_wallet["poly"]["available"],
-        paper_wallet["sx"]["available"],
+        "Ciclo concluido | Casados: %d | Melhor margem: %s | Alertas: %d",
         stats["jogos_casados"],
         melhor_str,
         total_alertas
@@ -929,14 +934,14 @@ def correr_robo_continuo():
         try:
             ciclo_scanner()
         except Exception as e:
-            logger.exception("Erro geral do scanner Paper Trading.")
+            logger.exception("Erro geral do scanner.")
             with state_lock:
                 scanner_status["last_error"] = str(e)
         time.sleep(SCAN_INTERVAL)
 
 
 # ============================================================
-#  11. SERVIDOR WEB RENDER
+# 11. SERVIDOR WEB RENDER
 # ============================================================
 
 class SimpleHandler(BaseHTTPRequestHandler):
@@ -960,7 +965,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 s_disp = paper_wallet["sx"]["available"]
                 s_inv = paper_wallet["sx"]["invested"]
             body = (
-                "ROBO ARBITRAGEM PAPER TRADING V8.6 ONLINE (EXACT SYNC)\n"
+                "ROBO ARBITRAGEM PAPER TRADING V9.0 ONLINE (WEBSOCKET)\n"
                 f"Polymarket Disp: ${p_disp:.2f} | Investido: ${p_inv:.2f}\n"
                 f"SX Bet Disp: ${s_disp:.2f} | Investido: ${s_inv:.2f}\n"
                 "Health / Wallet: /health\n"
@@ -990,6 +995,13 @@ if __name__ == "__main__":
     if not TELEGRAM_TOKEN or not CHAT_ID:
         logger.warning("Telegram nao configurado.")
 
+    # 1. Iniciar thread do WebSocket da Polymarket
+    ws_thread = threading.Thread(target=correr_websocket_poly, daemon=True)
+    ws_thread.start()
+
+    # 2. Iniciar thread do scanner de arbitragem
     scanner_thread = threading.Thread(target=correr_robo_continuo, daemon=True)
     scanner_thread.start()
+
+    # 3. Iniciar servidor HTTP do Render
     iniciar_servidor_web()
