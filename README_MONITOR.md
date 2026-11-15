@@ -5,6 +5,7 @@ O monitor_v11.py é um **monitor só de leitura** para a Polymarket e SX Bet.
 - Guarda cada observação na base de dados SQLite; mantém até 30 dias.
 - Atualiza os catálogos a cada 10 minutos, por defeito.
 - Procura preços continuamente por REST, por lotes e com limites de pedidos.
+- Envia um **resumo Telegram a cada 6 horas** (por defeito) com confrontos distintos analisados, odds válidas, melhor margem estimada e sinais potenciais. O horário da última tentativa fica no SQLite e é mantido após reinício.
 - **Não usa WebSockets nesta primeira versão**: não pode prometer reação imediata a uma mudança de odd.
 - Não cria ordens, não chama book_paper, não altera carteiras virtuais nem aposta dinheiro real.
 - Qualquer sinal no Telegram é meramente hipotético: não confirma equivalência das regras de liquidação, taxa real ou execução de ambas as apostas.
@@ -29,9 +30,9 @@ O GitHub Actions **não é** o processo 24/7: termina depois do teste.
    - TELEGRAM_TOKEN e TELEGRAM_CHAT_ID
    - EUR_PER_USD com cotação realista e atualizada de **1 USD em euros**
    - Opcional: MONITOR_INTERVAL_SECONDS=20, MONITOR_PAIRS_PER_PASS=15,
-     MONITOR_CATALOG_SECONDS=600
+     MONITOR_CATALOG_SECONDS=600, MONITOR_SUMMARY_SECONDS=21600 (6 horas)
 6. Iniciar o serviço e consultar os logs.
-7. A mensagem do Telegram "MONITOR V11 · SÓ LEITURA" deve surgir no arranque.
+7. No primeiro arranque após a atualização, o Telegram recebe "MONITOR V11 · ÚLTIMAS 6H". Os seguintes relatórios são enviados de 6 em 6 horas, mesmo depois de reinícios normais (sem repetir o relatório a cada deploy).
 
 Se EUR_PER_USD não estiver definido, o programa continua a recolher preços,
 mas não dimensiona posições em euros nem envia sinais de stake hipotético.
