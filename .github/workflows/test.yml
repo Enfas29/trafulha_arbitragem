@@ -40,3 +40,6 @@ jobs:
 
       - name: Testar fluxo integral do Paper V12 (offline)
         run: python test_integration_v12.py
+
+      - name: Verificar isolamento das chaves API (offline)
+        run: python test_security_v12.py
