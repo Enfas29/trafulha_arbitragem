@@ -30,6 +30,11 @@ DB = os.getenv("MONITOR_DB", "monitor_v11.sqlite3")
 INTERVAL = max(10, int(os.getenv("MONITOR_INTERVAL_SECONDS", "20")))
 CATALOG_INTERVAL = max(180, int(os.getenv("MONITOR_CATALOG_SECONDS", "600")))
 MAX_PAIRS = min(60, max(1, int(os.getenv("MONITOR_PAIRS_PER_PASS", "15"))))
+# Reação a eventos WS: 2s entre ciclos para evitar tempestades de pedidos REST.
+# NÃO é promessa de execução <10s, nem habilita apostas reais/virtuais LIVE.
+WS_REACT_GAP_SECONDS = min(10.0, max(
+    1.0, float(os.getenv("MONITOR_WS_REACT_GAP_SECONDS", "2.0"))
+))
 ALERT_COOLDOWN = max(300, int(os.getenv("MONITOR_ALERT_COOLDOWN_SECONDS", "1800")))
 SUMMARY_INTERVAL = max(3600, int(os.getenv("MONITOR_SUMMARY_SECONDS", "21600")))
 OUTAGE_THRESHOLD = max(900, int(os.getenv("MONITOR_OUTAGE_SECONDS", "1800")))
@@ -227,6 +232,7 @@ def select_pairs(pairs):
 
 
 def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None, hot_sx_hashes=None, hot_poly_assets=None):
+    scan_started = time.monotonic()
     if not pairs:
         return {"checked": 0, "priced": 0, "positive": 0, "signals": 0,
                 "next_offset": 0, "best": None}
@@ -244,6 +250,8 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None, hot_sx_hashe
         seen = {p["key"] for p in priority}
         window = (priority + [p for p in window if p["key"] not in seen])[:MAX_PAIRS]
     checked = priced = positive = signals = 0
+    hot_checked = 0
+    book_max_ms = 0.0
     best = None
     now = time.time()
 
@@ -257,9 +265,15 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None, hot_sx_hashe
         if start <= now and not sx["live_enabled"]:
             continue
         checked += 1
+        is_hot = (sx["hash"] in (hot_sx_hashes or set())
+                  or pair["poly_asset"] in (hot_poly_assets or set()))
+        if is_hot:
+            hot_checked += 1
+        book_started = time.monotonic()
         try:
             poly_levels, t_poly = bot.poly_book(pair["poly_asset"])
             sx_levels, t_sx = bot.sx_book(sx["hash"], pair["sx_target"])
+            book_max_ms = max(book_max_ms, 1000 * (time.monotonic() - book_started))
             stage = "APOS_INICIO_NAO_CONFIRMADO" if start <= now else "PRE_JOGO"
             quote, hypothetical = insert_observation(
                 conn, pair, stage, poly_levels, sx_levels,
@@ -301,15 +315,19 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None, hot_sx_hashe
                             odds_sx=1.0 / min(p for p, _ in sx_levels),
                         ))
         except Exception as exc:
+            book_max_ms = max(book_max_ms, 1000 * (time.monotonic() - book_started))
             LOG.warning(
                 "Book falhou em %s (%s)",
                 pair["key"][:35], type(exc).__name__,
             )
     LOG.info(
         "SCAN | direções=%d | preços válidos=%d | margens positivas=%d "
-        "| sinais=%d | melhor buffer=%s",
+        "| sinais=%d | melhor buffer=%s | duracao_ms=%d "
+        "| maior_leitura_ms=%d | sinais_WS_verificados=%d",
         checked, priced, positive, signals,
         f"{best:+.2f}%" if best is not None else "N/D",
+        round(1000 * (time.monotonic() - scan_started)),
+        round(book_max_ms), hot_checked,
     )
     return {"checked": checked, "priced": priced, "positive": positive,
             "signals": signals, "next_offset": new_offset, "best": best}
@@ -472,6 +490,11 @@ def catalog():
 def self_test():
     import tempfile
 
+    # Evento WS não pode impor os 8 segundos adicionais da versão antiga.
+    assert websocket_reaction_pause(0.1, True, 2.0) == 1.9
+    assert websocket_reaction_pause(2.5, True, 2.0) == 0.0
+    assert websocket_reaction_pause(0.1, False, 2.0) == 0.0
+
     assert abs(normalize_quote([(0.45, 30)], [(0.50, 30)])[1] - 5.26315789) < 0.0001
     assert normalize_quote([(0.55, 30)], [(0.52, 30)])[2] < 0
     assert normalize_quote([], [(0.5, 10)]) is None
@@ -516,6 +539,13 @@ def self_test():
     print("✅ Monitor V11: testes locais OK (sem APIs, sem apostas)")
 
 
+def websocket_reaction_pause(elapsed_seconds, wake_received, min_gap=WS_REACT_GAP_SECONDS):
+    """Só aplicar pausa curta após atualização WS; demais ciclos são periódicos."""
+    if not wake_received:
+        return 0.0
+    return max(0.0, min_gap - elapsed_seconds)
+
+
 def main(once=False):
     fx = float(os.getenv("EUR_PER_USD", "0") or "0")
     if fx < 0 or fx > 10:
@@ -544,6 +574,12 @@ def main(once=False):
                  "1000 EUR virtuais por plataforma, "
                  "máximo 100 EUR total por operação, sem apostas reais.",
                  100 * paper.MIN_NET_ROI)
+    LOG.info(
+        "WS FAST: janela de reação %.1fs; %d direções por passagem; "
+        "prioridade a no máximo 2 sinais WS; REST valida sempre os livros. "
+        "Sem garantia de execução de apostas.",
+        WS_REACT_GAP_SECONDS, MAX_PAIRS,
+    )
     pairs, cursor = [], 0
     last_catalog = 0.0
     iteration = 0
@@ -598,17 +634,23 @@ def main(once=False):
             else:
                 # Polling de eventos de ambas as fontes; REST continua obrigatório.
                 deadline = time.monotonic() + wait_seconds
+                wake_received = False
                 while time.monotonic() < deadline:
                     if ((ws_feed is not None and ws_feed.wake.is_set())
                             or (poly_feed is not None and poly_feed.wake.is_set())):
+                        wake_received = True
                         break
                     remaining = max(0.0, deadline - time.monotonic())
                     if remaining <= 0:
                         break
-                    time.sleep(min(1.0, remaining))
+                    # Antes dormia 1s e forçava 8s mínimos mesmo após WS.
+                    # Agora: reação em ~100ms (mais a duração das APIs REST),
+                    # com um mínimo de 2s entre scans acionados pelo WS.
+                    time.sleep(min(0.1, remaining))
                 elapsed = time.monotonic() - started
-                if elapsed < 8.0:
-                    time.sleep(8.0 - elapsed)
+                pause = websocket_reaction_pause(elapsed, wake_received)
+                if pause > 0:
+                    time.sleep(pause)
     except KeyboardInterrupt:
         LOG.info("Monitor interrompido.")
     finally:
