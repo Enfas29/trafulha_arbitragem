@@ -165,6 +165,33 @@ def gamma_market_category(m, teams):
     return explicit[0]
 
 
+def unique_pick(picks, conflicts, label, asset, market, outcome,
+                gamma_price=None, market_id=None):
+    """Nunca escolher arbitrariamente entre dois tokens para o mesmo 1/X/2."""
+    if label in conflicts:
+        return
+    item = {
+        "asset": str(asset), "market": str(market),
+        "outcome": str(outcome), "gamma_price": gamma_price,
+        "market_id": str(market_id or ""),
+    }
+    previous = picks.get(label)
+    if previous is not None and previous["asset"] != item["asset"]:
+        picks.pop(label, None)
+        conflicts.add(label)
+        return
+    picks[label] = item
+
+
+def optional_gamma_probability(m, index):
+    values = parse_list(m.get("outcomePrices"))
+    try:
+        p = float(values[index])
+        return p if 0 < p < 1 and math.isfinite(p) else None
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
 def poly_soccer_events(now=None):
     now = time.time() if now is None else now
     sports = bot.get_json(bot.POLY_GAMMA + "/sports")
@@ -205,6 +232,7 @@ def poly_soccer_events(now=None):
                 continue
             seen.add(key)
             picks = {}
+            ambiguous = set()
             for m in event.get("markets") or []:
                 if m.get("closed") or m.get("active") is False:
                     continue
@@ -222,9 +250,13 @@ def poly_soccer_events(now=None):
                 if len(outcomes) >= 3:
                     for idx, outcome in enumerate(outcomes):
                         label = category(outcome, teams)
-                        if label and label not in picks:
-                            picks[label] = {"asset": str(assets[idx]),
-                                            "market": title}
+                        if label:
+                            unique_pick(
+                                picks, ambiguous, label, assets[idx],
+                                title, outcome,
+                                optional_gamma_probability(m, idx),
+                                m.get("id"),
+                            )
                     continue
                 # Caso B: três mercados binários separados, um para
                 # equipa da casa, outro para empate e outro para visitante.
@@ -237,10 +269,12 @@ def poly_soccer_events(now=None):
                     (i for i, x in enumerate(outcomes)
                      if bot.ascii_name(x) == "yes"), None
                 )
-                if idx is not None and label not in picks:
-                    picks[label] = {
-                        "asset": str(assets[idx]), "market": title,
-                    }
+                if idx is not None:
+                    unique_pick(
+                        picks, ambiguous, label, assets[idx], title,
+                        outcomes[idx], optional_gamma_probability(m, idx),
+                        m.get("id"),
+                    )
             if picks:
                 events.append({
                     "id": key, "teams": teams, "start": start,
@@ -652,6 +686,12 @@ def tests():
         "question": "Will Man City vs Fulham end in a draw?"
     }, football) != "away"
 
+    picks, collisions = {}, set()
+    unique_pick(picks, collisions, "draw", "yes-draw", "market1", "Yes", 0.2)
+    unique_pick(picks, collisions, "draw", "other-draw", "market2", "Yes", 0.3)
+    assert "draw" in collisions and "draw" not in picks
+    unique_pick(picks, collisions, "draw", "new-draw", "market3", "Yes", 0.3)
+    assert "draw" not in picks
     assert category("Not Team Beta", p["teams"]) is None
     assert category("Team Alpha", p["teams"]) == "home"
     assert category("Team Beta", p["teams"]) == "away"
