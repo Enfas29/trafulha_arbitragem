@@ -245,6 +245,47 @@ de ser iguais porque são preços para resultados **opostos**. E a melhor
 odd pode diferir da odd efetiva ao consumir vários níveis de liquidez.
 As odds observadas são um instante e podem mudar no site segundos depois.
 
+## V12: prioridade WebSocket e cache curta de eventos (sem cache de odds)
+
+A atualização liga a fila `ws_priority_v12.py` ao scanner contínuo:
+
+- Cada notificação WS guarda apenas `id de mercado/token` e um instante
+  **monotónico**, nunca o preço.
+- Eventos repetidos do mesmo mercado são coalescidos e têm validade
+  limitada a 20 segundos. Sinais antigos são descartados.
+- Até **4 direções sinalizadas** são verificadas antes dos restantes
+  candidatos em cada passagem. Há sempre posições reservadas para a
+  rotação REST, para não deixar os outros mercados esquecidos.
+- Ambas as plataformas são sempre consultadas novamente via REST; nenhuma
+  odd em cache pode desencadear apostas virtuais.
+- `WS_LATENCY` nos Deploy Logs mede os intervalos
+  `evento_ate_inicio_ms_max`, `REST_ms_max`,
+  `evento_ate_validacao_ms_max` e `evento_ate_decisao_ms_max`.
+  O evento medido é o **instante em que o robô recebe a mensagem WS**,
+  não o instante original da alteração no mercado.
+- `SCAN` continua a mostrar total de direções, preços, duração da
+  passagem e quantas verificações foram acionadas por sinais WS.
+- Variáveis opcionais: `MONITOR_WS_PRIORITY_MAX=4` (limite máximo de
+  6) e `MONITOR_WS_EVENT_TTL_SECONDS=20` (5 a 60 segundos).
+  **Não é necessário alterá-las** para ativar esta melhoria.
+- As subscrições continuam limitadas aos mercados observados nas fontes;
+  o conjunto inteiro não está garantidamente monitorizado por WS.
+- Sem execução real, sem simulação automática em jogo ao vivo por defeito,
+  e sem promessas de execução em menos de dez segundos.
+
+No Railway, após um deployment bem-sucedido, consultar os logs:
+`WS PRIORITY:`, `WS_LATENCY |` e `SCAN |`.
+
+Autotestes offline (não requerem tokens):
+
+    python ws_priority_v12.py
+    python poly_ws_v12.py
+    python sx_ws_v12.py
+    python monitor_v11.py --self-test
+
+**Não abrir uma segunda cópia do monitor no Console se o serviço já estiver
+a correr**; isso duplica pedidos às APIs e pode partilhar a mesma SQLite.
+
 ## Reação rápida às mudanças de odds — testes de latência
 
 O `monitor_v11.py` foi ajustado para reduzir a latência de **deteção**:
