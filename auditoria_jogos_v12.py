@@ -133,9 +133,6 @@ def poly_soccer_events(now=None):
                     continue
                 if not bot.is_poly_moneyline(m):
                     continue
-                label = gamma_market_category(m, teams)
-                if label is None:
-                    continue
                 outcomes = parse_list(m.get("outcomes"))
                 assets = parse_list(
                     m.get("positionIds") if m.get("version") == "v2"
@@ -143,24 +140,29 @@ def poly_soccer_events(now=None):
                 )
                 if len(outcomes) != len(assets):
                     continue
-                # 3 tokens explicit; ou 3 mercados independentes SIM/NÃO.
-                idx = None
-                if len(outcomes) == 2 and {
-                    bot.ascii_name(x) for x in outcomes
-                } == {"yes", "no"}:
-                    idx = next(
-                        (i for i, x in enumerate(outcomes)
-                         if bot.ascii_name(x) == "yes"), None
-                    )
-                elif len(outcomes) >= 3:
-                    idx = next((i for i, x in enumerate(outcomes)
-                                if category(x, teams) == label), None)
-                if idx is None:
+                title = str(m.get("question") or m.get("title") or name)
+                # Caso A: um único mercado 1X2 com três resultados explícitos.
+                if len(outcomes) >= 3:
+                    for idx, outcome in enumerate(outcomes):
+                        label = category(outcome, teams)
+                        if label and label not in picks:
+                            picks[label] = {"asset": str(assets[idx]),
+                                            "market": title}
                     continue
-                if label not in picks:
+                # Caso B: três mercados binários separados, um para
+                # equipa da casa, outro para empate e outro para visitante.
+                label = gamma_market_category(m, teams)
+                if label is None or len(outcomes) != 2:
+                    continue
+                if {bot.ascii_name(x) for x in outcomes} != {"yes", "no"}:
+                    continue
+                idx = next(
+                    (i for i, x in enumerate(outcomes)
+                     if bot.ascii_name(x) == "yes"), None
+                )
+                if idx is not None and label not in picks:
                     picks[label] = {
-                        "asset": str(assets[idx]),
-                        "market": str(m.get("question") or m.get("title") or name),
+                        "asset": str(assets[idx]), "market": title,
                     }
             if picks:
                 events.append({
@@ -465,6 +467,9 @@ def tests():
     assert gamma_market_category(
         {"groupItemTitle": "Draw"}, p["teams"]
     ) == "draw"
+    assert category("Not Team Beta", p["teams"]) is None
+    assert category("Team Alpha", p["teams"]) == "home"
+    assert category("Team Beta", p["teams"]) == "away"
     msg = soccer_message(
         {"poly": p, "sx": sx},
         {"home": 2.1, "draw": 3.4}, {"home": 2.2},
