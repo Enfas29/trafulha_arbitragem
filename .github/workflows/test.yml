@@ -49,3 +49,6 @@ jobs:
 
       - name: Testar dois avisos e carteiras fictícias (offline)
         run: python demonstracao_carteiras_v12.py --self-test
+
+      - name: Testar auditoria de varios jogos e futebol 1X2 (offline)
+        run: python auditoria_jogos_v12.py --self-test
