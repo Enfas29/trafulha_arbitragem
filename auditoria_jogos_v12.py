@@ -442,15 +442,24 @@ def send(text):
     return True
 
 
-def run_soccer(count, conn):
+def run_soccer(count, conn, requested_match=None, recheck=False):
     poly = poly_soccer_events()
     sx = sx_soccer_events()
     matches = soccer_matches(poly, sx)
+    if requested_match:
+        requested = bot.parse_title(requested_match)
+        if requested is None:
+            print("⚠️ Usa --match com formato 'Equipa A vs Equipa B'.")
+            return 2
+        matches = [
+            pair for pair in matches
+            if match_teams(*pair["poly"]["teams"], *requested)
+        ]
     print(f"⚽ Jogos identificados nas DUAS plataformas: {len(matches)}")
     sent, examined = 0, 0
     for match in matches:
         key = "soccer:" + match["poly"]["id"]
-        if was_sent(conn, key):
+        if was_sent(conn, key) and not recheck:
             continue
         examined += 1
         pp = poly_soccer_prices(match["poly"])
@@ -540,6 +549,8 @@ def tests():
     assert len(soccer_matches([p], sx, now)) == 1
     assert not soccer_matches([p], [{**sx[0], "start": now + 7200}], now)
     assert not soccer_matches([p], [{**sx[0], "teams": ("Other", "Another")}], now)
+    assert match_teams("Man City", "Fulham", "Manchester City", "Fulham")
+    assert not match_teams("Man City", "Napoli", "Manchester City", "Fulham")
     assert category("Team Alpha", p["teams"]) == "home"
     assert category("Team Beta", p["teams"]) == "away"
     assert category("Draw", p["teams"]) == "draw"
@@ -675,6 +686,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sport", choices=SPORTS, default="soccer")
     ap.add_argument("--count", type=int, default=3)
+    ap.add_argument("--match", type=str, default=None,
+                    help="Futebol: filtrar confronto 'Man City vs Fulham'")
+    ap.add_argument("--recheck", action="store_true",
+                    help="Repetir um jogo já verificado sem alterar saldos")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:
@@ -687,7 +702,12 @@ def main():
     conn = db_open()
     try:
         if args.sport == "soccer":
-            return run_soccer(args.count, conn)
+            return run_soccer(
+                args.count, conn, requested_match=args.match,
+                recheck=args.recheck
+            )
+        if args.match:
+            ap.error("--match só se aplica a --sport soccer")
         return run_standard(args.sport, args.count, conn)
     finally:
         conn.close()
