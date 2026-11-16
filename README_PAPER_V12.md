@@ -136,12 +136,14 @@ com resultados opostos e consulta os livros de ordens REST das duas plataformas.
 Se houver liquidez suficiente e as leituras estiverem próximas no tempo,
 envia **uma única mensagem** para Telegram com:
 
-- Evento, hora, desporto e lados exatos escolhidos;
-- Melhor odd decimal em cada plataforma, preço observado e odd efetiva
-  estimada para a quantidade do teste;
-- Dois valores hipotéticos com **10 € no máximo, no conjunto**;
-- Margem condicional, **incluindo margens negativas** e reservas adversas;
-- Hora UTC e diferença entre os instantes de leitura.
+- Dois blocos separados: **1️⃣ POLYMARKET** e **2️⃣ SX BET**;
+  cada bloco mostra claramente equipa, odd da API e valor virtual;
+- Odds arredondadas a **duas casas e com vírgula decimal** para leitura,
+  por exemplo 1,09. A amostra SQLite mantém o valor numérico original;
+- Valor total do ensaio até 10 €; resultado condicional, incluindo perdas;
+- Aviso **MARGEM NEGATIVA — NÃO APOSTAR**, quando aplicável;
+- Horas de início de cada plataforma quando diferirem, e hora da leitura;
+- Texto simples na consola e versão Telegram com títulos a negrito.
 
 O ensaio NÃO depende do limiar de +1,5% da carteira principal e **não coloca
 ordens**, não altera os 1.000 € virtuais de cada plataforma e não apresenta
@@ -182,3 +184,9 @@ Não armazenar chaves privadas de carteira no Railway para esta versão.
 - SX Bet — API/WebSocket: https://blog.sx.bet/developers/tutorials/building-on-sx-bet-api-websocket-mcp/
 - SX Bet — regras de ténis: https://help.sx.bet/en/articles/5090684-tennis-betting-rules
 - SX Bet — regras gerais: https://help.sx.bet/en/articles/3613418-general-betting-rules
+
+Uma diferença entre a odd apresentada no browser e a odd do Telegram não
+prova necessariamente erro: são observações em instantes diferentes. O teste
+indica que o valor vem do livro REST; confirmar ambos no mesmo instante
+antes de confiar no preço. A odd média para consumir vários níveis de
+liquidez pode diferir da melhor odd exibida.
