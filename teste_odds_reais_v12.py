@@ -11,6 +11,7 @@ Offline:         python teste_odds_reais_v12.py --self-test
 from __future__ import annotations
 
 import argparse
+import html
 import os
 import sqlite3
 import time
@@ -108,35 +109,78 @@ def make_snapshot(pair, poly_levels, sx_levels, poly_time, sx_time, fx):
     }
 
 
-def format_message(snapshot):
+def format_eur(value):
+    """Formato português: 8,89 € em vez de 8.89€."""
+    return f"{float(value):.2f}".replace(".", ",") + " €"
+
+
+def format_odd(value):
+    """Odds decimais, tal como no site: duas casas."""
+    return f"{float(value):.2f}".replace(".", ",")
+
+
+def format_message(snapshot, html_mode=False):
+    """Uma mensagem clara: plataforma, equipa, odd e montante simulado."""
     pair = snapshot["pair"]
     quote = snapshot["quote"]
-    sx = pair["sx"]
-    first, second = sx["teams"]
-    start = datetime.fromtimestamp(
-        float(sx["start"]), timezone.utc
-    ).strftime("%d/%m %H:%M UTC")
-    stage = "pré-jogo" if float(sx["start"]) > time.time() else "após início"
+    sx, poly = pair["sx"], pair["poly"]
     observed = datetime.fromisoformat(
         snapshot["observed_at"]
-    ).strftime("%H:%M:%S UTC")
-    return "\n".join([
-        "🧪 TESTE DE ODDS REAIS · V12",
-        f"🏟️ {sx['sport']}: {first} vs {second}",
-        f"⏰ {start} · {stage}",
-        f"🔵 Poly ({pair['poly_label']}): {snapshot['best_poly_odd']:.3f}",
-        f"🟣 SX ({pair['sx_label']}): {snapshot['best_sx_odd']:.3f}",
-        f"📚 Odd para teste ~{quote.total_eur:.2f}€:",
-        f"Poly {snapshot['poly_effective_odd']:.3f} | "
-        f"SX {snapshot['sx_effective_odd']:.3f}",
-        f"💶 Teste: Poly {quote.poly_debit_cents/100:.2f}€ + "
-        f"SX {quote.sx_debit_cents/100:.2f}€",
-        f"📊 Margem condicional: {quote.roi*100:+.2f}% "
-        f"({quote.profit_eur:+.2f}€)",
-        f"🕒 {observed} · diferença de leitura {snapshot['skew_sec']:.1f}s",
-        "🔒 Sem apostas nem débitos virtuais. "
-        "Odds podem mudar; liquidação por validar.",
-    ])
+    ).astimezone(timezone.utc).strftime("%d/%m %H:%M:%S UTC")
+
+    def show(value):
+        return html.escape(str(value), quote=False) if html_mode else str(value)
+
+    def strong(value):
+        value = show(value)
+        return f"<b>{value}</b>" if html_mode else value
+
+    poly_start = datetime.fromtimestamp(
+        float(poly["start"]), timezone.utc
+    ).strftime("%H:%M")
+    sx_start = datetime.fromtimestamp(
+        float(sx["start"]), timezone.utc
+    ).strftime("%H:%M")
+    difference = abs(float(poly["start"]) - float(sx["start"]))
+    start = "⏰ Início: " + sx_start + " UTC"
+    if difference >= 60:
+        start = (
+            f"⏰ Início: Poly {poly_start} | SX {sx_start} UTC"
+            "\n⚠️ Horários diferentes — confirmar o mesmo jogo"
+        )
+
+    verdict = (
+        strong("⛔ MARGEM NEGATIVA — NÃO APOSTAR")
+        if quote.conditional_profit_cents <= 0 else
+        strong("🔎 Margem positiva estimada — NÃO EXECUTADO")
+    )
+    lines = [
+        f"🧪 {strong('TESTE DE ODDS REAIS · V12')}",
+        f"🎾 {strong(' vs '.join(sx['teams']))}",
+        start,
+        "",
+        f"1️⃣ {strong('POLYMARKET')}",
+        f"Equipa: {strong(pair['poly_label'])}",
+        f"Odd na API: {strong(format_odd(snapshot['best_poly_odd']))}"
+        f" ({round(snapshot['poly_price'] * 100):d}¢)",
+        f"Valor virtual: {strong(format_eur(quote.poly_debit_cents / 100))}",
+        "",
+        f"2️⃣ {strong('SX BET')}",
+        f"Equipa: {strong(pair['sx_label'])}",
+        f"Odd na API: {strong(format_odd(snapshot['best_sx_odd']))}",
+        f"Valor virtual: {strong(format_eur(quote.sx_debit_cents / 100))}",
+        "",
+        f"💶 Total do teste: {strong(format_eur(quote.total_eur))}",
+        f"📊 Resultado estimado: {strong(format_eur(quote.profit_eur))} "
+        f"({quote.roi * 100:+.2f}%)",
+        verdict,
+        "",
+        f"🕒 Leitura: {observed}",
+        "ℹ️ Odd lida no livro REST; pode diferir da página noutro instante.",
+        "🔒 Sem apostas nem débitos virtuais.",
+    ]
+    return "\n".join(lines)
+
 
 
 def record_snapshot(snapshot, path=TEST_DB):
@@ -187,7 +231,7 @@ def record_snapshot(snapshot, path=TEST_DB):
         conn.close()
 
 
-def send_telegram(message):
+def send_telegram(message, html_mode=False):
     """Verificação do envio sem revelar token em erros da API."""
     if not (bot.TG_TOKEN and bot.TG_CHAT):
         print("⚠️ Telegram não configurado: mostrarei o teste apenas na consola.")
@@ -199,6 +243,7 @@ def send_telegram(message):
             json={
                 "chat_id": bot.TG_CHAT,
                 "text": message,
+                "parse_mode": "HTML" if html_mode else None,
                 "disable_web_page_preview": True,
             },
             timeout=12,
@@ -237,7 +282,7 @@ def run_once():
         msg = format_message(snapshot)
         print("\n"+msg)
         print(f"\n✅ Amostra #{record_id} guardada numa base separada.")
-        print("✅ Telegram enviado." if send_telegram(msg)
+        print("✅ Telegram enviado." if send_telegram(format_message(snapshot, html_mode=True), html_mode=True)
               else "ℹ️ Consulta a mensagem na consola.")
         return 0
     print("⚠️ Sem livros comparáveis e com liquidez suficiente nesta amostra.")
@@ -275,6 +320,15 @@ def self_test():
     assert "TESTE DE ODDS REAIS" in msg
     assert "Team A" in msg and "Team B" in msg
     assert "Sem apostas nem débitos virtuais" in msg
+    assert "POLYMARKET" in msg and "SX BET" in msg
+    assert "Equipa: Team A" in msg and "Equipa: Team B" in msg
+    assert "Valor virtual:" in msg
+    assert "MARGEM NEGATIVA" in msg
+    assert "Odd na API: 2,13" in msg
+    assert "Odd na API: 1,79" in msg
+    rich = format_message(snap, html_mode=True)
+    assert "<b>POLYMARKET</b>" in rich
+    assert "<b>Team A</b>" in rich and "<b>Team B</b>" in rich
     with tempfile.TemporaryDirectory() as d:
         path = str(Path(d) / "test.sqlite3")
         assert record_snapshot(snap, path) == 1
