@@ -412,7 +412,26 @@ def run_soccer(count, conn):
     return 0 if sent else 2
 
 
+def previous_single_test_events():
+    """Excluir também o confronto do teste isolado anterior, se existir."""
+    path = Path(single.TEST_DB)
+    if not path.is_file():
+        return set()
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+        try:
+            rows = conn.execute(
+                "SELECT poly_market,sx_market FROM test_odds_snapshots"
+            ).fetchall()
+            return {(str(p), str(s)) for p, s in rows}
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError):
+        return set()
+
+
 def run_standard(sport, count, conn):
+    previously_tested = previous_single_test_events()
     poly = bot.discover_poly()
     sx = bot.discover_sx()
     pairs = single.choose_pairs(poly, sx)
@@ -421,6 +440,8 @@ def run_standard(sport, count, conn):
         if pair["sx"]["sport"] != sport:
             continue
         key = "standard:" + str(pair["poly"]["id"]) + ":" + str(pair["sx"]["hash"])
+        if (str(pair["poly"]["id"]), str(pair["sx"]["hash"])) in previously_tested:
+            continue
         if key in seen or was_sent(conn, key):
             continue
         seen.add(key)
@@ -479,6 +500,7 @@ def tests():
     assert "Empate: 3,40" in msg
     assert "NÃO significa" in msg
     assert "Sem apostas ou débitos" in msg
+    assert isinstance(previous_single_test_events(), set)
     with tempfile.TemporaryDirectory() as tmp:
         conn = db_open(str(Path(tmp) / "audit.sqlite3"))
         assert not was_sent(conn, "soccer:soc-1")
