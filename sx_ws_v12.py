@@ -181,7 +181,16 @@ def self_test():
     asyncio.run(listener.on_publication(None))
     assert f.take_hot() == {"c"}
     assert f.received_events == 2
-    print("✅ SX WS V12: eventos, subscrição e handler compatíveis (offline)")
+
+    # Verificar também a classe REAL instalada em requirements.txt.
+    from centrifuge import SubscriptionEventHandler
+    official = make_subscription_handler(
+        SubscriptionEventHandler, "c", f.signal
+    )
+    asyncio.run(official.on_publication(None))
+    assert f.take_hot() == {"c"}
+    assert f.received_events == 3
+    print("✅ SX WS V12: eventos e handler oficial centrifuge-python OK (offline)")
 
 
 if __name__ == "__main__":
