@@ -241,6 +241,13 @@ as horas de leitura UTC e:
 - A auditoria só aceita SX em 1X2 quando encontra `Equipa / Not Equipa`
   ou `Tie / Not Tie`. Não aceita pares `Equipa A / Equipa B`,
   handicaps, mercados 2-way ou resultados contraditórios.
+- A SX Bet usa **type=1** para o 1X2 desdobrado em contratos
+  `Equipa/Not Equipa` e `Tie/Not Tie`. **type=52 não é o 1X2**:
+  o filtro anterior excluía as três linhas corretas e devolvia zero.
+  A consulta agora filtra `type=1` e apresenta contadores de rejeição
+  (desporto, horário, estado, equipas, resultado) se não houver confrontos.
+  O scanner contínuo V12 mantém futebol EXCLUÍDO das operações virtuais,
+  até as regras de 1X2 serem validadas.
 - Os tokens Poly com classificações ambíguas são excluídos; nunca
   escolhe uma odd arbitrária para casa, empate ou fora.
 
