@@ -470,6 +470,31 @@ def poly_soccer_prices(poly, diagnostics=None):
     return prices
 
 
+def sx_public_best_odds(market_hash, affirmative_index):
+    """Endpoint opcional de melhores odds SX, independente da leitura do livro.
+
+    Segundo a documentação SX, bestBettingOdds usa probabilidade x 10^12
+    e índices de resultado 1/2. Se o formato não corresponder, omitir.
+    """
+    try:
+        payload = bot.get_json(bot.SX_API + "/orders/odds/best", {
+            "marketHash": market_hash
+        }, timeout=7)
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        back = data.get("bestBettingOdds") if isinstance(data, dict) else None
+        if not isinstance(back, dict):
+            return None
+        number = back.get(str(affirmative_index+1))
+        if number is None:
+            number = back.get(affirmative_index+1)
+        implied = float(number) / 1e12
+        if not (0 < implied < 1 and math.isfinite(implied)):
+            return None
+        return 1 / implied
+    except Exception:
+        return None
+
+
 def sx_soccer_prices(sx_markets, teams, diagnostics=None):
     prices = {}
     # Só mercados 1X2 explicitamente emparelhados com o seu 'Not X'.
@@ -495,6 +520,7 @@ def sx_soccer_prices(sx_markets, teams, diagnostics=None):
                         "outcomes": tuple(market["outcomes"]),
                         "positive_index": index,
                         "best_price": best_price,
+                        "sx_public_best": sx_public_best_odds(market["hash"], index),
                         "read_utc": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
                     }
         except Exception as exc:
@@ -556,9 +582,14 @@ def diagnostics_message(poly_details, sx_details):
             lines.append(f"  Livro indisponível: {info['error']}")
             continue
         lines.append(
-            "  BUY (taker): " +
+            "  BUY (taker) pelo livro: " +
             (single.format_odd(1/info["best_price"])
              if info.get("best_price") else "indisponível")
+        )
+        best = info.get("sx_public_best")
+        lines.append(
+            "  API SX melhor odd: " +
+            (single.format_odd(best) if best else "indisponível")
         )
         lines.append(
             f"  Tipo: {info.get('type')} | "
@@ -875,7 +906,8 @@ def tests():
     assert "Exibição site estimada: 52.00¢" in explained
     assert "BUY (ask): 54.00¢" in explained
     assert "Token: poly-token" in forensic
-    assert "BUY (taker): 1,92" in forensic
+    assert "BUY (taker) pelo livro: 1,92" in forensic
+    assert "API SX melhor odd: indisponível" in forensic
     assert "NÃO significa" in msg
     assert "Sem apostas ou débitos" in msg
     assert isinstance(previous_single_test_events(), set)
