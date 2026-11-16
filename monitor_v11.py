@@ -295,34 +295,11 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None, hot_sx_hashe
                             shadow_quote.total_eur, shadow_quote.profit_eur,
                             100 * shadow_quote.roi,
                         )
-                        best_poly_odd = 1.0 / min(p for p, _ in poly_levels)
-                        best_sx_odd = 1.0 / min(p for p, _ in sx_levels)
-                        def money(amount):
-                            return f"{amount:.2f}".replace(".", ",") + " €"
-
-                        def odd(value):
-                            return f"{value:.2f}".replace(".", ",")
-
-                        telegram(
-                            f"🧪 PAPER V12 #{shadow_id} · SÓ SIMULAÇÃO\n"
-                            f"🏟️ {' vs '.join(sx['teams'])}\n"
-                            "\n"
-                            "1️⃣ POLYMARKET\n"
-                            f"Equipa: {pair['poly_label']}\n"
-                            f"Odd na API: {odd(best_poly_odd)}\n"
-                            f"Valor virtual: {money(shadow_quote.poly_debit_cents / 100)}\n"
-                            "\n"
-                            "2️⃣ SX BET\n"
-                            f"Equipa: {pair['sx_label']}\n"
-                            f"Odd na API: {odd(best_sx_odd)}\n"
-                            f"Valor virtual: {money(shadow_quote.sx_debit_cents / 100)}\n"
-                            "\n"
-                            f"💶 Total virtual: {money(shadow_quote.total_eur)}\n"
-                            f"📈 Lucro estimado: {money(shadow_quote.profit_eur)} "
-                            f"({100 * shadow_quote.roi:+.2f}%)\n"
-                            "⚠️ Margem condicional; execução e liquidação não verificadas.\n"
-                            "🔒 NENHUMA APOSTA REAL"
-                        )
+                        telegram(paper.format_open_message(
+                            paper_conn, shadow_id,
+                            odds_poly=1.0 / min(p for p, _ in poly_levels),
+                            odds_sx=1.0 / min(p for p, _ in sx_levels),
+                        ))
         except Exception as exc:
             LOG.warning(
                 "Book falhou em %s (%s)",
@@ -411,8 +388,10 @@ def send_summary(conn, catalog_count, startup=False, now_epoch=None, paper_conn=
         message += (
             f"\n🧾 Paper: {totals['open_trades']} abertas · "
             f"{totals['settled']} liquidadas"
-            f"\n💰 Livre: Poly {totals['poly_free_eur']:.2f}€ | "
-            f"SX {totals['sx_free_eur']:.2f}€"
+            f"\n💰 Polymarket: {paper.eur(int(round(totals['poly_free_eur'] * 100)))} livres"
+            f"\n💰 SX Bet: {paper.eur(int(round(totals['sx_free_eur'] * 100)))} livres"
+            f"\n🔒 Em operações abertas: {paper.eur(int(round(totals['exposure_eur'] * 100)))}"
+            f"\n📈 Resultado realizado: {paper.eur(int(round(totals['realized_eur'] * 100)))}"
             "\n⚠️ Saldos virtuais"
         )
     telegram(message)
