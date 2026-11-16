@@ -119,7 +119,7 @@ def format_odd(value):
     return f"{float(value):.2f}".replace(".", ",")
 
 
-def format_message(snapshot, html_mode=False):
+def format_message(snapshot, html_mode=False, balances=None):
     """Uma mensagem clara: plataforma, equipa, odd e montante simulado."""
     pair = snapshot["pair"]
     quote = snapshot["quote"]
@@ -171,6 +171,12 @@ def format_message(snapshot, html_mode=False):
         f"Valor virtual: {strong(format_eur(quote.sx_debit_cents / 100))}",
         "",
         f"💶 Total do teste: {strong(format_eur(quote.total_eur))}",
+        "",
+        "💰 CARTEIRAS VIRTUAIS (SEM DÉBITOS NESTE TESTE)",
+        (f"Polymarket: {strong(format_eur(balances['poly'] / 100))}"
+         if balances else "Polymarket: saldo não disponível"),
+        (f"SX Bet: {strong(format_eur(balances['sx'] / 100))}"
+         if balances else "SX Bet: saldo não disponível"),
         f"📊 Resultado estimado: {strong(format_eur(quote.profit_eur))} "
         f"({quote.roi * 100:+.2f}%)",
         verdict,
@@ -231,6 +237,22 @@ def record_snapshot(snapshot, path=TEST_DB):
         conn.close()
 
 
+def read_wallet_balances():
+    """Consulta APENAS de leitura da carteira V12; não cria nem altera saldos."""
+    path = Path(paper.PAPER_DB)
+    if not path.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=3)
+        try:
+            values = paper.free_balances(conn)
+            return values if "poly" in values and "sx" in values else None
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError):
+        return None
+
+
 def send_telegram(message, html_mode=False):
     """Verificação do envio sem revelar token em erros da API."""
     if not (bot.TG_TOKEN and bot.TG_CHAT):
@@ -279,10 +301,11 @@ def run_once():
             print(f"Livro {idx}: indisponível ({type(exc).__name__}).", flush=True)
             continue
         record_id = record_snapshot(snapshot)
-        msg = format_message(snapshot)
+        balances = read_wallet_balances()
+        msg = format_message(snapshot, balances=balances)
         print("\n"+msg)
         print(f"\n✅ Amostra #{record_id} guardada numa base separada.")
-        print("✅ Telegram enviado." if send_telegram(format_message(snapshot, html_mode=True), html_mode=True)
+        print("✅ Telegram enviado." if send_telegram(format_message(snapshot, html_mode=True, balances=balances), html_mode=True)
               else "ℹ️ Consulta a mensagem na consola.")
         return 0
     print("⚠️ Sem livros comparáveis e com liquidez suficiente nesta amostra.")
@@ -323,6 +346,12 @@ def self_test():
     assert "POLYMARKET" in msg and "SX BET" in msg
     assert "Equipa: Team A" in msg and "Equipa: Team B" in msg
     assert "Valor virtual:" in msg
+    with_balances = format_message(
+        snap, balances={"poly": 100_000, "sx": 100_000}
+    )
+    assert "Polymarket: 1.000,00 €" in with_balances
+    assert "SX Bet: 1.000,00 €" in with_balances
+    assert "SEM DÉBITOS NESTE TESTE" in with_balances
     assert "MARGEM NEGATIVA" in msg
     assert "Odd na API: 2,13" in msg
     assert "Odd na API: 1,79" in msg
