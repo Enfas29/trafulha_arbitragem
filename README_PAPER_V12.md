@@ -230,6 +230,17 @@ executar com `--explain-prices`:
 
     python auditoria_jogos_v12.py --sport soccer --match "Chelsea vs Leeds United" --recheck --count 1 --explain-prices
 
+Se o relatório de Newcastle vs Arsenal marcar "empate não identificado":
+
+    python auditoria_jogos_v12.py --sport soccer --match "Newcastle United vs Arsenal" --recheck --count 1 --explain-prices
+
+A auditoria reconhece também `groupItemTitle` com
+`Draw (Equipa A vs Equipa B)`, mas apenas quando ambos os nomes coincidem
+com o confronto. Se ainda faltar empate, imprime na **consola**
+`GAMMA: PORQUE FALTA O EMPATE?` com tipo, rótulo, pergunta, mercado
+e número de tokens, para rever a causa sem inventar odds.
+
+
 O modo de diagnóstico mostra os identificadores de token e de mercado,
 as horas de leitura UTC e:
 - **Polymarket:** melhor ASK (custo de comprar agora), BID (preço a que
@@ -250,6 +261,11 @@ as horas de leitura UTC e:
   até as regras de 1X2 serem validadas.
 - Os tokens Poly com classificações ambíguas são excluídos; nunca
   escolhe uma odd arbitrária para casa, empate ou fora.
+- A publicação para o Telegram em modo só texto **omite `parse_mode`**
+  (em vez de enviar `null`) e divide mensagens longas em partes
+  inferiores a 4096 caracteres, conforme a Bot API oficial. Só confirmar
+  envio quando a API responder com sucesso. Se persistir HTTP 400,
+  investigar o código de erro antes de assumir uma causa.
 
 O modo detalhado acrescenta texto técnico ao Telegram e pode ser extenso.
 É uma auditoria pontual, não modifica as carteiras virtuais e não
