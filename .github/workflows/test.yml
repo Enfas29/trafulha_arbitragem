@@ -29,6 +29,13 @@ jobs:
       - name: Testar o monitor e historico SQLite (offline)
         run: python monitor_v11.py --self-test
 
+      - name: Testar cache curta de eventos WS e prioridade/latência (offline)
+        run: |
+          python ws_priority_v12.py
+          python poly_ws_v12.py
+          python sx_ws_v12.py
+          python monitor_v11.py --self-test
+
       - name: Testar V12 de paper trading (offline, sem APIs)
         run: python paper_v12.py --self-test
 
