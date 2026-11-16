@@ -317,13 +317,24 @@ def soccer_message(pair, poly_prices, sx_prices, index, count):
     teams = poly["teams"]
     start = datetime.fromtimestamp(poly["start"], timezone.utc)
     stamp = datetime.now(timezone.utc)
-    def format_source(price):
-        return single.format_odd(price) if price is not None else "— sem cotação"
-    def tab(prices):
+    def format_source(price, available):
+        if price is not None:
+            return single.format_odd(price)
+        if not available:
+            return "⚠️ mercado não identificado"
+        return "⚠️ sem preço de compra disponível"
+    poly_available = set(poly["picks"])
+    sx_available = {
+        category(outcome, teams)
+        for market in group
+        for outcome in market["outcomes"]
+    }
+    sx_available.discard(None)
+    def tab(prices, available):
         return "\n".join([
-            f"🏠 {teams[0]}: {format_source(prices.get('home'))}",
-            f"🤝 Empate: {format_source(prices.get('draw'))}",
-            f"🚌 {teams[1]}: {format_source(prices.get('away'))}",
+            f"🏠 {teams[0]}: {format_source(prices.get('home'), 'home' in available)}",
+            f"🤝 Empate: {format_source(prices.get('draw'), 'draw' in available)}",
+            f"🚌 {teams[1]}: {format_source(prices.get('away'), 'away' in available)}",
         ])
     sx_start = group[0]["start"]
     warning = (
@@ -332,16 +343,21 @@ def soccer_message(pair, poly_prices, sx_prices, index, count):
     )
     return "\n".join([
         f"⚽ AUDITORIA FUTEBOL {index}/{count} · SÓ LEITURA",
-        f"🏟️ {teams[0]} vs {teams[1]}",
+        f"🏟️ JOGO: {teams[0]} vs {teams[1]}",
         f"⏰ Início: {start:%d/%m %H:%M} UTC" + warning,
+        f"🆔 Poly evento: {poly['id']}" + (
+            f" | referência: {poly['slug']}" if poly.get("slug") else ""
+        ),
+        f"🆔 SX mercado: {group[0]['hash'][:12]}...",
         "",
         "1️⃣ POLYMARKET · odd de compra no livro",
-        tab(poly_prices),
+        tab(poly_prices, poly_available),
         "",
         "2️⃣ SX BET · odd de compra no livro",
-        tab(sx_prices),
+        tab(sx_prices, sx_available),
         "",
         f"🕒 Consulta: {stamp:%d/%m %H:%M:%S} UTC",
+        "⚠️ CONFERE O MESMO ADVERSÁRIO NOS DOIS SITES.",
         "⚠️ 1X2: vitória/empate/derrota; mercados e liquidação por validar.",
         "⚠️ 'Não vence' NÃO significa 'vence o adversário'.",
         "🔒 Não é arbitragem confirmada. Sem apostas ou débitos.",
@@ -498,6 +514,10 @@ def tests():
     )
     assert "2,10" in msg and "2,20" in msg
     assert "Empate: 3,40" in msg
+    assert "mercado não identificado" in msg
+    assert "CONFERE O MESMO ADVERSÁRIO" in msg
+    assert "Poly evento: soc-1" in msg
+    assert "SX mercado: sx-1..." in msg
     assert "NÃO significa" in msg
     assert "Sem apostas ou débitos" in msg
     assert isinstance(previous_single_test_events(), set)
