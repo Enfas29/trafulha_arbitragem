@@ -43,3 +43,6 @@ jobs:
 
       - name: Verificar isolamento das chaves API (offline)
         run: python test_security_v12.py
+
+      - name: Testar cotacao pontual com margem negativa (offline)
+        run: python teste_odds_reais_v12.py --self-test
