@@ -501,6 +501,74 @@ def tests():
     assert "NÃO significa" in msg
     assert "Sem apostas ou débitos" in msg
     assert isinstance(previous_single_test_events(), set)
+    # Teste de ponta a ponta OFFLINE com respostas Gamma/SX sintéticas.
+    # Nunca assume que dados simulados são odds do dia.
+    old_get_json = bot.get_json
+    old_poly_book = bot.poly_book
+    old_sx_book = bot.sx_book
+    try:
+        def fake_get_json(url, params=None, timeout=12):
+            if url.endswith("/sports") and "gamma" in url:
+                return [{"sport": "soccer", "series": "123"}]
+            if url.endswith("/events"):
+                return [{
+                    "id": "game-1", "title": "Team Alpha vs Team Beta",
+                    "startTime": now + 3600,
+                    "markets": [
+                        {"sportsMarketType": "moneyline",
+                         "outcomes": '["Yes","No"]',
+                         "clobTokenIds": '["poly-home","other-home"]',
+                         "groupItemTitle": "Team Alpha"},
+                        {"sportsMarketType": "moneyline",
+                         "outcomes": '["Yes","No"]',
+                         "clobTokenIds": '["poly-draw","other-draw"]',
+                         "groupItemTitle": "Draw"},
+                        {"sportsMarketType": "moneyline",
+                         "outcomes": '["Yes","No"]',
+                         "clobTokenIds": '["poly-away","other-away"]',
+                         "groupItemTitle": "Team Beta"},
+                    ],
+                }]
+            if url.endswith("/sports") and "sx.bet" in url:
+                return {"data": {"sports": [{"sportId": 5, "label": "Soccer"}]}}
+            if url.endswith("/markets/active"):
+                return {"data": {"markets": [{
+                    "status": "ACTIVE",
+                    "sportId": 5, "sportLabel": "Soccer",
+                    "marketHash": "sx-fixture",
+                    "gameTime": now + 3600,
+                    "teamOneName": "Team Alpha",
+                    "teamTwoName": "Team Beta",
+                    "outcomeOneName": "Team Alpha",
+                    "outcomeTwoName": "Not Team Alpha",
+                }], "nextKey": None}}
+            raise AssertionError("Unexpected HTTP URL " + url)
+
+        bot.get_json = fake_get_json
+        bot.poly_book = lambda asset: (
+            [(0.41 if asset == "poly-home" else 0.30, 100)],
+            time.monotonic(),
+        )
+        bot.sx_book = lambda market_hash, index: (
+            [(0.42, 100)], time.monotonic(),
+        )
+        sample_poly = poly_soccer_events(now)
+        sample_sx = sx_soccer_events(now)
+        assert len(sample_poly) == 1 and len(sample_sx) == 1
+        assert set(sample_poly[0]["picks"]) == {"home", "draw", "away"}
+        sample_matches = soccer_matches(sample_poly, sample_sx, now)
+        assert len(sample_matches) == 1
+        pp = poly_soccer_prices(sample_poly[0])
+        sp = sx_soccer_prices(sample_sx, sample_poly[0]["teams"])
+        assert set(pp) == {"home", "draw", "away"}
+        assert set(sp) == {"home"}
+        assert sp["home"] > 2
+        assert "Empate: " in soccer_message(sample_matches[0], pp, sp, 1, 3)
+    finally:
+        bot.get_json = old_get_json
+        bot.poly_book = old_poly_book
+        bot.sx_book = old_sx_book
+
     with tempfile.TemporaryDirectory() as tmp:
         conn = db_open(str(Path(tmp) / "audit.sqlite3"))
         assert not was_sent(conn, "soccer:soc-1")
