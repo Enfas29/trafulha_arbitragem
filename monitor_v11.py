@@ -295,14 +295,33 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None, hot_sx_hashe
                             shadow_quote.total_eur, shadow_quote.profit_eur,
                             100 * shadow_quote.roi,
                         )
+                        best_poly_odd = 1.0 / min(p for p, _ in poly_levels)
+                        best_sx_odd = 1.0 / min(p for p, _ in sx_levels)
+                        def money(amount):
+                            return f"{amount:.2f}".replace(".", ",") + " €"
+
+                        def odd(value):
+                            return f"{value:.2f}".replace(".", ",")
+
                         telegram(
-                            f"🧪 PAPER V12 #{shadow_id} · NÃO REAL\n"
-                            f"{sx['sport']} | {sx['teams'][0]} vs {sx['teams'][1]}\n"
-                            f"Poly: {pair['poly_label']} {shadow_quote.poly_debit_cents/100:.2f}€\n"
-                            f"SX: {pair['sx_label']} {shadow_quote.sx_debit_cents/100:.2f}€\n"
-                            f"Total: {shadow_quote.total_eur:.2f}€\n"
-                            f"Lucro condicional: +{shadow_quote.profit_eur:.2f}€\n"
-                            "⚠️ Fills presumidos · liquidação por validar"
+                            f"🧪 PAPER V12 #{shadow_id} · SÓ SIMULAÇÃO\n"
+                            f"🏟️ {' vs '.join(sx['teams'])}\n"
+                            "\n"
+                            "1️⃣ POLYMARKET\n"
+                            f"Equipa: {pair['poly_label']}\n"
+                            f"Odd na API: {odd(best_poly_odd)}\n"
+                            f"Valor virtual: {money(shadow_quote.poly_debit_cents / 100)}\n"
+                            "\n"
+                            "2️⃣ SX BET\n"
+                            f"Equipa: {pair['sx_label']}\n"
+                            f"Odd na API: {odd(best_sx_odd)}\n"
+                            f"Valor virtual: {money(shadow_quote.sx_debit_cents / 100)}\n"
+                            "\n"
+                            f"💶 Total virtual: {money(shadow_quote.total_eur)}\n"
+                            f"📈 Lucro estimado: {money(shadow_quote.profit_eur)} "
+                            f"({100 * shadow_quote.roi:+.2f}%)\n"
+                            "⚠️ Margem condicional; execução e liquidação não verificadas.\n"
+                            "🔒 NENHUMA APOSTA REAL"
                         )
         except Exception as exc:
             LOG.warning(
