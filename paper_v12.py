@@ -352,6 +352,7 @@ def format_open_message(conn, trade_id, odds_poly=None, odds_sx=None,
     def odds(value):
         return f" | odd {value:.2f}".replace(".", ",") if value is not None else ""
 
+    balances = free_balances(conn)
     message = [
         f"🧪 {'DEMONSTRAÇÃO FICTÍCIA' if demo else 'APOSTA VIRTUAL'} #{trade_id}",
         f"🏟️ {record['event']}",
@@ -365,7 +366,9 @@ def format_open_message(conn, trade_id, odds_poly=None, odds_sx=None,
         f"Valor retirado: {eur(record['sx_debit_cents'])}",
         "",
         f"💶 Total aplicado: {eur(record['poly_debit_cents'] + record['sx_debit_cents'])}",
-        format_wallets(conn),
+        "💰 SALDOS (antes → depois)",
+        f"Carteira Polymarket: {eur(balances['poly'] + record['poly_debit_cents'])} → {eur(balances['poly'])}",
+        f"Carteira SX Bet: {eur(balances['sx'] + record['sx_debit_cents'])} → {eur(balances['sx'])}",
         "",
         "⏳ Resultado: AGUARDA LIQUIDAÇÃO",
         f"📈 Lucro condicional previsto: {eur(record['conditional_profit_cents'])}",
@@ -386,6 +389,13 @@ def format_settlement_message(conn, trade_id, demo=False):
     platform = "POLYMARKET" if winner_platform == "poly" else "SX BET"
     loser = "SX BET" if winner_platform == "poly" else "POLYMARKET"
     net = int(record["realized_profit_cents"])
+    balances = free_balances(conn)
+    poly_before = balances["poly"] - (
+        record["conditional_payout_cents"] if winner_platform == "poly" else 0
+    )
+    sx_before = balances["sx"] - (
+        record["conditional_payout_cents"] if winner_platform == "sx" else 0
+    )
     icon = "✅" if net >= 0 else "🔴"
     lines = [
         f"🏁 {'RESULTADO DEMONSTRATIVO' if demo else 'RESULTADO VIRTUAL CONFIRMADO'} #{trade_id}",
@@ -396,7 +406,9 @@ def format_settlement_message(conn, trade_id, demo=False):
         f"💸 Valor creditado: {eur(record['conditional_payout_cents'])}",
         f"{icon} Resultado líquido: {'+' if net > 0 else ''}{eur(net)}",
         "",
-        format_wallets(conn),
+        "💰 SALDOS (antes → depois)",
+        f"Carteira Polymarket: {eur(poly_before)} → {eur(balances['poly'])}",
+        f"Carteira SX Bet: {eur(sx_before)} → {eur(balances['sx'])}",
         "🔒 Resultado simulado, não houve apostas reais.",
     ]
     return "\n".join(lines)
