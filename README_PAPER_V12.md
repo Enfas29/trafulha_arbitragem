@@ -225,6 +225,36 @@ tenha sido enviado noutra execução:
 
     python auditoria_jogos_v12.py --sport soccer --match "Manchester City vs Fulham" --recheck --count 1
 
+Para investigar especificamente uma **diferença entre o site e o robô**,
+executar com `--explain-prices`:
+
+    python auditoria_jogos_v12.py --sport soccer --match "Chelsea vs Leeds United" --recheck --count 1 --explain-prices
+
+O modo de diagnóstico mostra os identificadores de token e de mercado,
+as horas de leitura UTC e:
+- **Polymarket:** melhor ASK (custo de comprar agora), BID (preço a que
+  poderias vender), último negócio, preço Gamma e exibição do site
+  **estimada** a partir do livro. Segundo o Help Center, a Polymarket
+  usa o midpoint entre BID e ASK ou o último negócio em spreads > 10¢.
+- **SX Bet:** odd efetiva taker do livro e odd do endpoint público
+  `/orders/odds/best`, quando devolvida e interpretável.
+- A auditoria só aceita SX em 1X2 quando encontra `Equipa / Not Equipa`
+  ou `Tie / Not Tie`. Não aceita pares `Equipa A / Equipa B`,
+  handicaps, mercados 2-way ou resultados contraditórios.
+- Os tokens Poly com classificações ambíguas são excluídos; nunca
+  escolhe uma odd arbitrária para casa, empate ou fora.
+
+O modo detalhado acrescenta texto técnico ao Telegram e pode ser extenso.
+É uma auditoria pontual, não modifica as carteiras virtuais e não
+ativa apostas. Evitar comparar com screenshots obtidas noutro minuto:
+as cotações variam entre instantes.
+
+Referências:
+- https://help.polymarket.com/en/articles/13364488-how-are-prices-calculated
+- https://docs.polymarket.com/market-data/prices-order-books
+- https://blog.sx.bet/developers/tutorials/fetch-live-odds-5-minutes/
+- https://help.sx.bet/en/articles/5090654-soccer-betting-rules
+
 O mapeamento da auditoria é deliberadamente conservador: se uma pergunta
 da Gamma sobre "draw" contiver o nome da equipa visitante, isso **não**
 autoriza atribuir o preço do empate à equipa. Se os rótulos contradisserem
