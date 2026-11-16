@@ -22,6 +22,7 @@ import trafulha_arbitragem as bot
 import paper_v12 as paper
 import sx_ws_v12 as sx_hints
 import poly_ws_v12 as poly_hints
+import ws_priority_v12 as ws_priority
 
 LOG = logging.getLogger("monitor_v11")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -34,6 +35,12 @@ MAX_PAIRS = min(60, max(1, int(os.getenv("MONITOR_PAIRS_PER_PASS", "15"))))
 # NÃO é promessa de execução <10s, nem habilita apostas reais/virtuais LIVE.
 WS_REACT_GAP_SECONDS = min(10.0, max(
     1.0, float(os.getenv("MONITOR_WS_REACT_GAP_SECONDS", "2.0"))
+))
+# Quantos eventos WS entram à frente dos restantes mercados em cada scan.
+WS_PRIORITY_MAX = min(6, max(1, int(os.getenv("MONITOR_WS_PRIORITY_MAX", "4"))))
+# Cache temporária SOMENTE de identificadores/timestamps, nunca de preços.
+WS_EVENT_TTL = min(60.0, max(5.0,
+    float(os.getenv("MONITOR_WS_EVENT_TTL_SECONDS", "20"))
 ))
 ALERT_COOLDOWN = max(300, int(os.getenv("MONITOR_ALERT_COOLDOWN_SECONDS", "1800")))
 SUMMARY_INTERVAL = max(3600, int(os.getenv("MONITOR_SUMMARY_SECONDS", "21600")))
@@ -231,26 +238,26 @@ def select_pairs(pairs):
     )
 
 
-def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None, hot_sx_hashes=None, hot_poly_assets=None):
+def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
+              priority_cache=None):
     scan_started = time.monotonic()
     if not pairs:
         return {"checked": 0, "priced": 0, "positive": 0, "signals": 0,
                 "next_offset": 0, "best": None}
-    total = len(pairs)
-    window = [pairs[(offset + n) % total] for n in range(min(MAX_PAIRS, total))]
-    new_offset = (offset + len(window)) % total
-    if hot_sx_hashes or hot_poly_assets:
-        # No máximo duas posições com sinais WS por passagem; o resto
-        # mantém a rotação REST, mesmo que as APIs enviem milhares de mensagens.
-        priority = [
-            p for p in pairs
-            if p["sx"]["hash"] in (hot_sx_hashes or set())
-            or p["poly_asset"] in (hot_poly_assets or set())
-        ][:2]
-        seen = {p["key"] for p in priority}
-        window = (priority + [p for p in window if p["key"] not in seen])[:MAX_PAIRS]
+    if priority_cache is not None:
+        window, new_offset, ws_events = priority_cache.choose(
+            pairs, offset, MAX_PAIRS, now=scan_started
+        )
+    else:
+        total = len(pairs)
+        window = [pairs[(offset + n) % total]
+                  for n in range(min(MAX_PAIRS, total))]
+        new_offset = (offset + len(window)) % total
+        ws_events = {}
     checked = priced = positive = signals = 0
     hot_checked = 0
+    ws_skipped = 0
+    ws_latencies = []
     book_max_ms = 0.0
     best = None
     now = time.time()
@@ -258,22 +265,27 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None, hot_sx_hashe
     for pair in window:
         sx = pair["sx"]
         start = sx["start"]
+        event = ws_events.get(pair["key"])
         if not (now - bot.MAX_LIVE_AGE_H * 3600 <= start
                 <= now + bot.MAX_FUTURE_H * 3600):
+            if event is not None:
+                ws_skipped += 1
             continue
         # Início ≠ jogo oficialmente ao vivo.
         if start <= now and not sx["live_enabled"]:
+            if event is not None:
+                ws_skipped += 1
             continue
         checked += 1
-        is_hot = (sx["hash"] in (hot_sx_hashes or set())
-                  or pair["poly_asset"] in (hot_poly_assets or set()))
-        if is_hot:
+        if event is not None:
             hot_checked += 1
         book_started = time.monotonic()
+        book_completed = None
         try:
             poly_levels, t_poly = bot.poly_book(pair["poly_asset"])
             sx_levels, t_sx = bot.sx_book(sx["hash"], pair["sx_target"])
-            book_max_ms = max(book_max_ms, 1000 * (time.monotonic() - book_started))
+            book_completed = time.monotonic()
+            book_max_ms = max(book_max_ms, 1000 * (book_completed - book_started))
             stage = "APOS_INICIO_NAO_CONFIRMADO" if start <= now else "PRE_JOGO"
             quote, hypothetical = insert_observation(
                 conn, pair, stage, poly_levels, sx_levels,
@@ -320,6 +332,36 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None, hot_sx_hashe
                 "Book falhou em %s (%s)",
                 pair["key"][:35], type(exc).__name__,
             )
+        finally:
+            # WS -> fila -> REST de ambos os livros -> avaliação/alerta.
+            # Mede tempo LOCAL do evento recebido, não latência da rede
+            # anterior ao recebimento nem preenchimento de uma ordem real.
+            if event is not None:
+                received_mono, sources = event
+                decided = time.monotonic()
+                ws_latencies.append({
+                    "queue": max(0, book_started-received_mono)*1000,
+                    "rest": max(0, (book_completed or decided)-book_started)*1000,
+                    "confirmed": (max(0, book_completed-received_mono)*1000
+                                  if book_completed is not None else None),
+                    "decision": max(0, decided-received_mono)*1000,
+                    "sources": sources,
+                })
+    if ws_latencies:
+        confirmed = [x["confirmed"] for x in ws_latencies if x["confirmed"] is not None]
+        LOG.info(
+            "WS_LATENCY | mercados=%d | fontes=%s | "
+            "evento_ate_inicio_ms_max=%d | REST_ms_max=%d | "
+            "evento_ate_validacao_ms_max=%s | "
+            "evento_ate_decisao_ms_max=%d | descartados=%d",
+            len(ws_latencies),
+            ",".join(sorted(set().union(*(x["sources"] for x in ws_latencies)))),
+            round(max(x["queue"] for x in ws_latencies)),
+            round(max(x["rest"] for x in ws_latencies)),
+            str(round(max(confirmed))) if confirmed else "N/D",
+            round(max(x["decision"] for x in ws_latencies)),
+            ws_skipped,
+        )
     LOG.info(
         "SCAN | direções=%d | preços válidos=%d | margens positivas=%d "
         "| sinais=%d | melhor buffer=%s | duracao_ms=%d "
@@ -490,6 +532,9 @@ def catalog():
 def self_test():
     import tempfile
 
+    # Fila com prioridade sem bloquear rotação REST e sem preços em cache.
+    ws_priority.self_test()
+
     # Evento WS não pode impor os 8 segundos adicionais da versão antiga.
     assert websocket_reaction_pause(0.1, True, 2.0) == 1.9
     assert websocket_reaction_pause(2.5, True, 2.0) == 0.0
@@ -559,6 +604,9 @@ def main(once=False):
         )
 
     conn = open_database(DB)
+    priority_cache = ws_priority.PriorityCache(
+        max_priority=WS_PRIORITY_MAX, ttl_seconds=WS_EVENT_TTL
+    )
     ws_feed = sx_hints.SXBookHints() if SX_WS_V12_ENABLED else None
     if ws_feed is not None and not ws_feed.start():
         LOG.warning("SX WS V12 solicitado mas sem SX_API_KEY: usar apenas REST.")
@@ -575,10 +623,11 @@ def main(once=False):
                  "máximo 100 EUR total por operação, sem apostas reais.",
                  100 * paper.MIN_NET_ROI)
     LOG.info(
-        "WS FAST: janela de reação %.1fs; %d direções por passagem; "
-        "prioridade a no máximo 2 sinais WS; REST valida sempre os livros. "
-        "Sem garantia de execução de apostas.",
+        "WS PRIORITY: janela %.1fs; direções/passo=%d; "
+        "prioridade máx=%d; cache eventos=%.0fs (SEM cache de odds); "
+        "REST valida ambos os livros. Sem apostas reais.",
         WS_REACT_GAP_SECONDS, MAX_PAIRS,
+        WS_PRIORITY_MAX, WS_EVENT_TTL,
     )
     pairs, cursor = [], 0
     last_catalog = 0.0
@@ -590,6 +639,7 @@ def main(once=False):
                 try:
                     pairs = catalog()
                     cursor = cursor % len(pairs) if pairs else 0
+                    priority_cache.rebuild(pairs)
                     if ws_feed is not None:
                         ws_feed.update(p["sx"]["hash"] for p in pairs[:24])
                     if poly_feed is not None:
@@ -601,11 +651,13 @@ def main(once=False):
                     if once:
                         raise
 
-            hot_hashes = ws_feed.take_hot() if ws_feed is not None else set()
-            hot_assets = poly_feed.take_hot() if poly_feed is not None else set()
-            result = scan_pass(conn, pairs, cursor, fx, paper_conn=paper_conn,
-                               hot_sx_hashes=hot_hashes,
-                               hot_poly_assets=hot_assets)
+            sx_events = ws_feed.take_events() if ws_feed is not None else {}
+            poly_events = poly_feed.take_events() if poly_feed is not None else {}
+            priority_cache.ingest(poly_events, sx_events)
+            result = scan_pass(
+                conn, pairs, cursor, fx, paper_conn=paper_conn,
+                priority_cache=priority_cache
+            )
             cursor = result["next_offset"]
             outage_notice = update_health(conn, result["checked"], result["priced"])
             if outage_notice:
