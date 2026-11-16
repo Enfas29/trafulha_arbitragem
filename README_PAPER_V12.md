@@ -124,6 +124,45 @@ atualizando os Secrets do GitHub e as Variables do Railway. Não enviar
 a chave em mensagens, screenshots ou commits. Não colocar chaves privadas
 de carteira no projeto.
 
+
+## Testar UMA aposta hipotética com odds reais, mesmo sem margem positiva
+
+No Railway → serviço `trafulha_arbitragem` → **Console**, executar:
+
+    python teste_odds_reais_v12.py
+
+O comando recolhe novos catálogos Polymarket e SX Bet, encontra um confronto
+com resultados opostos e consulta os livros de ordens REST das duas plataformas.
+Se houver liquidez suficiente e as leituras estiverem próximas no tempo,
+envia **uma única mensagem** para Telegram com:
+
+- Evento, hora, desporto e lados exatos escolhidos;
+- Melhor odd decimal em cada plataforma, preço observado e odd efetiva
+  estimada para a quantidade do teste;
+- Dois valores hipotéticos com **10 € no máximo, no conjunto**;
+- Margem condicional, **incluindo margens negativas** e reservas adversas;
+- Hora UTC e diferença entre os instantes de leitura.
+
+O ensaio NÃO depende do limiar de +1,5% da carteira principal e **não coloca
+ordens**, não altera os 1.000 € virtuais de cada plataforma e não apresenta
+fills fictícios como realizados. É uma cotação de aposta de ensaio, não uma
+transação executada. Guarda a amostra separada no volume persistente:
+
+    /data/odds_test_v12.sqlite3
+
+Se os jogos emparelhados não tiverem livros suficientes, o programa comunica
+que não encontrou amostra; não cria odds inventadas. É um comando único,
+não um loop, não altera o scanner ativo.
+
+Teste sem API/Telegram:
+
+    python teste_odds_reais_v12.py --self-test
+
+**Ao comparar com as páginas das plataformas:** as duas odds não precisam
+de ser iguais porque são preços para resultados **opostos**. E a melhor
+odd pode diferir da odd efetiva ao consumir vários níveis de liquidez.
+As odds observadas são um instante e podem mudar no site segundos depois.
+
 ## Por validar antes de qualquer execução com dinheiro real
 
 1. Regras de liquidação em cenários excecionais: desistências no ténis,
