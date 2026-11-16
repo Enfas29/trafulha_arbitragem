@@ -398,6 +398,21 @@ def soccer_matches(poly_events, sx_markets, now=None):
     ))
 
 
+def poly_site_price_estimate(bid, ask, last):
+    """Regra publicada da Polymarket: midpoint ou último negócio.
+
+    A UI do navegador pode estar noutro instante; isto é uma ESTIMATIVA
+    baseada no MESMO snapshot CLOB do preço executável.
+    """
+    if (bid is not None and ask is not None
+            and 0 < bid < 1 and 0 < ask < 1
+            and 0 <= ask - bid <= 0.10):
+        return (bid + ask) / 2, "MÉDIA (BID+ASK)/2"
+    if last is not None and 0 < last < 1:
+        return last, "ÚLTIMO NEGÓCIO"
+    return None, "SEM PREÇO ESTIMÁVEL"
+
+
 def poly_soccer_prices(poly, diagnostics=None):
     """Best ask é o preço de compra, não necessariamente o preço do site."""
     prices = {}
@@ -438,12 +453,9 @@ def poly_soccer_prices(poly, diagnostics=None):
                 last = None
             # A Polymarket mostra o MID (BID/ASK) quando spread <= 10¢;
             # caso contrário pode usar o último negócio.
-            if bid is not None and ask is not None and ask - bid <= 0.10:
-                indicative = (bid + ask) / 2
-                display_source = "MÉDIA (BID+ASK)/2"
-            else:
-                indicative = last
-                display_source = "ÚLTIMO NEGÓCIO"
+            indicative, display_source = poly_site_price_estimate(
+                bid, ask, last
+            )
             if ask:
                 prices[side] = 1.0 / ask
             diagnostics[side] = {
@@ -864,6 +876,23 @@ def tests():
         "question": "Will Man City vs Fulham end in a draw?"
     }, football) != "away"
 
+    assert poly_site_price_estimate(0.50, 0.54, 0.53)[0] == 0.52
+    assert poly_site_price_estimate(0.25, 0.50, 0.44)[0] == 0.44
+    assert poly_site_price_estimate(None, 0.50, None)[0] is None
+    assert poly_site_price_estimate(0.50, 0.54, 0.53)[1].startswith("MÉDIA")
+    # Chelsea/Leeds: o mercado 2-way hipotético com odd 1.44 NÃO pode
+    # substituir a linha 1X2 Chelsea/Not Chelsea com odd 1.93.
+    teams = ("Chelsea FC", "Leeds United FC")
+    allowed = {
+        "hash": "1x2", "type": 52,
+        "outcomes": ("Chelsea", "Not Chelsea")
+    }
+    forbidden = {
+        "hash": "two-way", "type": 226,
+        "outcomes": ("Chelsea", "Leeds United")
+    }
+    assert sx_1x2_side(allowed, teams) == ("home", 0)
+    assert sx_1x2_side(forbidden, teams) is None
     picks, collisions = {}, set()
     unique_pick(picks, collisions, "draw", "yes-draw", "market1", "Yes", 0.2)
     unique_pick(picks, collisions, "draw", "other-draw", "market2", "Yes", 0.3)
