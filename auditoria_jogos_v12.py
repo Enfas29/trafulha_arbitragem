@@ -429,6 +429,21 @@ def poly_soccer_prices(poly, diagnostics=None):
             )
             ask = asks[0] if asks else None
             bid = bids[-1] if bids else None
+            last = data.get("lastTradePrice")
+            try:
+                last = float(last)
+                if not (0 < last < 1 and math.isfinite(last)):
+                    last = None
+            except (TypeError, ValueError):
+                last = None
+            # A Polymarket mostra o MID (BID/ASK) quando spread <= 10¢;
+            # caso contrário pode usar o último negócio.
+            if bid is not None and ask is not None and ask - bid <= 0.10:
+                indicative = (bid + ask) / 2
+                display_source = "MÉDIA (BID+ASK)/2"
+            else:
+                indicative = last
+                display_source = "ÚLTIMO NEGÓCIO"
             if ask:
                 prices[side] = 1.0 / ask
             diagnostics[side] = {
@@ -439,6 +454,10 @@ def poly_soccer_prices(poly, diagnostics=None):
                 "gamma": item.get("gamma_price"),
                 "ask": ask,
                 "bid": bid,
+                "last": last,
+                "site_indicative": indicative,
+                "site_source": display_source,
+                "book_timestamp": data.get("timestamp"),
                 "read_utc": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
             }
         except Exception as exc:
@@ -513,6 +532,18 @@ def diagnostics_message(poly_details, sx_details):
             "  Gamma (indicativo): " +
             (f"{gamma*100:.2f}¢" if gamma else "indisponível")
         )
+        estimated = info.get("site_indicative")
+        lines.append(
+            "  Exibição site estimada: " +
+            (f"{estimated*100:.2f}¢ → odd "
+             f"{single.format_odd(1/estimated)} "
+             f"({info.get('site_source', '')})" if estimated
+             else "sem dados suficientes")
+        )
+        if info.get("last"):
+            lines.append(f"  Último negócio: {info['last']*100:.2f}¢")
+        if info.get("book_timestamp"):
+            lines.append(f"  Timestamp CLOB: {info['book_timestamp']}")
         lines.append(f"  Token: {info.get('token', 'indisponível')}")
         lines.append(f"  Mercado: {info.get('market', 'indisponível')}")
         lines.append(f"  Lido: {info.get('read_utc', 'indisponível')}")
@@ -833,6 +864,16 @@ def tests():
     )
     assert "BUY (ask): 54.00¢" in forensic
     assert "Gamma (indicativo): 52.00¢" in forensic
+    assert "Token: poly-token" in forensic
+    # O preço indicativo pode divergir do ASK.
+    simulated = {
+        "token": "abc", "market": "Chelsea", "gamma": 0.52,
+        "bid": 0.50, "ask": 0.54, "last": 0.53,
+        "site_indicative": 0.52, "site_source": "MÉDIA (BID+ASK)/2",
+    }
+    explained = diagnostics_message({"home": simulated}, {})
+    assert "Exibição site estimada: 52.00¢" in explained
+    assert "BUY (ask): 54.00¢" in explained
     assert "Token: poly-token" in forensic
     assert "BUY (taker): 1,92" in forensic
     assert "NÃO significa" in msg
