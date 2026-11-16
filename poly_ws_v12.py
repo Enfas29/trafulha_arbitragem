@@ -20,7 +20,7 @@ class PolyBookHints:
         self.wake = threading.Event()
         self.lock = threading.Lock()
         self.assets = ()
-        self.hot = set()
+        self.hot = {}  # asset/hash -> primeiro evento monotónico pendente
         self.running = False
         self.socket = None
         self.valid_updates = 0
@@ -43,7 +43,7 @@ class PolyBookHints:
         first_valid = False
         with self.lock:
             if asset in self.assets:
-                self.hot.add(asset)
+                self.hot.setdefault(asset, time.monotonic())
                 self.wake.set()
                 self.valid_updates += 1
                 self.last_update_epoch = time.time()
@@ -54,12 +54,20 @@ class PolyBookHints:
                 "(REST continua a confirmar as odds)."
             )
 
-    def take_hot(self):
+    def take_events(self):
+        """Cache breve: chave -> instante monotónico do 1.º sinal pendente.
+
+        Guarda apenas IDENTIFICADORES, nunca odds/fills executáveis.
+        """
         with self.lock:
-            found = set(self.hot)
+            result = dict(self.hot)
             self.hot.clear()
             self.wake.clear()
-            return found
+            return result
+
+    def take_hot(self):
+        """Compatibilidade com clientes que só pretendem as chaves alteradas."""
+        return set(self.take_events())
 
     def consume(self, message):
         if message == "PONG":
@@ -169,6 +177,14 @@ def self_test():
     }))
     assert watcher.take_hot() == {"b"}
     assert watcher.valid_updates == 2
+    # Coalescer dois eventos, mantendo o instante do primeiro.
+    watcher.consume(json.dumps({"event_type": "book", "asset_id": "a"}))
+    first = watcher.hot["a"]
+    watcher.consume(json.dumps({"event_type": "best_bid_ask", "asset_id": "a"}))
+    assert watcher.hot["a"] == first
+    stamped = watcher.take_events()
+    assert stamped == {"a": first}
+    assert first <= time.monotonic()
     watcher.consume("not-json")
     assert not watcher.wake.is_set()
     print("✅ Poly WS V12: teste local de sinais e subscrições OK")
