@@ -85,7 +85,9 @@ def sx_1x2_side(market, teams):
     Retorna (nome da posição, índice do resultado positivo).
     """
     market_type = str(market.get("type") or "").strip().lower()
-    if market_type not in {"", "52", "moneyline", "1x2", "1x2_moneyline"}:
+    # Na API SX tipo 1 = 1X2 (três resultados em mercados binários).
+    # Tipo 52 = moneyline de DUAS equipas, e não inclui o empate.
+    if market_type not in {"1"}:
         return None
     labels = market.get("outcomes") or ()
     if len(labels) != 2:
@@ -314,8 +316,15 @@ def sx_soccer_events(now=None):
     results = []
     page_key = None
     seen = set()
+    counters = {"received": 0, "wrong_sport": 0, "inactive": 0,
+                "missing_teams": 0, "outside_window": 0,
+                "wrong_type_or_outcomes": 0, "accepted": 0}
     for _ in range(MAX_SX_PAGES):
-        params = {"pageSize": 100, "onlyMainLine": "true"}
+        params = {
+            "type": "1",
+            "pageSize": 100,
+            "onlyMainLine": "true",
+        }
         if ids:
             params["sportIds"] = ",".join(ids)
         if page_key:
@@ -332,18 +341,23 @@ def sx_soccer_events(now=None):
         for market in batch:
             if not isinstance(market, dict):
                 continue
+            counters["received"] += 1
             sport_label = bot.sx_sport_family(market)
             if sport_label != "soccer" and (
                 not ids or str(market.get("sportId")) not in ids
             ):
+                counters["wrong_sport"] += 1
                 continue
-            if str(market.get("status") or "").upper() != "ACTIVE":
+            if str(market.get("status") or "").upper() not in {"ACTIVE", "LIVE"}:
+                counters["inactive"] += 1
                 continue
             teams = (market.get("teamOneName"), market.get("teamTwoName"))
             if not all(teams):
+                counters["missing_teams"] += 1
                 continue
             start = bot.unix_time(market.get("gameTime"))
             if not in_window(start, now):
+                counters["outside_window"] += 1
                 continue
             h = str(market.get("marketHash") or "")
             if not h or h in seen:
@@ -360,7 +374,9 @@ def sx_soccer_events(now=None):
             if check is None:
                 # Não podemos identificar a odd do resultado positivo
                 # com garantias suficientes para comparar com 1X2.
+                counters["wrong_type_or_outcomes"] += 1
                 continue
+            counters["accepted"] += 1
             results.append({
                 "hash": h, "teams": teams, "start": start,
                 "league": str(market.get("leagueLabel") or ""),
@@ -370,8 +386,17 @@ def sx_soccer_events(now=None):
         page_key = data.get("nextKey") if isinstance(data, dict) else None
         if not page_key:
             break
-    print(f"⚽ SX Bet: {len(results)} mercados de futebol com hora e equipas.",
+    print(f"⚽ SX Bet: {len(results)} mercados 1X2 identificados "
+          f"(recebidos={counters['received']}, excluídos="
+          f"desporto:{counters['wrong_sport']}, "
+          f"estado:{counters['inactive']}, "
+          f"equipas:{counters['missing_teams']}, "
+          f"horário:{counters['outside_window']}, "
+          f"tipo/outcomes:{counters['wrong_type_or_outcomes']}).",
           flush=True)
+    if not ids:
+        print("⚠️ SX /sports sem IDs de futebol reconhecidos; "
+              "a seleção depende dos rótulos dos mercados.", flush=True)
     return results
 
 
@@ -812,7 +837,7 @@ def tests():
          "teams": ("Team Alpha", "Team Beta"),
          "picks": {"home": {"asset": "1"}, "draw": {"asset": "2"}}}
     sx = [{"hash": "sx-1", "start": now + 3600,
-           "teams": ("Team Alpha", "Team Beta"),
+           "teams": ("Team Alpha", "Team Beta"), "type": 1,
            "outcomes": ("Team Alpha", "Not Team Alpha")}]
     assert len(soccer_matches([p], sx, now)) == 1
     assert not soccer_matches([p], [{**sx[0], "start": now + 7200}], now)
@@ -824,19 +849,22 @@ def tests():
     assert category("Draw", p["teams"]) == "draw"
     assert category("Not Team Alpha", p["teams"]) is None
     assert sx_1x2_side({
-        "outcomes": ("Team Alpha", "Not Team Alpha"), "type": 52
+        "outcomes": ("Team Alpha", "Not Team Alpha"), "type": 1
     }, p["teams"]) == ("home", 0)
     assert sx_1x2_side({
-        "outcomes": ("Not Team Alpha", "Team Alpha"), "type": 52
+        "outcomes": ("Not Team Alpha", "Team Alpha"), "type": 1
     }, p["teams"]) == ("home", 1)
     assert sx_1x2_side({
-        "outcomes": ("Tie", "Not Tie"), "type": 52
+        "outcomes": ("Tie", "Not Tie"), "type": 1
     }, p["teams"]) == ("draw", 0)
     assert sx_1x2_side({
-        "outcomes": ("Team Beta", "Not Team Beta"), "type": 52
+        "outcomes": ("Team Beta", "Not Team Beta"), "type": 1
     }, p["teams"]) == ("away", 0)
     assert sx_1x2_side({
         "outcomes": ("Team Alpha", "Team Beta"), "type": 52
+    }, p["teams"]) is None
+    assert sx_1x2_side({
+        "outcomes": ("Team Alpha", "Not Team Alpha"), "type": 52
     }, p["teams"]) is None
     assert sx_1x2_side({
         "outcomes": ("Team Alpha", "Not Team Alpha"), "type": 226
@@ -884,7 +912,7 @@ def tests():
     # substituir a linha 1X2 Chelsea/Not Chelsea com odd 1.93.
     teams = ("Chelsea FC", "Leeds United FC")
     allowed = {
-        "hash": "1x2", "type": 52,
+        "hash": "1x2", "type": 1,
         "outcomes": ("Chelsea", "Not Chelsea")
     }
     forbidden = {
@@ -971,6 +999,7 @@ def tests():
             if url.endswith("/sports") and "sx.bet" in url:
                 return {"data": {"sports": [{"sportId": 5, "label": "Soccer"}]}}
             if url.endswith("/markets/active"):
+                assert params is not None and str(params.get("type")) == "1"
                 return {"data": {"markets": [{
                     "status": "ACTIVE",
                     "sportId": 5, "sportLabel": "Soccer",
@@ -979,7 +1008,7 @@ def tests():
                     "teamOneName": "Team Alpha",
                     "teamTwoName": "Team Beta",
                     "outcomeOneName": "Team Alpha",
-                    "outcomeTwoName": "Not Team Alpha",
+                    "outcomeTwoName": "Not Team Alpha", "type": 1,
                 }], "nextKey": None}}
             raise AssertionError("Unexpected HTTP URL " + url)
 
