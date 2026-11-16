@@ -42,7 +42,7 @@ class SXBookHints:
         self.wake = threading.Event()
         self.lock = threading.Lock()
         self.watched = ()
-        self.hot = set()
+        self.hot = {}  # asset/hash -> primeiro evento monotónico pendente
         self.running = False
         self.last_message_epoch = None
         self.received_events = 0
@@ -56,7 +56,7 @@ class SXBookHints:
         first_event = False
         with self.lock:
             if market_hash in self.watched:
-                self.hot.add(market_hash)
+                self.hot.setdefault(market_hash, time.monotonic())
                 self.last_message_epoch = time.time()
                 self.received_events += 1
                 first_event = self.received_events == 1
@@ -67,12 +67,20 @@ class SXBookHints:
                 "(REST continua a confirmar as odds)."
             )
 
-    def take_hot(self):
+    def take_events(self):
+        """Cache breve: chave -> instante monotónico do 1.º sinal pendente.
+
+        Guarda apenas IDENTIFICADORES, nunca odds/fills executáveis.
+        """
         with self.lock:
-            result = set(self.hot)
+            result = dict(self.hot)
             self.hot.clear()
             self.wake.clear()
             return result
+
+    def take_hot(self):
+        """Compatibilidade com clientes que só pretendem as chaves alteradas."""
+        return set(self.take_events())
 
     async def get_token(self, ctx=None):
         if not self.key:
@@ -163,8 +171,12 @@ def self_test():
     assert not f.wake.is_set()
     f.signal("b")
     assert f.wake.is_set()
+    assert f.hot["b"] <= time.monotonic()
+    first = f.hot["b"]
+    f.signal("b")
+    assert f.hot["b"] == first
     assert f.take_hot() == {"b"}
-    assert f.received_events == 1
+    assert f.received_events == 2
     assert f.last_message_epoch is not None
     assert not f.wake.is_set()
     f.update(["c"])
@@ -189,7 +201,7 @@ def self_test():
     )
     asyncio.run(official.on_publication(None))
     assert f.take_hot() == {"c"}
-    assert f.received_events == 3
+    assert f.received_events == 4
     print("✅ SX WS V12: eventos e handler oficial centrifuge-python OK (offline)")
 
 
