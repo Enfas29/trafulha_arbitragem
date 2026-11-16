@@ -65,6 +65,39 @@ def category(label, teams):
     return None
 
 
+def sx_complement(label, affirmative):
+    """Confirma 'Not A' como oposto EXATO de A, incluindo Tie/Not Tie."""
+    positive = bot.ascii_name(affirmative)
+    negative = bot.ascii_name(label)
+    if positive in {"draw", "tie", "empate", "x"}:
+        return negative in {"not draw", "not tie", "not empate", "no draw"}
+    return (
+        negative.startswith(("not ", "no ", "nao "))
+        and bot.same_team(negative.split(" ", 1)[1], affirmative)
+    )
+
+
+def sx_1x2_side(market, teams):
+    """Uma linha só é 1X2 se tiver A/Not A, Tie/Not Tie ou B/Not B.
+
+    Rejeita mercados 2-way, tipos de prolongamento, handicap, etc.
+    Evita trocar uma odd de 'not A' pela odd de B.
+    Retorna (nome da posição, índice do resultado positivo).
+    """
+    market_type = str(market.get("type") or "").strip().lower()
+    if market_type not in {"", "52", "moneyline", "1x2", "1x2_moneyline"}:
+        return None
+    labels = market.get("outcomes") or ()
+    if len(labels) != 2:
+        return None
+    candidates = []
+    for index in (0, 1):
+        positive = category(labels[index], teams)
+        if positive and sx_complement(labels[1-index], labels[index]):
+            candidates.append((positive, index))
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def explicit_question_category(text, teams):
     """Classificar perguntas EXPLÍCITAS, nunca procurar uma equipa em 'A vs B'.
 
@@ -286,6 +319,14 @@ def sx_soccer_events(now=None):
                 str(market.get("outcomeOneName") or ""),
                 str(market.get("outcomeTwoName") or ""),
             )
+            check = sx_1x2_side(
+                {"outcomes": outcomes, "type": market.get("type")},
+                teams,
+            )
+            if check is None:
+                # Não podemos identificar a odd do resultado positivo
+                # com garantias suficientes para comparar com 1X2.
+                continue
             results.append({
                 "hash": h, "teams": teams, "start": start,
                 "league": str(market.get("leagueLabel") or ""),
@@ -337,22 +378,25 @@ def poly_soccer_prices(poly):
 
 def sx_soccer_prices(sx_markets, teams):
     prices = {}
-    # No máximo seis consultas por jogo; não confundir NOT TEAM com TEAM.
+    # Só mercados 1X2 explicitamente emparelhados com o seu 'Not X'.
+    # Contratos duplicados ou 2-way não substituem as odds do 1X2.
     looked = 0
     for market in sx_markets:
-        for index, label in enumerate(market["outcomes"]):
-            side = category(label, teams)
-            if side is None or side in prices:
-                continue
-            try:
-                levels, _ = bot.sx_book(market["hash"], index)
-                looked += 1
-                if levels:
-                    prices[side] = 1.0 / min(p for p, capacity in levels)
-            except Exception:
-                pass
-            if looked >= 6:
-                return prices
+        answer = sx_1x2_side(market, teams)
+        if answer is None:
+            continue
+        side, index = answer
+        if side in prices:
+            continue
+        try:
+            levels, _ = bot.sx_book(market["hash"], index)
+            looked += 1
+            if levels:
+                prices[side] = 1.0 / min(p for p, capacity in levels)
+        except Exception:
+            pass
+        if looked >= 6:
+            return prices
     return prices
 
 
@@ -369,9 +413,9 @@ def soccer_message(pair, poly_prices, sx_prices, index, count):
         return "⚠️ sem preço de compra disponível"
     poly_available = set(poly["picks"])
     sx_available = {
-        category(outcome, teams)
+        answer[0]
         for market in group
-        for outcome in market["outcomes"]
+        if (answer := sx_1x2_side(market, teams)) is not None
     }
     sx_available.discard(None)
     def tab(prices, available):
@@ -555,6 +599,27 @@ def tests():
     assert category("Team Beta", p["teams"]) == "away"
     assert category("Draw", p["teams"]) == "draw"
     assert category("Not Team Alpha", p["teams"]) is None
+    assert sx_1x2_side({
+        "outcomes": ("Team Alpha", "Not Team Alpha"), "type": 52
+    }, p["teams"]) == ("home", 0)
+    assert sx_1x2_side({
+        "outcomes": ("Not Team Alpha", "Team Alpha"), "type": 52
+    }, p["teams"]) == ("home", 1)
+    assert sx_1x2_side({
+        "outcomes": ("Tie", "Not Tie"), "type": 52
+    }, p["teams"]) == ("draw", 0)
+    assert sx_1x2_side({
+        "outcomes": ("Team Beta", "Not Team Beta"), "type": 52
+    }, p["teams"]) == ("away", 0)
+    assert sx_1x2_side({
+        "outcomes": ("Team Alpha", "Team Beta"), "type": 52
+    }, p["teams"]) is None
+    assert sx_1x2_side({
+        "outcomes": ("Team Alpha", "Not Team Alpha"), "type": 226
+    }, p["teams"]) is None
+    assert sx_1x2_side({
+        "outcomes": ("Not Tie", "Team Beta"), "type": 52
+    }, p["teams"]) is None
     assert category("Not Draw", p["teams"]) is None
     assert gamma_market_category(
         {"groupItemTitle": "Draw"}, p["teams"]
