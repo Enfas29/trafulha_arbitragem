@@ -38,7 +38,8 @@ O workflow inclui agora:
 - Testes do monitor, histórico e relatório de seis horas.
 - Testes do PAPER V12 (limites, livro, carteiras, não duplicação, liquidação).
 - Testes dos mecanismos WebSocket SX e Polymarket.
-- Teste integral com livros sintéticos e simulação sem APIs ou apostas.
+- Teste integral com livros sintéticos, saldos e mensagem de liquidação sem duplicação.
+- Teste isolado de demonstração de débito, crédito e mensagens Telegram.
 
 Não usar um resultado verde como prova de arbitragem real: são testes
 locais, com livros sintéticos.
@@ -62,9 +63,12 @@ Ao fazer deploy, a base nova é criada com 1.000 € virtuais na Polymarket
 e 1.000 € virtuais na SX Bet. Não apagues `paper_v12.sqlite3`, pois isso
 reiniciaria artificialmente os saldos.
 
-O Telegram só envia a mensagem **🧪 PAPER V12 · NÃO REAL** quando houver
-uma operação simulada que ultrapasse os filtros de ROI e liquidez.
-Os relatórios de seis horas também passam a mostrar saldos virtuais.
+O Telegram só envia uma mensagem **🧪 APOSTA VIRTUAL** quando uma
+operação simulada ultrapassar os filtros de ROI e liquidez. A mensagem
+mostra **equipa, odd, valor debitado e saldo disponível de cada carteira
+logo após a abertura**. Não altera as regras de admissão de oportunidades.
+Os relatórios de seis horas mostram também saldos livres, valor reservado
+em operações abertas e resultado realizado.
 
 Para consultar saldos na consola do próprio serviço:
 
@@ -74,13 +78,55 @@ Para bloquear um evento atípico e exigir revisão:
 
     python paper_v12.py --flag-exception 1 --reason "desistencia antes de completar jogo"
 
+Para listar os IDs das operações abertas:
+
+    python paper_v12.py --list-open
+
 Para liquidar manualmente APENAS depois de confirmar resultado e regras
 **nas duas plataformas**:
 
     python paper_v12.py --settle-id 1 --winner poly --verified-both-rules
 
+A liquidação devolve o prémio virtual **à carteira da plataforma vencedora**
+(e não à outra); a outra aposta fica perdida. Atualiza os dois saldos na base
+persistente e gera **uma nova mensagem de resultado** no Telegram, com a equipa
+vencedora, montante creditado, lucro/prejuízo do conjunto e saldos atualizados.
+O `--winner sx` serve para o caso oposto.
+
+Se o Telegram falhar após a liquidação, os saldos continuam corretos no
+SQLite; para tentar novamente **sem creditar outra vez**:
+
+    python paper_v12.py --notify-settlement-id 1
+
+A notificação usa uma tabela de idempotência para não repetir o aviso
+quando tiver sido confirmadamente enviado.
+
+⚠️ **A verificação dos resultados ainda é manual.** O código não sabe
+automaticamente se a partida terminou, se foi interrompida ou como as duas
+bolsas a liquidaram. Nunca será enviada uma mensagem de vitória confirmada
+só porque uma odd baixou ou porque a hora prevista terminou.
+
 `--winner sx` está igualmente disponível. Não existe liquidação
 automática nem tratamento automático de eventos void, empate ou desistência.
+
+### Ver duas mensagens de demonstração sem esperar por arbitragem
+
+Na **Console do Railway**:
+
+    python demonstracao_carteiras_v12.py --send-telegram
+
+Isto cria uma operação e uma liquidação com dados **inteiramente fictícios**
+num SQLite **temporário**, gera duas mensagens (abertura e resultado)
+rotuladas como DEMONSTRAÇÃO e envia ambas ao Telegram.
+
+**Não acede a mercados reais, não gasta dinheiro real, não modifica
+`/data/paper_v12.sqlite3`, nem mexe nas carteiras virtuais verdadeiras
+do monitor.** Serve apenas para comprovar visualmente a movimentação.
+
+Para executar somente testes locais, sem mandar nada ao Telegram:
+
+    python demonstracao_carteiras_v12.py --self-test
+
 
 ## Aceleração por WebSocket — opcional
 
@@ -141,6 +187,8 @@ envia **uma única mensagem** para Telegram com:
 - Odds arredondadas a **duas casas e com vírgula decimal** para leitura,
   por exemplo 1,09. A amostra SQLite mantém o valor numérico original;
 - Valor total do ensaio até 10 €; resultado condicional, incluindo perdas;
+- Saldo atual das **duas carteiras virtuais**, apenas lido na base V12 sem
+  efetuar débitos. Se a base ainda não existir, indica saldo indisponível;
 - Aviso **MARGEM NEGATIVA — NÃO APOSTAR**, quando aplicável;
 - Horas de início de cada plataforma quando diferirem, e hora da leitura;
 - Texto simples na consola e versão Telegram com títulos a negrito.
