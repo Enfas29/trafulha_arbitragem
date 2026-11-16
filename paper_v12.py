@@ -387,8 +387,8 @@ def format_open_message(conn, trade_id, odds_poly=None, odds_sx=None,
         f"📈 Lucro condicional previsto: {eur(record['conditional_profit_cents'])}",
         f"📊 ROI condicional: {100 * record['conditional_profit_cents'] / (record['poly_debit_cents'] + record['sx_debit_cents']):+.2f}%"
         + (" · 🧪 MARGEM BAIXA / EXPERIMENTAL" if
-           record["conditional_profit_cents"] * 100 <
-           0.015 * (record["poly_debit_cents"] + record["sx_debit_cents"]) * 100
+           record["conditional_profit_cents"] /
+           (record["poly_debit_cents"] + record["sx_debit_cents"]) < 0.015
            else ""),
         "🔒 Apenas dinheiro fictício. Sem apostas reais.",
     ]
