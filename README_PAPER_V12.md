@@ -245,6 +245,42 @@ de ser iguais porque são preços para resultados **opostos**. E a melhor
 odd pode diferir da odd efetiva ao consumir vários níveis de liquidez.
 As odds observadas são um instante e podem mudar no site segundos depois.
 
+## Reação rápida às mudanças de odds — testes de latência
+
+O `monitor_v11.py` foi ajustado para reduzir a latência de **deteção**:
+- O monitor já reage a alterações WebSocket em mercados subscritos, mas
+  antes impunha uma espera mínima artificial de 8 segundos após sinais.
+  Agora verifica os eventos em intervalos de ~100 ms na espera e mantém
+  um intervalo mínimo de 2 segundos entre ciclos acionados por WebSocket.
+- `MONITOR_WS_REACT_GAP_SECONDS` permite configurar o intervalo de
+  proteção (de 1 a 10 segundos, por defeito `2.0`). Não é necessário
+  adicionar esta variável para beneficiar da alteração.
+- As linhas `SCAN` mostram `duracao_ms`,
+  `maior_leitura_ms` e `sinais_WS_verificados`, para medir
+  o tempo consumido pela análise e por pedidos REST.
+- Isto só acelera os **mercados subscritos**. Atualmente, a Polymarket
+  subscreve até 24 tokens e a SX Bet até 12 mercados, dos candidatos
+  priorizados. O monitor continua a percorrer os restantes em rotação;
+  NÃO existe garantia de reação inferior a 10 segundos em todos os jogos.
+- A leitura REST continua obrigatória para confirmar os livros; não
+  assumir que a odd do evento WebSocket ainda é executável.
+- **Execução real permanece desativada**. Em jogos iniciados, o V12
+  faz diagnóstico quando autorizado pelas condições do feed mas a abertura
+  de operações fictícias em modo `LIVE_NAO_CONFIRMADO` continua
+  desativada por defeito. Não ligar `PAPER_V12_LIVE_UNVERIFIED`
+  sem verificar estado do jogo e equivalência de liquidação.
+- Não usar lucro bruto estimado como garantia: uma execução de duas
+  pernas pode falhar ou preencher a preços diferentes.
+
+Para verificar a instalação:
+
+    python monitor_v11.py --self-test
+
+Depois, no Railway **Deploy Logs**, procurar `WS FAST` e `SCAN`.
+O alvo é medir consistentemente tempos de deteção, não prometer
+fills abaixo de 10 segundos sem API de ordens, autenticação e simulação
+de execução validadas.
+
 ## Auditoria de vários jogos com odds reais — incluindo futebol
 
 Em **Railway → trafulha_arbitragem → Console**, depois de
