@@ -149,6 +149,41 @@ def explicit_question_category(text, teams):
     return None
 
 
+def gamma_soccer_market_eligible(m, teams):
+    """Verifica resultados 1X2 de futebol sem confundir mercados parciais.
+
+    Os mercados de empate 1X2 podem vir com metadados diferentes.
+    Só incluir variantes não-moneyline quando 'Draw' estiver explícito,
+    houver um par Yes/No e nenhuma indicação de mercado parcial, handicap,
+    double chance ou draw-no-bet.
+    """
+    kind = str(m.get("sportsMarketType") or "").strip().lower()
+    if kind == "moneyline":
+        return True
+    question = str(m.get("question") or "")
+    title = str(m.get("title") or "")
+    group = str(m.get("groupItemTitle") or "")
+    slug = str(m.get("slug") or "")
+    combined = bot.ascii_name(" ".join((question, title, group, slug)))
+    forbidden = (
+        "draw no bet", "double chance", "first half", "second half",
+        "half time", "halftime", "overtime", "extra time", "qualify",
+        "advance", "penalties", "spread", "handicap", "total goals",
+        "corners", "correct score", "both teams", "btts",
+    )
+    if any(term in combined for term in forbidden):
+        return False
+    if kind and kind not in {"1x2", "soccer_1x2", "draw"}:
+        return False
+    label = gamma_market_category(m, teams)
+    if label != "draw":
+        return False
+    outcomes = parse_list(m.get("outcomes"))
+    return len(outcomes) == 2 and {
+        bot.ascii_name(x) for x in outcomes
+    } == {"yes", "no"}
+
+
 def gamma_market_category(m, teams):
     """Classificar 1/X/2 pelos rótulos explícitos e perguntas consistentes.
 
@@ -254,13 +289,12 @@ def poly_soccer_events(now=None):
             for m in event.get("markets") or []:
                 if m.get("closed") or m.get("active") is False:
                     continue
-                if not bot.is_poly_moneyline(m):
+                if not gamma_soccer_market_eligible(m, teams):
                     continue
                 outcomes = parse_list(m.get("outcomes"))
-                assets = parse_list(
-                    m.get("positionIds") if m.get("version") == "v2"
-                    else m.get("clobTokenIds")
-                )
+                assets = parse_list(m.get("clobTokenIds"))
+                if not assets:
+                    assets = parse_list(m.get("positionIds"))
                 if len(outcomes) != len(assets):
                     continue
                 title = str(m.get("question") or m.get("title") or name)
@@ -948,6 +982,36 @@ def tests():
     assert gamma_market_category(
         {"groupItemTitle": "Draw"}, p["teams"]
     ) == "draw"
+    assert gamma_soccer_market_eligible({
+        "sportsMarketType": "moneyline",
+        "question": "Will Team Alpha win?",
+        "outcomes": '["Yes","No"]'
+    }, p["teams"])
+    assert gamma_soccer_market_eligible({
+        "sportsMarketType": "",
+        "groupItemTitle": "Draw (Team Alpha vs Team Beta)",
+        "question": "Will Team Alpha vs Team Beta end in a draw?",
+        "outcomes": '["Yes","No"]'
+    }, p["teams"])
+    assert not gamma_soccer_market_eligible({
+        "sportsMarketType": "",
+        "groupItemTitle": "Draw (Team Alpha vs Team Beta)",
+        "question": "First half: will Team Alpha vs Team Beta end in a draw?",
+        "outcomes": '["Yes","No"]'
+    }, p["teams"])
+    assert not gamma_soccer_market_eligible({
+        "sportsMarketType": "soccer_spread",
+        "groupItemTitle": "Draw",
+        "question": "Spread draw",
+        "outcomes": '["Yes","No"]'
+    }, p["teams"])
+    assert not gamma_soccer_market_eligible({
+        "sportsMarketType": "",
+        "groupItemTitle": "Draw",
+        "question": "Draw no bet Team Alpha vs Team Beta",
+        "outcomes": '["Yes","No"]'
+    }, p["teams"])
+
     # Newcastle vs Arsenal: Gamma pode acrescentar o confronto no rótulo Draw.
     opponents = ("Newcastle United FC", "Arsenal FC")
     assert gamma_market_category({
