@@ -35,7 +35,7 @@ SUMMARY_INTERVAL = max(3600, int(os.getenv("MONITOR_SUMMARY_SECONDS", "21600")))
 OUTAGE_THRESHOLD = max(900, int(os.getenv("MONITOR_OUTAGE_SECONDS", "1800")))
 OUTAGE_REPEAT = max(1800, int(os.getenv("MONITOR_OUTAGE_REPEAT_SECONDS", "3600")))
 MAX_SKEW = 6.0
-MIN_ROI = bot.MIN_NET_ROI
+MIN_ROI = paper.MIN_NET_ROI    # Usar mesmo ROI do Paper V12, nunca o limiar legado V11
 PAPER_V12_ENABLED = os.getenv("PAPER_V12_ENABLED", "0").strip().lower() in {"1", "true", "yes"}
 SX_WS_V12_ENABLED = os.getenv("SX_WS_V12_ENABLED", "0").strip().lower() in {"1", "true", "yes"}
 POLY_WS_V12_ENABLED = os.getenv("POLY_WS_V12_ENABLED", "0").strip().lower() in {"1", "true", "yes"}
@@ -386,6 +386,7 @@ def send_summary(conn, catalog_count, startup=False, now_epoch=None, paper_conn=
     if paper_conn is not None:
         totals = paper.paper_summary(paper_conn)
         message += (
+            f"\n🧪 Paper: ROI mínimo configurado {100 * paper.MIN_NET_ROI:.2f}%"
             f"\n🧾 Paper: {totals['open_trades']} abertas · "
             f"{totals['settled']} liquidadas"
             f"\n💰 Polymarket: {paper.eur(int(round(totals['poly_free_eur'] * 100)))} livres"
@@ -539,8 +540,10 @@ def main(once=False):
     if PAPER_V12_ENABLED and paper_conn is None:
         LOG.warning("PAPER V12 pediu ativação, mas EUR_PER_USD inválido/ausente: desativado.")
     if paper_conn is not None:
-        LOG.info("PAPER V12 ATIVO: 1000 EUR virtuais por plataforma, "
-                 "máximo 100 EUR total por operação, sem apostas reais.")
+        LOG.info("PAPER V12 ATIVO: ROI mínimo %.2f%% após custos simulados; "
+                 "1000 EUR virtuais por plataforma, "
+                 "máximo 100 EUR total por operação, sem apostas reais.",
+                 100 * paper.MIN_NET_ROI)
     pairs, cursor = [], 0
     last_catalog = 0.0
     iteration = 0
