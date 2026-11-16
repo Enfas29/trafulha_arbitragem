@@ -22,7 +22,20 @@ INITIAL_CENTS = 100_000                 # 1.000 EUR em cada plataforma
 MAX_TRADE_CENTS = 10_000                # 100 EUR TOTAL, incluindo custos
 MAX_OPEN_EXPOSURE_CENTS = 50_000        # máximo 500 EUR expostos em conjunto
 MIN_TRADE_CENTS = 500                  # mínimo de 5 EUR por operação
-MIN_NET_ROI = 0.015                    # 1,5%, antes de considerar risco de liquidação
+# Percentagem para papel: PAPER_V12_MIN_NET_ROI_PCT=0.5 significa 0,5%.
+# A configuração não ativa ordens REAIS; só muda o limiar de registo virtual.
+def read_min_roi():
+    raw = os.getenv("PAPER_V12_MIN_NET_ROI_PCT", "1.5").strip().replace(",", ".")
+    try:
+        pct = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("PAPER_V12_MIN_NET_ROI_PCT deve ser uma percentagem, ex. 0.5") from exc
+    if not (math.isfinite(pct) and 0.5 <= pct <= 15.0):
+        raise ValueError("PAPER_V12_MIN_NET_ROI_PCT deve estar entre 0.5 e 15.0")
+    return pct / 100.0
+
+
+MIN_NET_ROI = read_min_roi()          # padrão 1,5%; piloto 0,5% no Railway
 POLY_TAKER_FEE_RATE = 0.05             # parâmetro desportivo indicado no help center
 ADVERSE_PRICE_BUFFER = 0.0125          # 1,25% por perna, reserva NÃO oficial
 MAX_SNAPSHOT_GAP_SECONDS = 4.0
@@ -372,6 +385,11 @@ def format_open_message(conn, trade_id, odds_poly=None, odds_sx=None,
         "",
         "⏳ Resultado: AGUARDA LIQUIDAÇÃO",
         f"📈 Lucro condicional previsto: {eur(record['conditional_profit_cents'])}",
+        f"📊 ROI condicional: {100 * record['conditional_profit_cents'] / (record['poly_debit_cents'] + record['sx_debit_cents']):+.2f}%"
+        + (" · 🧪 MARGEM BAIXA / EXPERIMENTAL" if
+           record["conditional_profit_cents"] * 100 <
+           0.015 * (record["poly_debit_cents"] + record["sx_debit_cents"]) * 100
+           else ""),
         "🔒 Apenas dinheiro fictício. Sem apostas reais.",
     ]
     return "\n".join(message)
@@ -528,6 +546,26 @@ def try_paper_entry(conn, pair, poly_levels, sx_levels, fx, stage, skew):
 
 def self_test():
     import tempfile
+
+    # Um livro sintético com ROI entre 0,5 e 1,5% tem de passar SOMENTE
+    # no piloto, continuando a aplicar taxa, buffer e limite de 100 EUR.
+    global MIN_NET_ROI
+    saved_min = MIN_NET_ROI
+    try:
+        MIN_NET_ROI = 0.005
+        pilot = select_shadow_quote(
+            [(0.45, 300)], [(0.516, 300)], 0.91,
+            100_000, 100_000,
+        )
+        assert pilot is not None and 0.005 <= pilot.roi < 0.015, pilot
+        assert pilot.total_cents <= MAX_TRADE_CENTS
+        MIN_NET_ROI = 0.015
+        assert select_shadow_quote(
+            [(0.45, 300)], [(0.516, 300)], 0.91,
+            100_000, 100_000,
+        ) is None
+    finally:
+        MIN_NET_ROI = saved_min
 
     q = select_shadow_quote([(0.43, 300)], [(0.50, 300)], 0.91, 100_000, 100_000)
     assert q and q.total_cents <= 10_000 and q.profit_eur > 0
