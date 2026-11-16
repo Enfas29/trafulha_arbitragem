@@ -581,6 +581,51 @@ def self_test():
         assert not report_due(conn)
         assert conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 0
         conn.close()
+    # Integração offline: um sinal WS entra ANTES da rotação normal.
+    # Nunca usa APIs reais nem cria uma aposta real/virtual.
+    import io
+    from contextlib import suppress
+    with tempfile.TemporaryDirectory() as td:
+        db = open_database(str(Path(td) / "priority.sqlite3"))
+        now = time.time()
+        observed = []
+        pairs = [{
+            "key": str(i), "poly_asset": f"poly-{i}",
+            "poly": {"id": f"market-{i}"},
+            "sx": {"hash": f"sx-{i}", "start": now + 3600,
+                   "live_enabled": False, "sport": "tennis",
+                   "teams": ("Team A", "Team B")},
+            "sx_target": 1,
+            "poly_label": "Team A", "sx_label": "Team B",
+        } for i in range(3)]
+        queue = ws_priority.PriorityCache(max_priority=1)
+        queue.rebuild(pairs)
+        queue.ingest({"poly-2": time.monotonic() - 0.01})
+        old_poly_book, old_sx_book = bot.poly_book, bot.sx_book
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        old_level = LOG.level
+        LOG.addHandler(handler)
+        LOG.setLevel(logging.INFO)
+        try:
+            def fake_poly(asset):
+                observed.append(asset)
+                return [(0.55, 300)], time.monotonic()
+            def fake_sx(market, target):
+                return [(0.60, 300)], time.monotonic()
+            bot.poly_book, bot.sx_book = fake_poly, fake_sx
+            result = scan_pass(db, pairs, 0, fx=0, priority_cache=queue)
+            assert result["checked"] == 3
+            assert observed == ["poly-2", "poly-0", "poly-1"]
+            assert "WS_LATENCY" in stream.getvalue()
+            assert "evento_ate_validacao_ms_max=" in stream.getvalue()
+            assert not queue.pending
+            assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 3
+        finally:
+            bot.poly_book, bot.sx_book = old_poly_book, old_sx_book
+            LOG.removeHandler(handler)
+            LOG.setLevel(old_level)
+            db.close()
     print("✅ Monitor V11: testes locais OK (sem APIs, sem apostas)")
 
 
