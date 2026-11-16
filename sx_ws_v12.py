@@ -19,6 +19,23 @@ SX_TOKEN_URL = "https://api.sx.bet/user/realtime-token-v3/api-key"
 MAX_WATCHED = 12
 
 
+def make_subscription_handler(base_class, market_hash, on_book):
+    """Handler de eventos compatível com centrifuge-python.
+
+    SubscriptionEventHandler é uma classe base com métodos assíncronos,
+    não um construtor que aceite callbacks por palavra-chave.
+    """
+    class BookHandler(base_class):
+        async def on_publication(self, ctx):
+            on_book(market_hash)
+
+        async def on_subscribed(self, ctx):
+            LOG.info("SX WS V12: canal de livro subscrito (%s).",
+                     market_hash[:12])
+
+    return BookHandler()
+
+
 class SXBookHints:
     def __init__(self, key=None):
         self.key = key if key is not None else os.getenv("SX_API_KEY", "")
@@ -81,21 +98,16 @@ class SXBookHints:
                 await asyncio.sleep(5)
                 continue
             client = None
+            phase = "criar cliente"
             try:
                 client = Client(SX_WS, get_token=self.get_token)
+                phase = "ligar"
                 await client.connect()
                 subscriptions = []
+                phase = "subscrever"
                 for market_hash in selected:
-                    async def on_update(ctx, market_hash=market_hash):
-                        self.signal(market_hash)
-
-                    async def on_subscribed(ctx, market_hash=market_hash):
-                        LOG.info("SX WS V12: canal de livro subscrito (%s).",
-                                 market_hash[:12])
-
-                    listener = SubscriptionEventHandler(
-                        on_publication=on_update,
-                        on_subscribed=on_subscribed,
+                    listener = make_subscription_handler(
+                        SubscriptionEventHandler, market_hash, self.signal
                     )
                     sub = client.new_subscription(
                         f"orderbook_v3:{market_hash}", listener
@@ -107,14 +119,19 @@ class SXBookHints:
                     "A aguardar eventos.",
                     len(subscriptions),
                 )
+                phase = "receber eventos"
                 while self.running:
                     await asyncio.sleep(3)
                     with self.lock:
                         if self.watched != selected:
                             break
             except Exception as exc:
-                LOG.warning("SX WS indisponível (%s), REST mantém-se ativo.",
-                            type(exc).__name__)
+                # Não incluir tokens nem cabeçalhos de autenticação nos logs.
+                LOG.warning(
+                    "SX WS indisponível na fase '%s' (%s); "
+                    "REST mantém-se ativo.",
+                    phase, type(exc).__name__,
+                )
                 await asyncio.sleep(10)
             finally:
                 if client is not None:
@@ -152,7 +169,19 @@ def self_test():
     assert not f.wake.is_set()
     f.update(["c"])
     assert f.watched == ("c",)
-    print("✅ SX WS V12: testes locais do mecanismo de sinais OK")
+
+    # A classe oficial de eventos não aceita callbacks no construtor.
+    # Simular essa interface sem ligar às APIs.
+    class StrictEventHandler:
+        def __init__(self):
+            pass
+
+    listener = make_subscription_handler(StrictEventHandler, "c", f.signal)
+    asyncio.run(listener.on_subscribed(None))
+    asyncio.run(listener.on_publication(None))
+    assert f.take_hot() == {"c"}
+    assert f.received_events == 2
+    print("✅ SX WS V12: eventos, subscrição e handler compatíveis (offline)")
 
 
 if __name__ == "__main__":
