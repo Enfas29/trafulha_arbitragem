@@ -253,30 +253,67 @@ def read_wallet_balances():
         return None
 
 
+def telegram_parts(message, max_chars=3600):
+    """Dividir diagnósticos longos respeitando linhas e limite do Telegram."""
+    text = str(message)
+    if not text.strip():
+        return []
+    result = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        while len(line) > max_chars:
+            if current:
+                result.append(current.rstrip("\n"))
+                current = ""
+            result.append(line[:max_chars])
+            line = line[max_chars:]
+        if len(current) + len(line) > max_chars and current:
+            result.append(current.rstrip("\n"))
+            current = ""
+        current += line
+    if current.strip():
+        result.append(current.rstrip("\n"))
+    return result
+
+
 def send_telegram(message, html_mode=False):
-    """Verificação do envio sem revelar token em erros da API."""
+    """Enviar mensagem sem parse_mode=null (rejeitado por Telegram).
+
+    O teste sem HTML usa só texto plano. Não imprimir token de Bot API,
+    nem cabeçalhos ou payloads sensíveis nos logs.
+    """
     if not (bot.TG_TOKEN and bot.TG_CHAT):
-        print("⚠️ Telegram não configurado: mostrarei o teste apenas na consola.")
+        print("⚠️ Telegram não configurado: relatório apenas na consola.")
+        return False
+    parts = telegram_parts(message)
+    if not parts:
+        print("⚠️ Telegram: mensagem vazia, não enviada.")
         return False
     try:
         import requests
-        response = requests.post(
-            f"https://api.telegram.org/bot{bot.TG_TOKEN}/sendMessage",
-            json={
+        for part in parts:
+            payload = {
                 "chat_id": bot.TG_CHAT,
-                "text": message,
-                "parse_mode": "HTML" if html_mode else None,
+                "text": part,
                 "disable_web_page_preview": True,
-            },
-            timeout=12,
-        )
-        if response.status_code != 200 or response.json().get("ok") is not True:
-            print(f"⚠️ Telegram respondeu com HTTP {response.status_code}.")
-            return False
+            }
+            if html_mode:
+                payload["parse_mode"] = "HTML"
+            response = requests.post(
+                f"https://api.telegram.org/bot{bot.TG_TOKEN}/sendMessage",
+                json=payload, timeout=12
+            )
+            if response.status_code != 200:
+                print(f"⚠️ Telegram devolveu HTTP {response.status_code}.")
+                return False
+            if response.json().get("ok") is not True:
+                print("⚠️ Telegram não confirmou a entrega do relatório.")
+                return False
         return True
     except Exception:
         print("⚠️ Não foi possível confirmar o envio para o Telegram.")
         return False
+
 
 
 def run_once():
@@ -358,6 +395,35 @@ def self_test():
     rich = format_message(snap, html_mode=True)
     assert "<b>POLYMARKET</b>" in rich
     assert "<b>Team A</b>" in rich and "<b>Team B</b>" in rich
+    assert telegram_parts("") == []
+    assert telegram_parts("a\nb\nc", max_chars=2) == ["a", "b", "c"]
+    assert all(len(chunk) <= 3600
+               for chunk in telegram_parts("linha\n" * 1400))
+    # Confirmar que o Telegram recebe texto sem parse_mode null.
+    import requests
+    old_post = requests.post
+    sent = []
+    class FakeResponse:
+        status_code = 200
+        def json(self):
+            return {"ok": True}
+    try:
+        def fake_post(url, json, timeout):
+            sent.append(json)
+            return FakeResponse()
+        requests.post = fake_post
+        old_token, old_chat = bot.TG_TOKEN, bot.TG_CHAT
+        try:
+            bot.TG_TOKEN, bot.TG_CHAT = "TEST_TOKEN", "TEST_CHAT"
+            assert send_telegram("AUDITORIA TESTE", html_mode=False)
+            assert "parse_mode" not in sent[-1]
+            assert send_telegram("<b>TESTE</b>", html_mode=True)
+            assert sent[-1]["parse_mode"] == "HTML"
+        finally:
+            bot.TG_TOKEN, bot.TG_CHAT = old_token, old_chat
+    finally:
+        requests.post = old_post
+
     with tempfile.TemporaryDirectory() as d:
         path = str(Path(d) / "test.sqlite3")
         assert record_snapshot(snap, path) == 1
