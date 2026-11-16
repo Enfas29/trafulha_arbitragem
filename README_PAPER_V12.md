@@ -50,6 +50,38 @@ No serviço `trafulha_arbitragem`, **Variables**:
 
     PAPER_V12_ENABLED=1
     PAPER_V12_DB=/data/paper_v12.sqlite3
+    PAPER_V12_MIN_NET_ROI_PCT=0.5
+
+O limiar anterior era **1,5%**. A nova variável
+`PAPER_V12_MIN_NET_ROI_PCT=0.5` ativa um **piloto de 0,5% apenas
+no Paper Trading**. É uma percentagem: não uses `0.005` nem `50`.
+
+- Com a variável ausente, o padrão continua **1,5%**.
+- A faixa permitida é de 0,5% a 15%; valores inválidos causam erro no arranque.
+- Mantemos 100 € virtuais no máximo por operação, 500 € de exposição aberta,
+  1.000 € de saldo inicial por plataforma e sem apostas reais.
+- As operações virtuais abaixo de 1,5% são identificadas no Telegram como
+  **MARGEM BAIXA / EXPERIMENTAL**.
+- O ROI é calculado depois de **taxas e reservas estimadas**, mas não prova
+  execução ou liquidação equivalente nos dois mercados.
+- **Futebol 1X2 e hóquei ficam excluídos** da execução virtual automática;
+  a auditoria de odds desses desportos é independente do motor de arbitragem.
+- Alterar a percentagem não altera operações já abertas nem reinicia carteiras.
+
+Para verificar o novo limiar, consulta **Railway → Deploy Logs** e procura
+`PAPER V12 ATIVO: ROI mínimo 0.50%`.
+
+Em **Railway → Console**, confirma o funcionamento:
+
+    python paper_v12.py --self-test
+    python test_integration_v12.py
+    python paper_v12.py --summary
+    python paper_v12.py --list-open
+
+`demonstracao_carteiras_v12.py` usa livros completamente fictícios; o monitor
+normal consulta as odds reais REST e apenas regista operações virtuais se
+encontrar uma oportunidade que passe todos os filtros. Mesmo com 0,5%, pode
+não abrir nenhuma operação durante várias horas ou dias.
 
 Conservar as variáveis já configuradas:
 
