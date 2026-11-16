@@ -213,6 +213,47 @@ de ser iguais porque são preços para resultados **opostos**. E a melhor
 odd pode diferir da odd efetiva ao consumir vários níveis de liquidez.
 As odds observadas são um instante e podem mudar no site segundos depois.
 
+## Auditoria de vários jogos com odds reais — incluindo futebol
+
+Em **Railway → trafulha_arbitragem → Console**, depois de
+confirmar o último teste verde no GitHub Actions:
+
+    python auditoria_jogos_v12.py --sport soccer --count 3
+
+O comando tenta encontrar até 3 jogos de FUTEBOL diferentes com mercados
+nas duas plataformas, e envia uma mensagem por jogo com os preços de compra
+dos desfechos **vitória casa / empate / vitória fora**, quando esses
+desfechos são identificáveis em cada livro. Mostra "sem cotação" quando
+não há preço: nunca inventa um resultado nem uma odd.
+
+Para testar outras modalidades (apostas opostas e até 10 € hipotéticos):
+
+    python auditoria_jogos_v12.py --sport tennis --count 3
+    python auditoria_jogos_v12.py --sport basketball --count 3
+    python auditoria_jogos_v12.py --sport american_football --count 3
+
+- O teste é **pontual**, não modifica `PAPER_V12_DB`, não realiza
+  apostas reais, nem debita carteiras virtuais.
+- Faz comparações de mercados com **nomes das duas equipas e hora próxima**,
+  não assume que mercados com nomes parecidos têm regras iguais.
+- Em futebol, **NÃO CALCULA ARBITRAGEM de duas pernas**, porque o empate
+  é um terceiro resultado e "Não equipa A" não é equivalente a "Equipa B".
+  Nem todos os 1X2 são executáveis pela mesma seleção em ambas as plataformas.
+- Nos outros desportos, mantém os valores hipotéticos/odds do
+  `teste_odds_reais_v12.py` (inclui margens negativas).
+- O histórico independente `/data/odds_auditoria_v12.sqlite3` marca
+  jogos já enviados para preferir confrontos diferentes noutras execuções.
+- Se não houver jogos cruzados/odds, o comando diz isso na consola e **não
+  manda dados fictícios**.
+- `--count` aceita entre 1 e 5 para limitar o número de pedidos e mensagens.
+
+Teste sem APIs nem Telegram:
+
+    python auditoria_jogos_v12.py --self-test
+
+Os horários, odds e regras de liquidação têm de ser comparados em cada
+plataforma; odds são instantâneas e podem mudar antes de abrires as páginas.
+
 ## Por validar antes de qualquer execução com dinheiro real
 
 1. Regras de liquidação em cenários excecionais: desistências no ténis,
