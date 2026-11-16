@@ -46,3 +46,6 @@ jobs:
 
       - name: Testar cotacao pontual com margem negativa (offline)
         run: python teste_odds_reais_v12.py --self-test
+
+      - name: Testar dois avisos e carteiras fictícias (offline)
+        run: python demonstracao_carteiras_v12.py --self-test
