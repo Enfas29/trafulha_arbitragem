@@ -65,27 +65,71 @@ def category(label, teams):
     return None
 
 
-def gamma_market_category(m, teams):
-    # Primeiro nome individual explícito; em segundo lugar, título do mercado.
-    for field in ("groupItemTitle", "title", "question"):
-        value = str(m.get(field) or "").strip()
-        cat = category(value, teams)
-        if cat:
-            return cat
-        normalized = bot.ascii_name(value)
-        if normalized and re.search(r"\b(draw|tie|empate)\b", normalized):
-            if re.search(r"\b(will|result|end|finish|match|jogo)\b", normalized):
-                return "draw"
-        hits = [
-            bool(bot.comparable(team) and
-                 bot.comparable(team) in bot.comparable(value))
-            for team in teams
+def explicit_question_category(text, teams):
+    """Classificar perguntas EXPLÍCITAS, nunca procurar uma equipa em 'A vs B'.
+
+    'Will Man City vs Fulham end in a draw?' NÃO significa aposta no Fulham.
+    Um título com o nome das duas equipas é metadado do evento, não um
+    resultado individual.
+    """
+    text = bot.ascii_name(text)
+    if not text:
+        return None
+
+    # Mercados diferentes de 1X2 não podem virar vitória/empate por texto.
+    if any(flag in text for flag in (
+        "draw no bet", "double chance", "first half", "second half",
+        "half time", "halftime", "to qualify", "to advance",
+        "extra time", "penalties",
+    )):
+        return None
+
+    # A palavra 'draw' apenas identifica empate quando a PERGUNTA
+    # pede explicitamente esse desfecho.
+    if (re.search(r"\b(?:draw|tie|empate)\b", text)
+            and re.search(
+                r"\b(?:end|ends|finish|finishes|result|be|is|ends up)\b"
+                r"(?:\s+\w+){0,5}\s+(?:draw|tie|empate)\b",
+                text,
+            )):
+        return "draw"
+    if re.fullmatch(r"(?:draw|tie|empate)", text):
+        return "draw"
+
+    # Só 'Will <equipa> win/beat ...?' ou '<equipa> to win?'.
+    candidates = []
+    m = re.match(r"^(?:will|does|can)\s+(.+?)\s+(?:win|beat)\b", text)
+    if m:
+        candidates.append(m.group(1))
+    m = re.match(r"^(.+?)\s+to win\b", text)
+    if m:
+        candidates.append(m.group(1))
+    for candidate in candidates:
+        matched = [
+            side for side, team in (("home", teams[0]), ("away", teams[1]))
+            if bot.same_team(candidate, team)
         ]
-        if hits == [True, False]:
-            return "home"
-        if hits == [False, True]:
-            return "away"
+        if len(matched) == 1:
+            return matched[0]
     return None
+
+
+def gamma_market_category(m, teams):
+    """Exigir identificação inequívoca do desfecho; conflito => excluir.
+
+    'groupItemTitle' é um rótulo de desfecho quando coincide exatamente
+    com uma equipa ou 'Draw'. Se a pergunta indicar outro desfecho, não
+    atribuimos o token a nenhum dos lados.
+    """
+    item = category(m.get("groupItemTitle"), teams)
+    question = explicit_question_category(m.get("question"), teams)
+    title = explicit_question_category(m.get("title"), teams)
+    explicit = [value for value in (item, question, title) if value is not None]
+    if not explicit:
+        return None
+    if len(set(explicit)) > 1:
+        return None
+    return explicit[0]
 
 
 def poly_soccer_events(now=None):
@@ -504,6 +548,34 @@ def tests():
     assert gamma_market_category(
         {"groupItemTitle": "Draw"}, p["teams"]
     ) == "draw"
+    # Regressão com caso real: o preço do EMPATE não pode ser rotulado Fulham.
+    football = ("Manchester City", "Fulham")
+    assert gamma_market_category({
+        "question": "Will Man City vs Fulham end in a draw?"
+    }, football) == "draw"
+    assert gamma_market_category({
+        "groupItemTitle": "Fulham",
+        "question": "Will Man City vs Fulham end in a draw?"
+    }, football) is None
+    assert gamma_market_category({
+        "question": "Manchester City vs Fulham"
+    }, football) is None
+    assert gamma_market_category({
+        "groupItemTitle": "Draw",
+        "question": "Man City vs Fulham"
+    }, football) == "draw"
+    assert gamma_market_category({
+        "groupItemTitle": "Fulham",
+        "question": "Will Fulham win against Manchester City?"
+    }, football) == "away"
+    assert gamma_market_category({
+        "groupItemTitle": "Manchester City",
+        "question": "Will Manchester City win against Fulham?"
+    }, football) == "home"
+    assert gamma_market_category({
+        "question": "Will Man City vs Fulham end in a draw?"
+    }, football) != "away"
+
     assert category("Not Team Beta", p["teams"]) is None
     assert category("Team Alpha", p["teams"]) == "home"
     assert category("Team Beta", p["teams"]) == "away"
