@@ -150,19 +150,35 @@ def explicit_question_category(text, teams):
 
 
 def gamma_market_category(m, teams):
-    """Exigir identificação inequívoca do desfecho; conflito => excluir.
+    """Classificar 1/X/2 pelos rótulos explícitos e perguntas consistentes.
 
-    'groupItemTitle' é um rótulo de desfecho quando coincide exatamente
-    com uma equipa ou 'Draw'. Se a pergunta indicar outro desfecho, não
-    atribuimos o token a nenhum dos lados.
+    A Gamma pode usar groupItemTitle='Draw (Team A vs Team B)' para o
+    mesmo mercado que a UI rotula apenas 'Draw'. Exigir que o par de
+    equipas entre parênteses corresponda ao evento inteiro.
     """
-    item = category(m.get("groupItemTitle"), teams)
+    raw_item = str(m.get("groupItemTitle") or "").strip()
+    item = category(raw_item, teams)
+    if item is None:
+        # Apenas o rótulo do mercado, nunca o título geral do evento.
+        match = re.fullmatch(
+            r"(?:draw|tie|empate)\s*\(\s*(.+?)\s*\)\s*",
+            raw_item, re.I,
+        )
+        if match:
+            opponents = bot.parse_title(match.group(1))
+            if opponents and match_teams(*opponents, *teams):
+                item = "draw"
+
     question = explicit_question_category(m.get("question"), teams)
     title = explicit_question_category(m.get("title"), teams)
-    explicit = [value for value in (item, question, title) if value is not None]
-    if not explicit:
-        return None
-    if len(set(explicit)) > 1:
+    # Alguns contratos 1X2 da Gamma são identificáveis diretamente
+    # pelo slug do evento + '-draw'. A pergunta não pode contradizê-los.
+    slug = bot.ascii_name(m.get("slug"))
+    suffix = slug.endswith(" draw") and bool(slug)
+    guess = "draw" if suffix and not item and not question and not title else None
+    explicit = [value for value in (item, question, title, guess)
+                if value is not None]
+    if not explicit or len(set(explicit)) != 1:
         return None
     return explicit[0]
 
@@ -876,6 +892,26 @@ def tests():
     assert gamma_market_category(
         {"groupItemTitle": "Draw"}, p["teams"]
     ) == "draw"
+    # Newcastle vs Arsenal: Gamma pode acrescentar o confronto no rótulo Draw.
+    opponents = ("Newcastle United FC", "Arsenal FC")
+    assert gamma_market_category({
+        "groupItemTitle": "Draw (Newcastle United FC vs Arsenal FC)"
+    }, opponents) == "draw"
+    assert gamma_market_category({
+        "groupItemTitle": "Draw (Newcastle United FC vs Liverpool FC)"
+    }, opponents) is None
+    assert gamma_market_category({
+        "groupItemTitle": "Draw (Newcastle United FC vs Arsenal FC)",
+        "question": "Will Arsenal FC win?"
+    }, opponents) is None
+    assert gamma_market_category({
+        "groupItemTitle": "Draw",
+        "question": "Will Newcastle United FC vs Arsenal FC end in a draw?"
+    }, opponents) == "draw"
+    assert gamma_market_category({
+        "slug": "epl-new-ars-2026-11-21-draw",
+        "question": "Newcastle vs Arsenal"
+    }, opponents) == "draw"
     # Regressão com caso real: o preço do EMPATE não pode ser rotulado Fulham.
     football = ("Manchester City", "Fulham")
     assert gamma_market_category({
