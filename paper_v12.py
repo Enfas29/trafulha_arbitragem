@@ -168,6 +168,10 @@ def open_database(path=PAPER_DB):
       CREATE TABLE IF NOT EXISTS paper_v12_wallets(
         platform TEXT PRIMARY KEY, free_cents INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS paper_v12_notifications(
+        trade_id INTEGER PRIMARY KEY,
+        sent_epoch INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS paper_v12_trades(
         id INTEGER PRIMARY KEY,
         event_key TEXT UNIQUE NOT NULL,
@@ -315,6 +319,131 @@ def paper_summary(conn):
     }
 
 
+
+def eur(value_cents):
+    """Apresentação portuguesa dos cêntimos de uma carteira virtual."""
+    return f"{int(value_cents) / 100:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".") + " €"
+
+
+def trade_details(conn, trade_id):
+    """Linha completa da operação, sem alterar saldos ou estados."""
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM paper_v12_trades WHERE id=?", (int(trade_id),)
+    ).fetchone()
+    return row
+
+
+def format_wallets(conn):
+    """Mostra apenas saldo livre; capital aberto continua reservado."""
+    balances = free_balances(conn)
+    return (
+        f"💰 Carteira Polymarket: {eur(balances['poly'])}\n"
+        f"💰 Carteira SX Bet: {eur(balances['sx'])}"
+    )
+
+
+def format_open_message(conn, trade_id, odds_poly=None, odds_sx=None,
+                        demo=False):
+    """Mensagem enviada apenas para uma OPERAÇÃO VIRTUAL efetivamente registada."""
+    record = trade_details(conn, trade_id)
+    if record is None or record["status"] != "OPEN_CONDITIONAL":
+        raise ValueError("Operação virtual aberta não encontrada")
+    def odds(value):
+        return f" | odd {value:.2f}".replace(".", ",") if value is not None else ""
+
+    message = [
+        f"🧪 {'DEMONSTRAÇÃO FICTÍCIA' if demo else 'APOSTA VIRTUAL'} #{trade_id}",
+        f"🏟️ {record['event']}",
+        "",
+        "1️⃣ POLYMARKET",
+        f"Equipa: {record['poly_side']}{odds(odds_poly)}",
+        f"Valor retirado: {eur(record['poly_debit_cents'])}",
+        "",
+        "2️⃣ SX BET",
+        f"Equipa: {record['sx_side']}{odds(odds_sx)}",
+        f"Valor retirado: {eur(record['sx_debit_cents'])}",
+        "",
+        f"💶 Total aplicado: {eur(record['poly_debit_cents'] + record['sx_debit_cents'])}",
+        format_wallets(conn),
+        "",
+        "⏳ Resultado: AGUARDA LIQUIDAÇÃO",
+        f"📈 Lucro condicional previsto: {eur(record['conditional_profit_cents'])}",
+        "🔒 Apenas dinheiro fictício. Sem apostas reais.",
+    ]
+    return "\n".join(message)
+
+
+def format_settlement_message(conn, trade_id, demo=False):
+    """Mensagem APÓS liquidação manualmente verificada das duas plataformas."""
+    record = trade_details(conn, trade_id)
+    if record is None or record["status"] != "SETTLED":
+        raise ValueError("Operação ainda não liquidada/verificada")
+    winner_platform = record["settled_side"]
+    if winner_platform not in ("poly", "sx"):
+        raise ValueError("Liquidação sem vencedor reconhecido")
+    winner = record["poly_side"] if winner_platform == "poly" else record["sx_side"]
+    platform = "POLYMARKET" if winner_platform == "poly" else "SX BET"
+    loser = "SX BET" if winner_platform == "poly" else "POLYMARKET"
+    net = int(record["realized_profit_cents"])
+    icon = "✅" if net >= 0 else "🔴"
+    lines = [
+        f"🏁 {'RESULTADO DEMONSTRATIVO' if demo else 'RESULTADO VIRTUAL CONFIRMADO'} #{trade_id}",
+        f"🏟️ {record['event']}",
+        f"🏆 Venceu: {winner}",
+        f"✅ Paga a carteira: {platform}",
+        f"❌ A outra aposta ({loser}) perdeu",
+        f"💸 Valor creditado: {eur(record['conditional_payout_cents'])}",
+        f"{icon} Resultado líquido: {'+' if net > 0 else ''}{eur(net)}",
+        "",
+        format_wallets(conn),
+        "🔒 Resultado simulado, não houve apostas reais.",
+    ]
+    return "\n".join(lines)
+
+
+def send_telegram_notice(message):
+    """Enviar Telegram sem expor token de API em erros ou logs."""
+    token = os.getenv("TELEGRAM_TOKEN", "").strip()
+    chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not (token and chat):
+        print("ℹ️ Telegram não configurado: só foi gerado texto.")
+        return False
+    try:
+        import requests
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat, "text": message,
+                  "disable_web_page_preview": True},
+            timeout=12,
+        )
+        return response.status_code == 200 and response.json().get("ok") is True
+    except Exception:
+        return False
+
+
+def send_settlement_once(conn, trade_id):
+    """Uma notificação por liquidação; retry manual em caso de falha de rede."""
+    record = trade_details(conn, trade_id)
+    if record is None or record["status"] != "SETTLED":
+        raise ValueError("Só é possível notificar uma liquidação confirmada")
+    if conn.execute(
+        "SELECT 1 FROM paper_v12_notifications WHERE trade_id=?",
+        (trade_id,),
+    ).fetchone():
+        return True  # já enviado — nunca repetir automaticamente
+    message = format_settlement_message(conn, trade_id)
+    if not send_telegram_notice(message):
+        return False
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO paper_v12_notifications(trade_id, sent_epoch) "
+            "VALUES(?,?)",
+            (trade_id, int(time.time())),
+        )
+    return True
+
+
 def settle_normal(conn, trade_id, winning_platform, verified=False):
     """Liquidação manual após resultado E regras verificados nas duas fontes."""
     if not verified:
@@ -428,6 +557,10 @@ def self_test():
         assert balances["poly"] == INITIAL_CENTS - q.poly_debit_cents
         assert balances["sx"] == INITIAL_CENTS - q.sx_debit_cents
         assert paper_summary(db)["open_trades"] == 1
+        opening = format_open_message(db, ident, odds_poly=2.33, odds_sx=2.0)
+        assert "Polymarket" in opening and "SX Bet" in opening
+        assert "Valor retirado" in opening and "AGUARDA LIQUIDAÇÃO" in opening
+        assert "Carteira Polymarket" in opening and "Carteira SX Bet" in opening
         try:
             settle_normal(db, ident, "poly")
         except ValueError:
@@ -439,6 +572,10 @@ def self_test():
         assert paper_summary(db)["open_trades"] == 0
         assert paper_summary(db)["settled"] == 1
         assert paper_summary(db)["realized_eur"] == realized
+        settling = format_settlement_message(db, ident)
+        assert "Venceu: Lakers" in settling and "POLYMARKET" in settling
+        assert "Resultado líquido" in settling
+        assert "Carteira SX Bet" in settling
         assert db.execute("SELECT COUNT(*) FROM paper_v12_trades").fetchone()[0] == 1
         db.close()
     print("✅ PAPER V12 | matemática, carteiras, limite 100€, duplicados e liquidação OK")
@@ -451,6 +588,10 @@ def cli():
     parser.add_argument("--settle-id", type=int)
     parser.add_argument("--winner", choices=["poly", "sx"])
     parser.add_argument("--verified-both-rules", action="store_true")
+    parser.add_argument("--notify-settlement-id", type=int,
+                        help="Reenviar notificação pendente (sem duplicações)")
+    parser.add_argument("--list-open", action="store_true",
+                        help="Listar operações simuladas abertas")
     parser.add_argument("--flag-exception", type=int)
     parser.add_argument("--reason")
     args = parser.parse_args()
@@ -464,7 +605,23 @@ def cli():
                 conn, args.settle_id, args.winner,
                 verified=args.verified_both_rules
             )
-            print(f"Liquidação condicional #{args.settle_id}: {gain:+.2f} €")
+            print(format_settlement_message(conn, args.settle_id))
+            if not send_settlement_once(conn, args.settle_id):
+                print("⚠️ Telegram não confirmou a mensagem. "
+                      "Pode repetir com --notify-settlement-id.")
+        elif args.notify_settlement_id is not None:
+            if not send_settlement_once(conn, args.notify_settlement_id):
+                print("⚠️ Telegram indisponível. O resultado foi preservado no SQLite.")
+            else:
+                print("✅ Liquidação já notificada ou agora enviada.")
+        elif args.list_open:
+            for row in conn.execute(
+                "SELECT id, event, poly_side, sx_side, status "
+                "FROM paper_v12_trades "
+                "WHERE status IN ('OPEN_CONDITIONAL','REVIEW_REQUIRED') "
+                "ORDER BY id"
+            ):
+                print(f"#{row[0]} | {row[1]} | Poly={row[2]} | SX={row[3]} | {row[4]}")
         elif args.flag_exception is not None:
             flag_exception(conn, args.flag_exception, args.reason or "")
             print(f"Operação #{args.flag_exception} bloqueada para revisão")
