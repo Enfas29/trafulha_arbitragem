@@ -398,19 +398,60 @@ def soccer_matches(poly_events, sx_markets, now=None):
     ))
 
 
-def poly_soccer_prices(poly):
+def poly_soccer_prices(poly, diagnostics=None):
+    """Best ask é o preço de compra, não necessariamente o preço do site."""
     prices = {}
     for side, item in poly["picks"].items():
         try:
-            levels, _ = bot.poly_book(item["asset"])
-            if levels:
-                prices[side] = 1.0 / min(p for p, capacity in levels)
-        except Exception:
-            continue
+            if diagnostics is None:
+                levels, _ = bot.poly_book(item["asset"])
+                if levels:
+                    prices[side] = 1.0 / min(p for p, capacity in levels)
+                continue
+
+            # No diagnóstico, consultar o livro inteiro UMA vez para cada
+            # resultado e observar também melhor BID e preço Gamma.
+            data = bot.get_json(
+                bot.POLY_CLOB + "/book", {"token_id": item["asset"]},
+                timeout=7,
+            )
+            if not isinstance(data, dict):
+                continue
+            asks = sorted(
+                [float(x["price"]) for x in data.get("asks", [])
+                 if 0 < float(x.get("price", 0)) < 1
+                 and float(x.get("size", 0)) > 0]
+            )
+            bids = sorted(
+                [float(x["price"]) for x in data.get("bids", [])
+                 if 0 < float(x.get("price", 0)) < 1
+                 and float(x.get("size", 0)) > 0]
+            )
+            ask = asks[0] if asks else None
+            bid = bids[-1] if bids else None
+            if ask:
+                prices[side] = 1.0 / ask
+            diagnostics[side] = {
+                "token": item["asset"],
+                "market_id": item.get("market_id", ""),
+                "market": item["market"],
+                "outcome": item.get("outcome", ""),
+                "gamma": item.get("gamma_price"),
+                "ask": ask,
+                "bid": bid,
+                "read_utc": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+            }
+        except Exception as exc:
+            if diagnostics is not None:
+                diagnostics[side] = {
+                    "error": type(exc).__name__,
+                    "token": item["asset"],
+                    "market": item["market"],
+                }
     return prices
 
 
-def sx_soccer_prices(sx_markets, teams):
+def sx_soccer_prices(sx_markets, teams, diagnostics=None):
     prices = {}
     # Só mercados 1X2 explicitamente emparelhados com o seu 'Not X'.
     # Contratos duplicados ou 2-way não substituem as odds do 1X2.
@@ -426,12 +467,78 @@ def sx_soccer_prices(sx_markets, teams):
             levels, _ = bot.sx_book(market["hash"], index)
             looked += 1
             if levels:
-                prices[side] = 1.0 / min(p for p, capacity in levels)
-        except Exception:
-            pass
+                best_price = min(p for p, capacity in levels)
+                prices[side] = 1.0 / best_price
+                if diagnostics is not None:
+                    diagnostics[side] = {
+                        "hash": market["hash"],
+                        "type": market.get("type"),
+                        "outcomes": tuple(market["outcomes"]),
+                        "positive_index": index,
+                        "best_price": best_price,
+                        "read_utc": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+                    }
+        except Exception as exc:
+            if diagnostics is not None:
+                diagnostics[side] = {"error": type(exc).__name__,
+                                     "hash": market["hash"]}
         if looked >= 6:
             return prices
     return prices
+
+
+def diagnostics_message(poly_details, sx_details):
+    """Detalhe técnico para verificar divergências sem misturar preço de site."""
+    names = {"home": "1 · Casa", "draw": "X · Empate", "away": "2 · Fora"}
+    lines = ["", "🔬 DIAGNÓSTICO DE ODDS (mesmo confronto)"]
+    for side in ("home", "draw", "away"):
+        info = poly_details.get(side) or {}
+        if not info:
+            continue
+        lines.append(f"🔵 Poly {names[side]}:")
+        if info.get("error"):
+            lines.append(f"  Livro indisponível: {info['error']}")
+            continue
+        lines.append(
+            "  BUY (ask): " +
+            (f"{info['ask']*100:.2f}¢ → odd {single.format_odd(1/info['ask'])}"
+             if info.get("ask") else "indisponível")
+        )
+        lines.append(
+            "  BID (venda): " +
+            (f"{info['bid']*100:.2f}¢" if info.get("bid") else "indisponível")
+        )
+        gamma = info.get("gamma")
+        lines.append(
+            "  Gamma (indicativo): " +
+            (f"{gamma*100:.2f}¢" if gamma else "indisponível")
+        )
+        lines.append(f"  Token: {info.get('token', 'indisponível')}")
+        lines.append(f"  Mercado: {info.get('market', 'indisponível')}")
+        lines.append(f"  Lido: {info.get('read_utc', 'indisponível')}")
+    for side in ("home", "draw", "away"):
+        info = sx_details.get(side) or {}
+        if not info:
+            continue
+        lines.append(f"🟣 SX {names[side]}:")
+        if info.get("error"):
+            lines.append(f"  Livro indisponível: {info['error']}")
+            continue
+        lines.append(
+            "  BUY (taker): " +
+            (single.format_odd(1/info["best_price"])
+             if info.get("best_price") else "indisponível")
+        )
+        lines.append(
+            f"  Tipo: {info.get('type')} | "
+            f"Outcome {info.get('positive_index')}"
+        )
+        lines.append(f"  Opostos: {info.get('outcomes')}")
+        lines.append(f"  Hash: {info.get('hash')}")
+        lines.append(f"  Lido: {info.get('read_utc', 'indisponível')}")
+    lines.append("ℹ️ Gamma, preço do site e BUY/ASK podem divergir.")
+    lines.append("🔒 Auditoria apenas. Zero apostas.")
+    return "\n".join(lines)
 
 
 def soccer_message(pair, poly_prices, sx_prices, index, count):
@@ -520,7 +627,8 @@ def send(text):
     return True
 
 
-def run_soccer(count, conn, requested_match=None, recheck=False):
+def run_soccer(count, conn, requested_match=None, recheck=False,
+               explain=False):
     poly = poly_soccer_events()
     sx = sx_soccer_events()
     matches = soccer_matches(poly, sx)
@@ -540,12 +648,20 @@ def run_soccer(count, conn, requested_match=None, recheck=False):
         if was_sent(conn, key) and not recheck:
             continue
         examined += 1
-        pp = poly_soccer_prices(match["poly"])
-        sp = sx_soccer_prices(match["sx"], match["poly"]["teams"])
+        poly_details, sx_details = {}, {}
+        pp = poly_soccer_prices(
+            match["poly"], diagnostics=poly_details if explain else None
+        )
+        sp = sx_soccer_prices(
+            match["sx"], match["poly"]["teams"],
+            diagnostics=sx_details if explain else None
+        )
         # Só enviar COMPARAÇÕES, não listas de uma só plataforma.
         if not pp or not sp:
             continue
         msg = soccer_message(match, pp, sp, sent+1, count)
+        if explain:
+            msg += diagnostics_message(poly_details, sx_details)
         print("\n" + msg + "\n")
         if send(msg):
             mark_sent(conn, key, "soccer")
@@ -706,6 +822,19 @@ def tests():
     assert "CONFERE O MESMO ADVERSÁRIO" in msg
     assert "Poly evento: soc-1" in msg
     assert "SX mercado: sx-1..." in msg
+    forensic = diagnostics_message(
+        {"home": {"token": "poly-token", "market": "Chelsea",
+                  "gamma": 0.52, "ask": 0.54, "bid": 0.50,
+                  "read_utc": "12:00:00 UTC"}},
+        {"home": {"hash": "sx-hash", "type": 52,
+                  "outcomes": ("Chelsea", "Not Chelsea"),
+                  "positive_index": 0, "best_price": 0.52,
+                  "read_utc": "12:00:01 UTC"}},
+    )
+    assert "BUY (ask): 54.00¢" in forensic
+    assert "Gamma (indicativo): 52.00¢" in forensic
+    assert "Token: poly-token" in forensic
+    assert "BUY (taker): 1,92" in forensic
     assert "NÃO significa" in msg
     assert "Sem apostas ou débitos" in msg
     assert isinstance(previous_single_test_events(), set)
@@ -795,6 +924,8 @@ def main():
                     help="Futebol: filtrar confronto 'Man City vs Fulham'")
     ap.add_argument("--recheck", action="store_true",
                     help="Repetir um jogo já verificado sem alterar saldos")
+    ap.add_argument("--explain-prices", action="store_true",
+                    help="Anexar ASK, BID, Gamma, tokens e timestamps")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:
@@ -809,7 +940,7 @@ def main():
         if args.sport == "soccer":
             return run_soccer(
                 args.count, conn, requested_match=args.match,
-                recheck=args.recheck
+                recheck=args.recheck, explain=args.explain_prices
             )
         if args.match:
             ap.error("--match só se aplica a --sport soccer")
