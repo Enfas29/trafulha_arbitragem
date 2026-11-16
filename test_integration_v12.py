@@ -61,6 +61,9 @@ def main():
                 assert stats["poly_free_eur"] < 1000
                 assert stats["sx_free_eur"] < 1000
                 assert any("PAPER V12" in msg for msg in sent), sent
+                assert any("Carteira Polymarket" in msg for msg in sent), sent
+                assert any("Carteira SX Bet" in msg for msg in sent), sent
+                assert any("AGUARDA LIQUIDAÇÃO" in msg for msg in sent), sent
 
                 second = monitor.scan_pass(
                     monitor_db, [pair], 0, 0.91, paper_conn=paper_db
@@ -115,6 +118,59 @@ def main():
                     raise AssertionError(
                         "Uma operação com exceção não pode ser liquidada normalmente"
                     )
+                # Outro confronto: uma operação virtual ganha e envia
+                # UMA mensagem Telegram, sem voltar a creditar em duplicado.
+                second_pair = {
+                    **pair,
+                    "poly": {**pair["poly"], "id": "poly-test-2"},
+                    "sx": {**pair["sx"], "hash": "sx-test-2"},
+                }
+                quote = paper.select_shadow_quote(
+                    [(0.40, 200.0)], [(0.50, 200.0)], 0.91,
+                    *(
+                        paper.free_balances(paper_db)[k]
+                        for k in ("poly", "sx")
+                    ),
+                )
+                assert quote is not None
+                second_id = paper.book_shadow_trade(
+                    paper_db, second_pair, quote, "PRE_JOGO"
+                )
+                assert second_id is not None
+                poly_prior = paper.free_balances(paper_db)["poly"]
+                payout = quote.payout_eur_cents
+                profit = paper.settle_normal(
+                    paper_db, second_id, "poly", verified=True
+                )
+                assert paper.free_balances(paper_db)["poly"] == poly_prior + payout
+                assert profit > 0
+                assert "Venceu: Lakers" in paper.format_settlement_message(
+                    paper_db, second_id
+                )
+                original_notice = paper.send_telegram_notice
+                notice_list = []
+                try:
+                    def fake_notice(message):
+                        notice_list.append(message)
+                        return True
+                    paper.send_telegram_notice = fake_notice
+                    assert paper.send_settlement_once(paper_db, second_id)
+                    assert paper.send_settlement_once(paper_db, second_id)
+                    assert len(notice_list) == 1
+                    assert "RESULTADO VIRTUAL CONFIRMADO" in notice_list[0]
+                    assert "Carteira Polymarket" in notice_list[0]
+                finally:
+                    paper.send_telegram_notice = original_notice
+                # A segunda liquidação da mesma operação tem de falhar.
+                try:
+                    paper.settle_normal(
+                        paper_db, second_id, "poly", verified=True
+                    )
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("Duplo crédito na carteira virtual")
+
             finally:
                 monitor_db.close()
                 paper_db.close()
