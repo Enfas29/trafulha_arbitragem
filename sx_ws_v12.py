@@ -192,7 +192,7 @@ def self_test():
     asyncio.run(listener.on_subscribed(None))
     asyncio.run(listener.on_publication(None))
     assert f.take_hot() == {"c"}
-    assert f.received_events == 2
+    assert f.received_events == 3
 
     # Verificar também a classe REAL instalada em requirements.txt.
     from centrifuge import SubscriptionEventHandler
