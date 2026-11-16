@@ -220,6 +220,19 @@ confirmar o último teste verde no GitHub Actions:
 
     python auditoria_jogos_v12.py --sport soccer --count 3
 
+Para **repetir exatamente** Manchester City vs Fulham, mesmo que já
+tenha sido enviado noutra execução:
+
+    python auditoria_jogos_v12.py --sport soccer --match "Manchester City vs Fulham" --recheck --count 1
+
+O mapeamento da auditoria é deliberadamente conservador: se uma pergunta
+da Gamma sobre "draw" contiver o nome da equipa visitante, isso **não**
+autoriza atribuir o preço do empate à equipa. Se os rótulos contradisserem
+a pergunta, o mercado é descartado e assinalado como não identificado.
+Para comparar com a página da Polymarket, usar os mesmos três desfechos
+(1 / X / 2) e uma hora de leitura próxima. Não confiar em arbitragem
+de futebol enquanto os três preços e regras não estiverem verificados.
+
 O comando tenta encontrar até 3 jogos de FUTEBOL diferentes com mercados
 nas duas plataformas, e envia uma mensagem por jogo com os preços de compra
 dos desfechos **vitória casa / empate / vitória fora**, quando esses
