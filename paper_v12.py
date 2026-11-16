@@ -589,6 +589,24 @@ def self_test():
         assert "Resultado líquido" in settling
         assert "Carteira SX Bet" in settling
         assert db.execute("SELECT COUNT(*) FROM paper_v12_trades").fetchone()[0] == 1
+
+        # Outro jogo: desta vez vence a SX Bet; apenas a SX recebe o prémio.
+        opposite = {
+            **sample,
+            "poly": {**sample["poly"], "id": "poly-2"},
+            "sx": {**sample["sx"], "hash": "sx-2"},
+        }
+        ident2 = book_shadow_trade(db, opposite, q, "PRE_JOGO")
+        assert ident2 is not None
+        before = free_balances(db)
+        settle_normal(db, ident2, "sx", verified=True)
+        after = free_balances(db)
+        assert after["poly"] == before["poly"]
+        assert after["sx"] == before["sx"] + q.payout_eur_cents
+        text_result = format_settlement_message(db, ident2)
+        assert "Venceu: Celtics" in text_result
+        assert "Paga a carteira: SX BET" in text_result
+        assert "SALDOS (antes → depois)" in text_result
         db.close()
     print("✅ PAPER V12 | matemática, carteiras, limite 100€, duplicados e liquidação OK")
 
