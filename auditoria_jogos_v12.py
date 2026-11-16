@@ -304,6 +304,59 @@ def poly_soccer_events(now=None):
     return events
 
 
+def explain_missing_poly_draw(poly):
+    """Diagnóstico Gamma do empate ausente, sem modificar apostas/carteiras."""
+    lines = ["", "🔎 GAMMA: PORQUE FALTA O EMPATE?"]
+    try:
+        event = bot.get_json(
+            bot.POLY_GAMMA + "/events/" + str(poly["id"]), timeout=12
+        )
+        if not isinstance(event, dict):
+            return "\n".join(lines + ["Resposta do evento indisponível."])
+        candidates = []
+        for market in event.get("markets", []) or []:
+            if not isinstance(market, dict):
+                continue
+            question = str(market.get("question") or "")
+            group = str(market.get("groupItemTitle") or "")
+            slug = str(market.get("slug") or "")
+            if not (
+                "draw" in (question + group + slug).lower()
+                or "tie" in (question + group + slug).lower()
+            ):
+                continue
+            outcomes = parse_list(market.get("outcomes"))
+            assets = parse_list(market.get("clobTokenIds"))
+            candidates.append({
+                "type": market.get("sportsMarketType"),
+                "group": group[:100],
+                "question": question[:145],
+                "slug": slug[:90],
+                "category": gamma_market_category(market, poly["teams"]),
+                "outcomes": outcomes[:3],
+                "assets": len(assets),
+                "active": market.get("active"),
+                "closed": market.get("closed"),
+            })
+        if not candidates:
+            return "\n".join(lines + [
+                "A Gamma não devolveu mercados com 'draw'/'tie' neste evento."
+            ])
+        for i, m in enumerate(candidates[:6], 1):
+            lines += [
+                f"Mercado {i}: type={m['type']} | grupo={m['group']!r}",
+                f" Pergunta={m['question']!r}",
+                f" slug={m['slug']!r} | classificado={m['category']}",
+                f" outcomes={m['outcomes']} | tokens={m['assets']}"
+                f" | active={m['active']} | closed={m['closed']}",
+            ]
+        return "\n".join(lines)
+    except Exception as exc:
+        return "\n".join(lines + [
+            f"Não foi possível consultar Gamma: {type(exc).__name__}"
+        ])
+
+
 def sx_soccer_ids():
     raw = bot.get_json(bot.SX_API + "/sports")
     items = raw.get("data", raw) if isinstance(raw, dict) else raw
@@ -777,6 +830,9 @@ def run_soccer(count, conn, requested_match=None, recheck=False,
         msg = soccer_message(match, pp, sp, sent+1, count)
         if explain:
             msg += diagnostics_message(poly_details, sx_details)
+            if "draw" not in match["poly"]["picks"]:
+                diagnostic = explain_missing_poly_draw(match["poly"])
+                print(diagnostic, flush=True)
         print("\n" + msg + "\n")
         if send(msg):
             mark_sent(conn, key, "soccer")
@@ -977,6 +1033,30 @@ def tests():
     assert "CONFERE O MESMO ADVERSÁRIO" in msg
     assert "Poly evento: soc-1" in msg
     assert "SX mercado: sx-1..." in msg
+    # Um evento Gamma com Draw tem de ser inspecionável se o mercado
+    # não for identificado (modo --explain-prices).
+    old_get = bot.get_json
+    try:
+        bot.get_json = lambda *args, **kwargs: {
+            "markets": [{
+                "sportsMarketType": "other",
+                "groupItemTitle": "Draw (Team Alpha vs Team Beta)",
+                "question": "Will Team Alpha vs Team Beta end in a draw?",
+                "outcomes": '["Yes", "No"]',
+                "clobTokenIds": '["yes-token", "no-token"]',
+                "active": True,
+                "closed": False,
+            }]
+        }
+        explanation = explain_missing_poly_draw({
+            "id": "soc-1", "teams": p["teams"]
+        })
+        assert "type=other" in explanation
+        assert "Draw (Team Alpha vs Team Beta)" in explanation
+        assert "classificado=draw" in explanation
+    finally:
+        bot.get_json = old_get
+
     forensic = diagnostics_message(
         {"home": {"token": "poly-token", "market": "Chelsea",
                   "gamma": 0.52, "ask": 0.54, "bid": 0.50,
