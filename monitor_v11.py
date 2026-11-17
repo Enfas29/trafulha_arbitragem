@@ -598,6 +598,17 @@ def send_summary(conn, catalog_count, startup=False, now_epoch=None, paper_conn=
             f"\n📈 Resultado realizado: {paper.eur(int(round(totals['realized_eur'] * 100)))}"
             "\n⚠️ Saldos virtuais"
         )
+        suspect_trades = paper_conn.execute("""
+            SELECT COUNT(*) FROM paper_v12_trades
+            WHERE status IN ('OPEN_CONDITIONAL','REVIEW_REQUIRED')
+              AND conditional_profit_cents >=
+                  (poly_debit_cents + sx_debit_cents) * 0.10
+        """).fetchone()[0]
+        if suspect_trades:
+            message += (
+                f"\n🚨 {suspect_trades} operação(ões) antigas com ROI >=10%"
+                " — REVISÃO MANUAL RECOMENDADA, sem liquidação automática"
+            )
     telegram(message)
     record_report_attempt(conn, now_epoch)
     LOG.info(
