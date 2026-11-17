@@ -39,6 +39,9 @@ jobs:
       - name: Testar V12 de paper trading (offline, sem APIs)
         run: python paper_v12.py --self-test
 
+      - name: Testar auditoria histórica da margem de 49% (somente leitura)
+        run: python auditoria_margem_49_v12.py --self-test
+
       - name: Testar Paper V12 com ROI mínimo 0,5% (offline)
         env:
           PAPER_V12_MIN_NET_ROI_PCT: "0.5"
