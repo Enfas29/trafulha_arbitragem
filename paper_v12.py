@@ -690,7 +690,10 @@ def self_test():
     }
     with tempfile.TemporaryDirectory() as temp:
         db = open_database(str(Path(temp) / "paper.sqlite3"))
-        ident = book_shadow_trade(db, sample, q, "PRE_JOGO", now_epoch=1000)
+        ident = book_shadow_trade(
+            db, sample, q, "PRE_JOGO", now_epoch=1000,
+            opening_odds=(2.33, 2.0),
+        )
         assert ident == 1
         assert book_shadow_trade(db, sample, q, "PRE_JOGO") is None
         # Duplicação, modalidade diferente, horário e tipo de mercado
@@ -709,6 +712,32 @@ def self_test():
         assert "Polymarket" in opening and "SX Bet" in opening
         assert "Valor retirado" in opening and "AGUARDA LIQUIDAÇÃO" in opening
         assert "Carteira Polymarket" in opening and "Carteira SX Bet" in opening
+        stored = db.execute(
+            "SELECT message, sent_epoch, attempts FROM paper_v12_open_notifications "
+            "WHERE trade_id=?", (ident,)
+        ).fetchone()
+        assert stored and "Lakers vs Celtics" in stored[0]
+        assert "odd 2,33" in stored[0] and stored[1] is None and stored[2] == 0
+        original_send = send_telegram_notice
+        attempts = []
+        try:
+            def mocked_send(msg):
+                attempts.append(msg)
+                return len(attempts) >= 2
+            globals()["send_telegram_notice"] = mocked_send
+            assert not send_open_once(db, ident, now_epoch=1001, retry_seconds=0)
+            assert db.execute("SELECT COUNT(*) FROM paper_v12_trades").fetchone()[0] == 1
+            assert send_open_once(db, ident, now_epoch=1002, retry_seconds=0)
+            assert send_open_once(db, ident, now_epoch=1003, retry_seconds=0)
+            assert len(attempts) == 2
+            assert db.execute(
+                "SELECT sent_epoch IS NOT NULL FROM paper_v12_open_notifications "
+                "WHERE trade_id=?", (ident,)
+            ).fetchone()[0] == 1
+            assert retry_pending_open_notices(db) == 0
+        finally:
+            globals()["send_telegram_notice"] = original_send
+
         try:
             settle_normal(db, ident, "poly")
         except ValueError:
