@@ -35,6 +35,7 @@ def main():
     original_poly = monitor.bot.poly_book
     original_sx = monitor.bot.sx_book
     original_telegram = monitor.telegram
+    original_notice = paper.send_telegram_notice
     original_fx = monitor.bot.FX
     sent = []
 
@@ -42,6 +43,7 @@ def main():
         monitor.bot.poly_book = lambda _: ([(0.40, 200.0)], time.monotonic())
         monitor.bot.sx_book = lambda *_: ([(0.50, 200.0)], time.monotonic())
         monitor.telegram = sent.append
+        paper.send_telegram_notice = lambda msg: sent.append(msg) or True
         monitor.bot.FX = 0.91
 
         with tempfile.TemporaryDirectory() as td:
@@ -62,6 +64,12 @@ def main():
                 assert any("Carteira Polymarket" in msg for msg in sent), sent
                 assert any("Carteira SX Bet" in msg for msg in sent), sent
                 assert any("AGUARDA LIQUIDAÇÃO" in msg for msg in sent), sent
+                assert paper_db.execute(
+                    "SELECT sent_epoch IS NOT NULL FROM paper_v12_open_notifications "
+                    "WHERE trade_id=1"
+                ).fetchone()[0] == 1
+                assert sum("APOSTA VIRTUAL #1" in msg for msg in sent) == 1
+                assert "odds indicadas".lower() in " ".join(sent).lower()
 
                 # Odds revalidadas duas vezes no mercado original.
                 # Mudança súbita de 4 cêntimos não pode abrir outra operação.
@@ -96,6 +104,8 @@ def main():
                 assert paper_db.execute(
                     "SELECT COUNT(*) FROM paper_v12_trades"
                 ).fetchone()[0] == 1
+                assert paper.send_open_once(paper_db, 1)
+                assert sum("APOSTA VIRTUAL #1" in msg for msg in sent) == 1
 
                 monitor.send_summary(
                     monitor_db, 2, paper_conn=paper_db,
@@ -201,6 +211,7 @@ def main():
         monitor.bot.poly_book = original_poly
         monitor.bot.sx_book = original_sx
         monitor.telegram = original_telegram
+        paper.send_telegram_notice = original_notice
         monitor.bot.FX = original_fx
 
     print("✅ PAPER V12 integrado: preços, duas carteiras, 100€, dedup, Telegram, exceções OK")
