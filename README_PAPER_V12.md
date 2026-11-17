@@ -245,6 +245,53 @@ de ser iguais porque são preços para resultados **opostos**. E a melhor
 odd pode diferir da odd efetiva ao consumir vários níveis de liquidez.
 As odds observadas são um instante e podem mudar no site segundos depois.
 
+## V12.3 — Aviso de abertura imediato e recuperável no Telegram
+
+Para **novas operações virtuais**, a mensagem de abertura mostra:
+jogo e modalidade, instante UTC, equipa da Polymarket, equipa da SX Bet,
+melhor odd de compra observada em cada livro REST, valor fictício por
+plataforma, total, saldos antes/depois, ROI e prémio condicional.
+
+A mensagem exibe claramente que o melhor nível REST não garante a
+execução da totalidade do stake àquela odd. O registo é fictício e
+a liquidação continua a exigir verificação manual.
+
+Implementação:
+- A mensagem de abertura completa é guardada numa
+  `paper_v12_open_notifications` na **mesma transação SQLite** da
+  operação fictícia. Um reinício não a perde.
+- O monitor tenta enviá-la imediatamente. Se Telegram devolver falha,
+  regista `PAPER_ALERT | pendente #ID` e verifica novamente a outbox
+  periodicamente; não debita duas vezes as carteiras.
+- Mensagens confirmadas ficam marcadas como enviadas e não são
+  reenviadas automaticamente. Uma resposta HTTP perdida pode,
+  excecionalmente, originar dois avisos para **a mesma operação #ID**;
+  não cria uma segunda aposta.
+- **Operações anteriores à atualização não são reenviadas**: não
+  guardaram odds e saldos específicos no instante de abertura.
+  Usa a auditoria histórica para as inspecionar.
+
+Para consultar avisos pendentes (sem enviar ou abrir operações):
+
+    python paper_v12.py --pending-open-notices
+
+Para repetir manualmente um envio **já guardado**:
+
+    python paper_v12.py --notify-open-id 3
+
+Substitui `3` pelo ID confirmado no histórico. Se já foi confirmado,
+não envia duplicado. O ID antigo sem mensagem histórica não é elegível.
+
+Nos **Deploy Logs**, verificar `PAPER V12 #` e `PAPER_ALERT | enviado`
+ou `PAPER_ALERT | pendente`. Testes offline:
+
+    python paper_v12.py --self-test
+    python test_integration_v12.py
+
+**Atenção:** estes testes usam SQLite temporária e não alteram as
+carteiras virtuais persistentes. Não arrancar uma cópia adicional do
+monitor na Console.
+
 ## V12.2 — Proteções a margens extremas e alterações rápidas
 
 Após auditoria às operações #1 (Vladislav Melnic–Maximilian Marterer,
