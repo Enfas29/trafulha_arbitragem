@@ -202,7 +202,9 @@ def telegram(text: str):
 
 
 def maybe_alert(conn, pair, quote, hypothetical, now):
-    if not hypothetical or not quote or quote[2] < MIN_ROI * 100:
+    if (not hypothetical or not quote
+            or quote[2] < MIN_ROI * 100
+            or quote[2] >= 100 * paper.MAX_AUTO_PAPER_ROI):
         return False
     row = conn.execute(
         "SELECT last_seen_epoch FROM alerts WHERE pair_key=?", (pair["key"],)
@@ -518,14 +520,16 @@ def summary(conn, since_hours=6, now_epoch=None):
     cutoff = datetime.fromtimestamp(
         current_epoch - since_hours * 3600, tz=timezone.utc
     ).isoformat(timespec="seconds")
-    n, priced, pos, best, unique_events, potential_signals = conn.execute("""
+    n, priced, pos, best, anomalies, unique_events, potential_signals = conn.execute("""
         SELECT COUNT(*),
                COUNT(buffered_roi_pct),
                COALESCE(SUM(CASE WHEN buffered_roi_pct > 0 THEN 1 ELSE 0 END), 0),
-               MAX(buffered_roi_pct),
+               MAX(CASE WHEN buffered_roi_pct < 10 THEN buffered_roi_pct END),
+               COALESCE(SUM(CASE WHEN buffered_roi_pct >= 10 THEN 1 ELSE 0 END),0),
                COUNT(DISTINCT poly_market || '|' || sx_market),
                COUNT(DISTINCT CASE
                  WHEN hypothetical_profit_eur > 0 AND hypothetical_total_eur > 0
+                      AND buffered_roi_pct < 10
                  THEN poly_market || '|' || sx_market END)
         FROM observations WHERE observed_at >= ?
     """, (cutoff,)).fetchone()
@@ -535,6 +539,7 @@ def summary(conn, since_hours=6, now_epoch=None):
         "positive": int(pos),
         "unique": int(unique_events),
         "best": best,
+        "suspicious": int(anomalies),
         "potential_signals": int(potential_signals),
     }
 
@@ -547,8 +552,9 @@ def format_summary(stats, catalog_count, window_hours=6, fx_available=False):
         f"📊 MONITOR V11 · ÚLTIMAS {window_hours:g}H",
         f"🏟️ Confrontos analisados: {stats['unique']}",
         f"📚 Odds válidas: {stats['priced']}/{stats['records']}",
-        f"📈 Melhor margem estimada: {best}",
-        f"🔎 Sinais potenciais: {potentials}",
+        f"📈 Melhor margem indicativa (<10%, não validada): {best}",
+        f"⚠️ Leituras anómalas (>=10%, excluídas): {stats.get('suspicious', 0)}",
+        f"🔎 Sinais potenciais (<10%, por verificar): {potentials}",
         "🔒 Só leitura · sem apostas",
     ])
 
