@@ -180,7 +180,7 @@ def main():
                 assert "Venceu: Lakers" in paper.format_settlement_message(
                     paper_db, second_id
                 )
-                original_notice = paper.send_telegram_notice
+                settlement_notice_sender = paper.send_telegram_notice
                 notice_list = []
                 try:
                     def fake_notice(message):
@@ -193,7 +193,7 @@ def main():
                     assert "RESULTADO VIRTUAL CONFIRMADO" in notice_list[0]
                     assert "Carteira Polymarket" in notice_list[0]
                 finally:
-                    paper.send_telegram_notice = original_notice
+                    paper.send_telegram_notice = settlement_notice_sender
                 # A segunda liquidação da mesma operação tem de falhar.
                 try:
                     paper.settle_normal(
