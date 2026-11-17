@@ -304,6 +304,66 @@ def fast_preview(pairs, priority_cache, fx, limit=FAST_PREVIEW_LIMIT):
     return previewed
 
 
+def confirm_paper_snapshot(pair, first_poly, first_sx, t_poly, t_sx, fx,
+                           paper_conn, sleep_fn=time.sleep):
+    """Revalidar dois livros antes de QUALQUER nova operação virtual.
+
+    Confirmar estabilidade do preço no melhor nível e ROI num segundo
+    snapshot fresco e independente; rejeitar ROI >= 10% ou variações
+    fortes. Não tocar nas carteiras nem aceitar preços do WebSocket.
+    """
+    first_q = paper.select_shadow_quote(
+        first_poly, first_sx, fx,
+        *[paper.free_balances(paper_conn)[k] for k in ("poly", "sx")]
+    )
+    if first_q is None:
+        return None
+    if abs(t_poly - t_sx) > MAX_SKEW:
+        return None
+    # Um pico de odds entre chamadas pode gerar um falso positivo.
+    first_best = (min(price for price, _ in first_poly),
+                  min(price for price, _ in first_sx))
+    sleep_fn(0.25)
+    try:
+        second_poly, p_time = bot.poly_book(pair["poly_asset"])
+        second_sx, s_time = bot.sx_book(pair["sx"]["hash"], pair["sx_target"])
+    except Exception as exc:
+        LOG.warning("PAPER_RECHECK | rejeitado=%s | erro REST %s",
+                    pair["key"][:36], type(exc).__name__)
+        return None
+    age = time.monotonic()
+    if (abs(p_time - s_time) > min(MAX_SKEW, paper.MAX_SNAPSHOT_GAP_SECONDS)
+            or abs(t_poly - s_time) > 3.0
+            or age - p_time > 2.0 or age - s_time > 2.0):
+        LOG.info("PAPER_RECHECK | rejeitado=%s | snapshots desfasados",
+                 pair["key"][:36])
+        return None
+    if not second_poly or not second_sx:
+        return None
+    second_best = (min(price for price, _ in second_poly),
+                   min(price for price, _ in second_sx))
+    if any(abs(a-b) > 0.01 for a, b in zip(first_best, second_best)):
+        LOG.info("PAPER_RECHECK | rejeitado=%s | mudança de preço >1 cêntimo",
+                 pair["key"][:36])
+        return None
+    balances = paper.free_balances(paper_conn)
+    second_q = paper.select_shadow_quote(
+        second_poly, second_sx, fx, balances["poly"], balances["sx"]
+    )
+    if (second_q is None or abs(first_q.roi-second_q.roi) > 0.01
+            or second_q.roi >= paper.MAX_AUTO_PAPER_ROI):
+        LOG.info("PAPER_RECHECK | rejeitado=%s | ROI instável/inválido",
+                 pair["key"][:36])
+        return None
+    LOG.info(
+        "PAPER_RECHECK | confirmado=%s | ROI1=%.2f%% ROI2=%.2f%%"
+        " | intervalo_ms=%d | apenas simulação",
+        pair["key"][:36], 100 * first_q.roi, 100 * second_q.roi,
+        round(1000 * (s_time - t_sx)),
+    )
+    return second_poly, second_sx, abs(p_time-s_time)
+
+
 def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
               priority_cache=None):
     scan_started = time.monotonic()
@@ -374,10 +434,21 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
                 if paper_conn is not None:
                     paper_stage = ("PRE_JOGO" if stage == "PRE_JOGO"
                                    else "LIVE_NAO_CONFIRMADO")
-                    booked = paper.try_paper_entry(
-                        paper_conn, pair, poly_levels, sx_levels, fx,
-                        paper_stage, abs(t_poly - t_sx)
-                    )
+                    booked = None
+                    # Evitar REST duplicado em todas as direções. Só repetir
+                    # quando a primeira leitura sugerir entrada elegível.
+                    if (stage == "PRE_JOGO"
+                            or paper.ALLOW_LIVE_UNVERIFIED):
+                        validated = confirm_paper_snapshot(
+                            pair, poly_levels, sx_levels, t_poly, t_sx,
+                            fx, paper_conn
+                        )
+                        if validated:
+                            final_poly, final_sx, final_skew = validated
+                            booked = paper.try_paper_entry(
+                                paper_conn, pair, final_poly, final_sx, fx,
+                                paper_stage, final_skew
+                            )
                     if booked:
                         shadow_id, shadow_quote = booked
                         LOG.info(
@@ -389,8 +460,8 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
                         )
                         telegram(paper.format_open_message(
                             paper_conn, shadow_id,
-                            odds_poly=1.0 / min(p for p, _ in poly_levels),
-                            odds_sx=1.0 / min(p for p, _ in sx_levels),
+                            odds_poly=1.0 / min(p for p, _ in final_poly),
+                            odds_sx=1.0 / min(p for p, _ in final_sx),
                         ))
         except Exception as exc:
             book_max_ms = max(book_max_ms, 1000 * (time.monotonic() - book_started))
