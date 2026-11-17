@@ -58,7 +58,7 @@ def main():
                 assert 0 < stats["exposure_eur"] <= 100, stats
                 assert stats["poly_free_eur"] < 1000
                 assert stats["sx_free_eur"] < 1000
-                assert any("PAPER V12" in msg for msg in sent), sent
+                assert any("APOSTA VIRTUAL" in msg for msg in sent), sent
                 assert any("Carteira Polymarket" in msg for msg in sent), sent
                 assert any("Carteira SX Bet" in msg for msg in sent), sent
                 assert any("AGUARDA LIQUIDAÇÃO" in msg for msg in sent), sent
@@ -103,7 +103,7 @@ def main():
                 )
                 assert any("Paper: 1 abertas" in msg for msg in sent)
                 assert any("Só leitura" in msg for msg in sent)
-                assert monitor.summary(monitor_db)["unique"] == 1
+                assert monitor.summary(monitor_db)["unique"] == 2
 
                 # Falhas de dados: só uma notificação após 30 minutos e
                 # nunca repetir a cada ciclo. A recuperação desarma o aviso.
