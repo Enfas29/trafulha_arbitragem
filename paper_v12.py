@@ -190,6 +190,13 @@ def open_database(path=PAPER_DB):
         trade_id INTEGER PRIMARY KEY,
         sent_epoch INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS paper_v12_open_notifications(
+        trade_id INTEGER PRIMARY KEY,
+        message TEXT NOT NULL,
+        sent_epoch INTEGER,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_attempt_epoch INTEGER
+      );
       CREATE TABLE IF NOT EXISTS paper_v12_trades(
         id INTEGER PRIMARY KEY,
         event_key TEXT UNIQUE NOT NULL,
@@ -243,7 +250,8 @@ def open_exposure(conn):
     return int(row[0])
 
 
-def book_shadow_trade(conn, pair, quote, stage, now_epoch=None):
+def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
+                      opening_odds=None):
     """Duas pernas virtuais numa única transação SQLite. Nunca faz apostas.
 
     Uma única simulação por par de mercados, mesmo que a direção mude.
@@ -309,6 +317,18 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None):
             "mercados resolverem normalmente; exceções exigem revisão.",
         ))
         trade_id = result.lastrowid
+        if opening_odds is not None:
+            # A mensagem é persistida NA MESMA transação que os dois débitos
+            # fictícios. Se o processo terminar antes de enviar ao Telegram,
+            # outro ciclo pode enviá-la sem registar nova operação.
+            odds_poly, odds_sx = opening_odds
+            frozen_message = format_open_message(
+                conn, trade_id, odds_poly=odds_poly, odds_sx=odds_sx,
+            )
+            conn.execute(
+                "INSERT INTO paper_v12_open_notifications(trade_id, message) "
+                "VALUES (?,?)", (trade_id, frozen_message),
+            )
         conn.commit()
         return trade_id
     except Exception:
@@ -377,6 +397,8 @@ def format_open_message(conn, trade_id, odds_poly=None, odds_sx=None,
     message = [
         f"🧪 {'DEMONSTRAÇÃO FICTÍCIA' if demo else 'APOSTA VIRTUAL'} #{trade_id}",
         f"🏟️ {record['event']}",
+        f"🕒 Registo: {time.strftime('%d/%m/%Y %H:%M:%S UTC', time.gmtime(record['created_epoch']))}",
+        f"🏷️ Modalidade: {record['sport']} | fase: {record['stage']}",
         "",
         "1️⃣ POLYMARKET",
         f"Equipa: {record['poly_side']}{odds(odds_poly)}",
@@ -386,6 +408,7 @@ def format_open_message(conn, trade_id, odds_poly=None, odds_sx=None,
         f"Equipa: {record['sx_side']}{odds(odds_sx)}",
         f"Valor retirado: {eur(record['sx_debit_cents'])}",
         "",
+        "ℹ️ Odds indicadas: melhor nível de compra REST, NÃO execução confirmada.",
         f"💶 Total aplicado: {eur(record['poly_debit_cents'] + record['sx_debit_cents'])}",
         "💰 SALDOS (antes → depois)",
         f"Carteira Polymarket: {eur(balances['poly'] + record['poly_debit_cents'])} → {eur(balances['poly'])}",
@@ -393,6 +416,7 @@ def format_open_message(conn, trade_id, odds_poly=None, odds_sx=None,
         "",
         "⏳ Resultado: AGUARDA LIQUIDAÇÃO",
         f"📈 Lucro condicional previsto: {eur(record['conditional_profit_cents'])}",
+        f"💵 Pagamento virtual condicional: {eur(record['conditional_payout_cents'])}",
         f"📊 ROI condicional: {100 * record['conditional_profit_cents'] / (record['poly_debit_cents'] + record['sx_debit_cents']):+.2f}%"
         + (" · 🧪 MARGEM BAIXA / EXPERIMENTAL" if
            record["conditional_profit_cents"] /
@@ -458,6 +482,60 @@ def send_telegram_notice(message):
         return response.status_code == 200 and response.json().get("ok") is True
     except Exception:
         return False
+
+
+def send_open_once(conn, trade_id, now_epoch=None, retry_seconds=60):
+    """Enviar aviso de abertura da outbox. NÃO cria novas operações.
+
+    Timeout HTTP após receção pelo Telegram pode gerar duplicação do aviso
+    numa tentativa posterior. Nunca gera um segundo débito.
+    """
+    now_epoch = int(time.time() if now_epoch is None else now_epoch)
+    row = conn.execute("""
+        SELECT message, sent_epoch, last_attempt_epoch
+        FROM paper_v12_open_notifications WHERE trade_id=?
+    """, (int(trade_id),)).fetchone()
+    if row is None:
+        return False  # operação antiga ou teste sem snapshot de odds
+    message, sent_epoch, last_attempt = row
+    if sent_epoch is not None:
+        return True
+    if last_attempt is not None and now_epoch - int(last_attempt) < retry_seconds:
+        return False
+    # Marcar tentativa ANTES do pedido HTTP para evitar tempestades após crash.
+    with conn:
+        conn.execute("""
+            UPDATE paper_v12_open_notifications
+            SET attempts=attempts+1, last_attempt_epoch=?
+            WHERE trade_id=? AND sent_epoch IS NULL
+        """, (now_epoch, int(trade_id)))
+    if not send_telegram_notice(message):
+        return False
+    with conn:
+        conn.execute("""
+            UPDATE paper_v12_open_notifications
+            SET sent_epoch=?
+            WHERE trade_id=? AND sent_epoch IS NULL
+        """, (int(time.time()), int(trade_id)))
+    return True
+
+
+def retry_pending_open_notices(conn, limit=3):
+    """Chamado periodicamente pelo monitor principal; exclui trades legados."""
+    pending = conn.execute("""
+        SELECT n.trade_id FROM paper_v12_open_notifications n
+        JOIN paper_v12_trades t ON t.id=n.trade_id
+        WHERE n.sent_epoch IS NULL
+          AND t.status IN ('OPEN_CONDITIONAL','REVIEW_REQUIRED')
+          AND (n.last_attempt_epoch IS NULL
+               OR n.last_attempt_epoch <= ?)
+        ORDER BY n.trade_id LIMIT ?
+    """, (int(time.time()) - 60, limit)).fetchall()
+    delivered = 0
+    for (ident,) in pending:
+        if send_open_once(conn, ident):
+            delivered += 1
+    return delivered
 
 
 def send_settlement_once(conn, trade_id):
@@ -548,7 +626,14 @@ def try_paper_entry(conn, pair, poly_levels, sx_levels, fx, stage, skew):
     quote = select_shadow_quote(poly_levels, sx_levels, fx, free["poly"], free["sx"])
     if not quote:
         return None
-    trade_id = book_shadow_trade(conn, pair, quote, stage)
+    # Best asks na 2.ª leitura REST: não confundir com odd média garantida
+    # de execução do stake. A mensagem explicita essa limitação.
+    best_poly = min(price for price, _ in poly_levels)
+    best_sx = min(price for price, _ in sx_levels)
+    trade_id = book_shadow_trade(
+        conn, pair, quote, stage,
+        opening_odds=(1.0 / best_poly, 1.0 / best_sx),
+    )
     return (trade_id, quote) if trade_id is not None else None
 
 
@@ -669,6 +754,10 @@ def cli():
     parser.add_argument("--settle-id", type=int)
     parser.add_argument("--winner", choices=["poly", "sx"])
     parser.add_argument("--verified-both-rules", action="store_true")
+    parser.add_argument("--notify-open-id", type=int,
+                        help="Tentar reenviar aviso de abertura pendente (sem duplicar aposta)")
+    parser.add_argument("--pending-open-notices", action="store_true",
+                        help="Ver avisos de abertura ainda não confirmados")
     parser.add_argument("--notify-settlement-id", type=int,
                         help="Reenviar notificação pendente (sem duplicações)")
     parser.add_argument("--list-open", action="store_true",
@@ -690,6 +779,20 @@ def cli():
             if not send_settlement_once(conn, args.settle_id):
                 print("⚠️ Telegram não confirmou a mensagem. "
                       "Pode repetir com --notify-settlement-id.")
+        elif args.notify_open_id is not None:
+            ok = send_open_once(conn, args.notify_open_id, retry_seconds=0)
+            print("✅ Aviso enviado ou já confirmado." if ok else
+                  "⚠️ Aviso não confirmado. Confirma id e Telegram nos logs.")
+        elif args.pending_open_notices:
+            pending = conn.execute("""
+                SELECT trade_id, attempts, last_attempt_epoch
+                FROM paper_v12_open_notifications
+                WHERE sent_epoch IS NULL ORDER BY trade_id
+            """).fetchall()
+            for trade_id, attempts, last in pending:
+                print(f"#{trade_id} | tentativas={attempts} | último={last}")
+            if not pending:
+                print("✅ Sem avisos de abertura pendentes (não inclui trades antigos).")
         elif args.notify_settlement_id is not None:
             if not send_settlement_once(conn, args.notify_settlement_id):
                 print("⚠️ Telegram indisponível. O resultado foi preservado no SQLite.")
