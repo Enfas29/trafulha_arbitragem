@@ -245,6 +245,37 @@ de ser iguais porque são preços para resultados **opostos**. E a melhor
 odd pode diferir da odd efetiva ao consumir vários níveis de liquidez.
 As odds observadas são um instante e podem mudar no site segundos depois.
 
+## V12.1: FAST_PREVIEW — teste da meta inferior a 1 segundo
+
+O monitor agora executa uma **pré-análise prioritária** de no máximo
+1 direção sinalizada por WebSocket ANTES do scan normal das 15 direções:
+
+- Lê os dois livros via REST, calcula margem ilustrativa com profundidade
+  de até 10 USDC e verifica desfasamento temporal.
+- Escreve `FAST_PREVIEW | ... | evento_ate_inicio_ms=...`
+  e `evento_ate_calculo_ms=... | meta_1s=SIM/NAO`.
+- Mede desde o instante de receção do evento **no processo**, não desde
+  a mudança no mercado; `meta_1s=SIM` não significa execução em 1 segundo.
+- Não insere operações SQLite, **não mexe nas carteiras, não aposta**,
+  nem envia pré-alertas de oportunidade. O scanner normal continua a
+  verificar as duas pernas com as regras atuais.
+- Opcional: `MONITOR_FAST_PREVIEW_ENABLED=0` desliga o modo rápido
+  sem alterar a rotina de apostas virtuais. Por omissão está ativado.
+- A fase rápida efetua até duas consultas REST por evento processado;
+  se surgirem códigos 429/erros de API, desativar e rever taxas de pedidos.
+- Continuam excluídas operações virtuais em direto não verificadas.
+  Antes de considerar qualquer margem invulgar (por exemplo +49%),
+  consultar `python paper_v12.py --list-open`, confirmar o confronto,
+  a equivalência dos mercados e a profundidade.
+
+Para testar offline:
+
+    python monitor_v11.py --self-test
+
+Para a medição real usar **Deploy Logs** da instância principal Railway
+(`FAST PREVIEW V12.1`, `FAST_PREVIEW`, `WS_LATENCY`).
+Não iniciar uma segunda cópia de `python monitor_v11.py` na Console.
+
 ## V12: prioridade WebSocket e cache curta de eventos (sem cache de odds)
 
 A atualização liga a fila `ws_priority_v12.py` ao scanner contínuo:
