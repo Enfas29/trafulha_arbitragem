@@ -245,6 +245,48 @@ de ser iguais porque são preços para resultados **opostos**. E a melhor
 odd pode diferir da odd efetiva ao consumir vários níveis de liquidez.
 As odds observadas são um instante e podem mudar no site segundos depois.
 
+## V12.2 — Proteções a margens extremas e alterações rápidas
+
+Após auditoria às operações #1 (Vladislav Melnic–Maximilian Marterer,
+ROI condicional +47,71%) e #2 (Hunter Heck–Jordan Lee, ROI +1,01%
+mas observação posterior −12,08%), o Paper V12 aplica novas regras:
+
+- **Novas operações com ROI >= 10% são bloqueadas**, mesmo que os livros
+  pareçam ter capacidade. Esta é uma heurística de risco para investigação,
+  NÃO uma prova de preço errado.
+- Para uma nova operação paper, são necessárias **duas leituras REST**
+  independentes de ambas as plataformas; após 250 ms, confirma novamente.
+- A variação do melhor preço de cada perna não pode exceder 0,01 (1 cêntimo
+  por payout), e a diferença entre os ROIs simulados não pode exceder
+  1 ponto percentual. A segunda leitura também tem de cumprir o ROI
+  mínimo e confirmar profundidade e limites de carteira.
+- Se os livros falharem, as timestamps diferirem demasiado ou uma margem
+  já não existir, o programa **não regista nova operação**.
+- Os resumos do Telegram passam a separar leituras históricas extremas
+  das margens normais e a avisar sobre operações antigas ainda abertas
+  com ROI >=10%.
+- **As operações antigas #1 e #2 não são alteradas automaticamente**.
+  Não liquidar enquanto a equivalência de regras, resultados e disponibilidade
+  de preço não estiver confirmada. Para sinalizar manualmente uma operação
+  existente com necessidade de revisão, usar `--flag-exception` apenas após
+  decidir esse estado; não restitui automaticamente fundos fictícios.
+- Os testes offline cobrem a rejeição de ROI extremo e um preço que salta
+  mais de 1 cêntimo entre as duas leituras.
+
+Para consultar o histórico sem escrever nas bases:
+
+    python auditoria_margem_49_v12.py
+    python paper_v12.py --list-open
+
+Para executar os testes sem APIs:
+
+    python paper_v12.py --self-test
+    python test_integration_v12.py
+    python monitor_v11.py --self-test
+
+Não lançar um segundo processo `python monitor_v11.py` na Console do
+Railway se o serviço principal já estiver ativo.
+
 ## V12.1: FAST_PREVIEW — teste da meta inferior a 1 segundo
 
 O monitor agora executa uma **pré-análise prioritária** de no máximo
