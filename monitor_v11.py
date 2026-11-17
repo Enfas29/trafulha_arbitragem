@@ -460,11 +460,13 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
                             shadow_quote.total_eur, shadow_quote.profit_eur,
                             100 * shadow_quote.roi,
                         )
-                        telegram(paper.format_open_message(
-                            paper_conn, shadow_id,
-                            odds_poly=1.0 / min(p for p, _ in final_poly),
-                            odds_sx=1.0 / min(p for p, _ in final_sx),
-                        ))
+                        # Mensagem completa guardada no SQLite na mesma
+                        # transação da operação virtual. Nunca usar o envio
+                        # genérico sem confirmação de entrega.
+                        if paper.send_open_once(paper_conn, shadow_id):
+                            LOG.info("PAPER_ALERT | enviado #%d | Telegram confirmado", shadow_id)
+                        else:
+                            LOG.warning("PAPER_ALERT | pendente #%d | Telegram não confirmou; retry automático", shadow_id)
         except Exception as exc:
             book_max_ms = max(book_max_ms, 1000 * (time.monotonic() - book_started))
             LOG.warning(
@@ -888,6 +890,13 @@ def main(once=False):
                 priority_cache=priority_cache
             )
             cursor = result["next_offset"]
+            if paper_conn is not None and iteration % 12 == 0:
+                try:
+                    retried = paper.retry_pending_open_notices(paper_conn)
+                    if retried:
+                        LOG.info("PAPER_ALERT | %d aviso(s) pendente(s) confirmado(s)", retried)
+                except Exception as exc:
+                    LOG.warning("PAPER_ALERT | erro a retentar: %s", type(exc).__name__)
             outage_notice = update_health(conn, result["checked"], result["priced"])
             if outage_notice:
                 LOG.warning("Sem odds válidas durante o período de alerta.")
