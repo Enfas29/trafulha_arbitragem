@@ -51,8 +51,6 @@ def main():
                 first = monitor.scan_pass(
                     monitor_db, [pair], 0, 0.91,
                     paper_conn=paper_db,
-                    hot_sx_hashes={"sx-test"},
-                    hot_poly_assets={"poly-asset"},
                 )
                 assert first["priced"] == 1, first
                 stats = paper.paper_summary(paper_db)
@@ -64,6 +62,31 @@ def main():
                 assert any("Carteira Polymarket" in msg for msg in sent), sent
                 assert any("Carteira SX Bet" in msg for msg in sent), sent
                 assert any("AGUARDA LIQUIDAÇÃO" in msg for msg in sent), sent
+
+                # Odds revalidadas duas vezes no mercado original.
+                # Mudança súbita de 4 cêntimos não pode abrir outra operação.
+                unstable_pair = {
+                    **pair,
+                    "key": "poly-unstable:sx-unstable:0",
+                    "poly": {**pair["poly"], "id": "poly-unstable"},
+                    "sx": {**pair["sx"], "hash": "sx-unstable"},
+                }
+                calls = {"poly": 0}
+                def jumping_poly(_):
+                    calls["poly"] += 1
+                    value = .40 if calls["poly"] % 2 else .44
+                    return [(value, 200.)], time.monotonic()
+                monitor.bot.poly_book = jumping_poly
+                rechecked = monitor.scan_pass(
+                    monitor_db, [unstable_pair], 0, .91,
+                    paper_conn=paper_db
+                )
+                assert rechecked["priced"] == 1
+                assert paper.paper_summary(paper_db)["open_trades"] == 1
+                monitor.bot.poly_book = lambda _: (
+                    [(0.40, 200.)], time.monotonic()
+                )
+
 
                 second = monitor.scan_pass(
                     monitor_db, [pair], 0, 0.91, paper_conn=paper_db
