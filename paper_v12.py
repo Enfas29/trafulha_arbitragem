@@ -39,6 +39,10 @@ MIN_NET_ROI = read_min_roi()          # padrão 1,5%; piloto 0,5% no Railway
 POLY_TAKER_FEE_RATE = 0.05             # parâmetro desportivo indicado no help center
 ADVERSE_PRICE_BUFFER = 0.0125          # 1,25% por perna, reserva NÃO oficial
 MAX_SNAPSHOT_GAP_SECONDS = 4.0
+# Bloquear novas operações paper com margens invulgares, sujeitas a auditoria.
+# Não altera nem liquida operações já registadas.
+MAX_AUTO_PAPER_ROI = 0.10
+
 PAPER_DB = os.getenv("PAPER_V12_DB", "/data/paper_v12.sqlite3")
 ALLOWED_SPORTS = {"tennis", "basketball", "american_football",
                   "baseball", "cricket", "esports", "combat"}
@@ -167,7 +171,8 @@ def select_shadow_quote(poly_levels, sx_levels, fx,
         return None
     if quote.poly_debit_cents > free_poly_cents or quote.sx_debit_cents > free_sx_cents:
         return None
-    if quote.roi < MIN_NET_ROI or quote.conditional_profit_cents <= 0:
+    if (quote.roi < MIN_NET_ROI or quote.roi >= MAX_AUTO_PAPER_ROI
+            or quote.conditional_profit_cents <= 0):
         return None
     return quote
 
@@ -260,7 +265,10 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None):
         return None
     if str(pair["poly_label"]).strip().lower() == str(pair["sx_label"]).strip().lower():
         return None
-    if quote.total_cents > MAX_TRADE_CENTS or quote.roi < MIN_NET_ROI:
+    if (quote.total_cents > MAX_TRADE_CENTS
+            or quote.roi < MIN_NET_ROI
+            or not math.isfinite(quote.roi)
+            or quote.roi >= MAX_AUTO_PAPER_ROI):
         return None
 
     eid = event_key(pair)
@@ -566,6 +574,11 @@ def self_test():
         ) is None
     finally:
         MIN_NET_ROI = saved_min
+
+    # +47% deve ser rejeitado mesmo com liquidez aparente.
+    assert select_shadow_quote(
+        [(0.51, 300)], [(0.14625, 300)], 0.91, 100_000, 100_000
+    ) is None
 
     q = select_shadow_quote([(0.43, 300)], [(0.50, 300)], 0.91, 100_000, 100_000)
     assert q and q.total_cents <= 10_000 and q.profit_eur > 0
