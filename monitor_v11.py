@@ -42,6 +42,11 @@ WS_PRIORITY_MAX = min(6, max(1, int(os.getenv("MONITOR_WS_PRIORITY_MAX", "4"))))
 WS_EVENT_TTL = min(60.0, max(5.0,
     float(os.getenv("MONITOR_WS_EVENT_TTL_SECONDS", "20"))
 ))
+# Pré-análise rápida (REST de ambos os lados), apenas diagnóstico.
+# Não abre operações nem lança alertas de lucro.
+FAST_PREVIEW_ENABLED = os.getenv("MONITOR_FAST_PREVIEW_ENABLED", "1").lower() in {"1", "true", "yes"}
+FAST_PREVIEW_LIMIT = 1  # máximo um par por ciclo para não sobrecarregar APIs
+FAST_PREVIEW_TARGET_MS = 1000
 ALERT_COOLDOWN = max(300, int(os.getenv("MONITOR_ALERT_COOLDOWN_SECONDS", "1800")))
 SUMMARY_INTERVAL = max(3600, int(os.getenv("MONITOR_SUMMARY_SECONDS", "21600")))
 OUTAGE_THRESHOLD = max(900, int(os.getenv("MONITOR_OUTAGE_SECONDS", "1800")))
@@ -236,6 +241,67 @@ def select_pairs(pairs):
             p["key"],
         ),
     )
+
+
+def fast_preview(pairs, priority_cache, fx, limit=FAST_PREVIEW_LIMIT):
+    """Pré-análise imediata de sinais WebSocket antes do scanner completo.
+
+    Faz SEMPRE novas leituras REST para as duas pernas; não usa preços
+    WebSocket nem abre apostas virtuais ou reais. O tempo medido começa
+    na receção do WS pelo processo, não na mudança original da plataforma.
+    """
+    if not pairs or not priority_cache.pending:
+        return 0
+    now_epoch = time.time()
+    eligible_by_key = {p["key"]: p for p in pairs}
+    previewed = 0
+    for key, (received_mono, sources) in sorted(
+        list(priority_cache.pending.items()), key=lambda item: item[1][0]
+    ):
+        if previewed >= limit:
+            break
+        pair = eligible_by_key.get(key)
+        if pair is None:
+            continue
+        sx = pair["sx"]
+        start = sx["start"]
+        if not (now_epoch - bot.MAX_LIVE_AGE_H * 3600 <= start
+                <= now_epoch + bot.MAX_FUTURE_H * 3600):
+            continue
+        if start <= now_epoch and not sx["live_enabled"]:
+            continue
+        started_mono = time.monotonic()
+        status = "sem_livros"
+        margin = None
+        rest_ms = None
+        try:
+            poly_levels, t_poly = bot.poly_book(pair["poly_asset"])
+            sx_levels, t_sx = bot.sx_book(sx["hash"], pair["sx_target"])
+            rest_ms = round(1000 * (time.monotonic() - started_mono))
+            if abs(t_poly - t_sx) > MAX_SKEW:
+                status = "snapshots_desfasados"
+            else:
+                preview = normalize_quote(poly_levels, sx_levels)
+                if preview is not None:
+                    margin = round(preview[2], 2)
+                    status = "margem_indicativa"
+        except Exception as exc:
+            status = "erro_" + type(exc).__name__
+        decided_mono = time.monotonic()
+        elapsed = 1000 * (decided_mono - received_mono)
+        previewed += 1
+        LOG.info(
+            "FAST_PREVIEW | mercado=%s | fontes=%s | estado=%s | "
+            "roi_indicativo=%s | REST_ms=%s | "
+            "evento_ate_inicio_ms=%d | evento_ate_calculo_ms=%d | "
+            "meta_1s=%s | SEM APOSTAS/DEBITOS",
+            key[:32], ",".join(sorted(sources)), status,
+            f"{margin:+.2f}%" if margin is not None else "N/D",
+            rest_ms if rest_ms is not None else "N/D",
+            round(1000 * max(0.0, started_mono - received_mono)),
+            round(elapsed), "SIM" if elapsed < FAST_PREVIEW_TARGET_MS else "NAO",
+        )
+    return previewed
 
 
 def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
@@ -534,6 +600,27 @@ def self_test():
 
     # Fila com prioridade sem bloquear rotação REST e sem preços em cache.
     ws_priority.self_test()
+    # Preview é exclusivamente leitura, sem acesso à SQLite do paper.
+    class PendingOnly:
+        pending = {"test": (time.monotonic() - .01, {"POLY"})}
+    sample = [{
+        "key": "test", "poly_asset": "a",
+        "sx": {"hash": "s", "sx_target": 0, "start": time.time()+600,
+               "live_enabled": False},
+        "sx_target": 0,
+    }]
+    old_poly_fn, old_sx_fn = bot.poly_book, bot.sx_book
+    seen = []
+    try:
+        bot.poly_book = lambda asset: (seen.append("poly") or
+                                      [(0.46, 200)], time.time())
+        bot.sx_book = lambda hash_, target: (seen.append("sx") or
+                                             [(0.51, 200)], time.time())
+        assert fast_preview(sample, PendingOnly(), fx=0.91) == 1
+        assert seen == ["poly", "sx"]
+    finally:
+        bot.poly_book, bot.sx_book = old_poly_fn, old_sx_fn
+
 
     # Evento WS não pode impor os 8 segundos adicionais da versão antiga.
     assert websocket_reaction_pause(0.1, True, 2.0) == 1.9
@@ -668,6 +755,11 @@ def main(once=False):
                  "máximo 100 EUR total por operação, sem apostas reais.",
                  100 * paper.MIN_NET_ROI)
     LOG.info(
+        "FAST PREVIEW V12.1: %s; objetivo de calculo <1s; "
+        "REST obrigatorio nas duas fontes, SEM operacoes/alertas.",
+        "ATIVO" if FAST_PREVIEW_ENABLED else "DESATIVADO"
+    )
+    LOG.info(
         "WS PRIORITY: janela %.1fs; direções/passo=%d; "
         "prioridade máx=%d; cache eventos=%.0fs (SEM cache de odds); "
         "REST valida ambos os livros. Sem apostas reais.",
@@ -699,6 +791,10 @@ def main(once=False):
             sx_events = ws_feed.take_events() if ws_feed is not None else {}
             poly_events = poly_feed.take_events() if poly_feed is not None else {}
             priority_cache.ingest(poly_events, sx_events)
+            # Pré-análise com prioridade, antes das restantes 15 direções.
+            # Nunca altera a base de dados nem executa paper trading.
+            if FAST_PREVIEW_ENABLED:
+                fast_preview(pairs, priority_cache, fx)
             result = scan_pass(
                 conn, pairs, cursor, fx, paper_conn=paper_conn,
                 priority_cache=priority_cache
