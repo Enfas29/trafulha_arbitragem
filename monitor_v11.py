@@ -717,6 +717,17 @@ def catalog():
 def self_test():
     import tempfile
 
+    # Modo manutenção não deve iniciar scanner nem escrever SQLite.
+    saved_maintenance = os.environ.get("TRAFLUHA_STORAGE_MAINTENANCE")
+    try:
+        os.environ["TRAFLUHA_STORAGE_MAINTENANCE"] = "1"
+        assert main(once=True) is None
+    finally:
+        if saved_maintenance is None:
+            os.environ.pop("TRAFLUHA_STORAGE_MAINTENANCE", None)
+        else:
+            os.environ["TRAFLUHA_STORAGE_MAINTENANCE"] = saved_maintenance
+
     # Fila com prioridade sem bloquear rotação REST e sem preços em cache.
     ws_priority.self_test()
     # Preview é exclusivamente leitura, sem acesso à SQLite do paper.
@@ -848,6 +859,18 @@ def websocket_reaction_pause(elapsed_seconds, wake_received, min_gap=WS_REACT_GA
 
 
 def main(once=False):
+    # Modo de manutenção: permite montar /data para backup sem tentar
+    # abrir SQLite cheia. Não apaga nem altera qualquer base de dados.
+    if os.getenv("TRAFLUHA_STORAGE_MAINTENANCE", "0").strip().lower() in {"1", "true", "yes"}:
+        LOG.warning(
+            "STORAGE MAINTENANCE: scanner e Paper V12 pausados. "
+            "Volume /data preservado para backup e recuperação; "
+            "NENHUMA aposta real/virtual e nenhuma escrita SQLite."
+        )
+        if once:
+            return
+        while True:
+            time.sleep(3600)
     fx = float(os.getenv("EUR_PER_USD", "0") or "0")
     if fx < 0 or fx > 10:
         raise SystemExit("EUR_PER_USD inválido. Usa euros por 1 USD, por exemplo cotação atual.")
