@@ -29,6 +29,9 @@ jobs:
       - name: Testar o monitor e historico SQLite (offline)
         run: python monitor_v11.py --self-test
 
+      - name: Testar recuperação segura SQLite (offline)
+        run: python recuperar_espaco_v12.py --self-test
+
       - name: Testar cache curta de eventos WS e prioridade/latência (offline)
         run: |
           python ws_priority_v12.py
