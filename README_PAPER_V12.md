@@ -1,3 +1,52 @@
+## Recuperação de armazenamento Railway — 24 nov 2026
+
+**Causa confirmada nos deploy logs:** `sqlite3.OperationalError:
+database or disk is full`. O volume de 500 MB está com ~496 MB usados.
+Não apagar o volume, a base `PAPER_V12_DB`, nem resetar carteiras.
+
+Para evitar reinícios que gravem numa base cheia, o monitor suporta
+`TRAFLUHA_STORAGE_MAINTENANCE=1`: mantém o processo inativo,
+não abre SQLite, não consulta jogos e não executa operações virtuais.
+A flag pode ficar definida até terminar a recuperação.
+
+### Passos de recuperação (ordem obrigatória)
+
+1. No Railway, verificar em **Service → Backups** se já há snapshot
+   do volume `trafulha_arbitragem-volume`. Se não existir, **criar
+   backup manual do volume e confirmar que consta como concluído**
+   antes de qualquer modificação da base SQLite. Um snapshot gerido
+   pelo Railway é preferível a copiar ficheiros SQLite em uso.
+2. Caso falte espaço até para uma intervenção controlada, aumentar
+   o volume *existente* de 500 MB para cerca de 2 GB nas definições
+   de volume, **sem criar volume novo** nem o desligar do serviço.
+   Isto pode ter custos adicionais; confirmar preços/plano antes.
+   Uma alteração de tamanho deve preservar o conteúdo.
+3. Com backup confirmado e scanner em manutenção, abrir Console e
+   executar SOMENTE a inspeção:
+
+       python recuperar_espaco_v12.py
+
+   Verificar o nome de `MONITOR_DB`, o número de observações, o espaço
+   livre e se `PAPER_V12_DB` é outra base.
+4. Apenas se o backup existir **e** houver pelo menos 150 MiB livres,
+   executar:
+
+       python recuperar_espaco_v12.py --apply --backup-confirmed
+
+   Remove apenas leituras redundantes/antigas da tabela
+   `observations` do **monitor**, preservando a base Paper V12.
+   A compactação `VACUUM` só ocorre se houver espaço adicional
+   suficiente. O script verifica `PRAGMA quick_check` no final.
+5. Voltar a executar a inspeção e verificar o relatório final. Remover
+   `TRAFLUHA_STORAGE_MAINTENANCE` (ou definir `0`), aplicar o
+   deployment e confirmar logs `SCAN` sem erros de SQLite.
+
+O monitor novo reduz as gravações (amostragem mínima de 60 segundos
+por direção) e elimina incrementalmente observações anteriores a
+12 horas ou que excedam 25.000 linhas. Isto NÃO limpa retroativamente
+uma base enorme até realizar o passo 4. Nunca usar `rm *.sqlite3`,
+apagar ficheiros WAL manualmente nem `VACUUM` numa base cheia.
+
 # V12 — Paper Trading e WebSocket (sem apostas reais)
 
 ## Estado e limites
