@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
 import sqlite3
 import sys
 import time
@@ -28,6 +29,17 @@ LOG = logging.getLogger("monitor_v11")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 DB = os.getenv("MONITOR_DB", "monitor_v11.sqlite3")
+# Evitar crescimento de SQLite: histórico recente basta para o resumo de 6h.
+OBSERVATION_RETENTION_HOURS = max(6, min(48, int(
+    os.getenv("MONITOR_OBSERVATION_RETENTION_HOURS", "12")
+)))
+OBSERVATION_MAX_ROWS = max(5000, min(100000, int(
+    os.getenv("MONITOR_OBSERVATION_MAX_ROWS", "25000")
+)))
+OBSERVATION_SAMPLE_SECONDS = max(10, min(600, int(
+    os.getenv("MONITOR_OBSERVATION_SAMPLE_SECONDS", "60")
+)))
+STORAGE_FREE_FLOOR = 32 * 1024 * 1024
 INTERVAL = max(10, int(os.getenv("MONITOR_INTERVAL_SECONDS", "20")))
 CATALOG_INTERVAL = max(180, int(os.getenv("MONITOR_CATALOG_SECONDS", "600")))
 MAX_PAIRS = min(60, max(1, int(os.getenv("MONITOR_PAIRS_PER_PASS", "15"))))
@@ -169,6 +181,23 @@ def insert_observation(conn, pair, stage, poly_levels, sx_levels, skew, fx):
     note = ("Livros lidos; equivalência de liquidação não validada."
             if quote else "Sem preço ou snapshots demasiado afastados.")
 
+    # Guardar no máximo uma leitura habitual/minuto por direção.
+    # Os cálculos e sinais continuam a ser feitos a cada passagem, com
+    # REST fresco; só reduzimos o volume das amostras históricas.
+    sample_seconds = (15 if quote and quote[2] >= MIN_ROI * 100
+                      else OBSERVATION_SAMPLE_SECONDS)
+    cutoff = datetime.fromtimestamp(
+        time.time() - sample_seconds, tz=timezone.utc
+    ).isoformat(timespec="seconds")
+    last = conn.execute(
+        "SELECT observed_at FROM observations WHERE pair_key=? "
+        "ORDER BY observed_at DESC LIMIT 1", (pair["key"],)
+    ).fetchone()
+    if last and last[0] >= cutoff:
+        return quote, hypothetical
+    if shutil.disk_usage(Path(DB).expanduser().resolve().parent).free < STORAGE_FREE_FLOOR:
+        LOG.warning("STORAGE | disco com menos de 32MiB livres: observação ignorada")
+        return quote, hypothetical
     with conn:
         conn.execute("""
           INSERT INTO observations (
@@ -736,6 +765,11 @@ def self_test():
         assert report["records"] == 1 and report["positive"] == 1
         assert report["unique"] == 1 and report["priced"] == 1
         assert report["potential_signals"] == 0
+        # Repetir a mesma direção não duplica continuamente o histórico.
+        insert_observation(
+            conn, fake, "PRE_JOGO", [(0.45, 30)], [(0.50, 30)], 1.0, 0
+        )
+        assert conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
 
         # Uma segunda direção do mesmo confronto não conta como novo jogo.
         reverse = {**fake, "key": "poly:1/sx:1:reverse",
@@ -907,13 +941,35 @@ def main(once=False):
                 send_summary(conn, len(pairs), startup=(iteration == 1),
                              paper_conn=paper_conn)
 
-            # Preservar o histórico do último mês; não apagar resultados recentes.
-            if iteration % 100 == 0:
+            # Retenção limitada a 12h/25k linhas (configurável) em vez de
+            # 30 dias sem limite. A limpeza histórica antiga deve ser
+            # feita APÓS backup e recuperação de espaço com
+            # recuperar_espaco_v12.py; aqui apenas manutenção incremental.
+            if iteration % 100 == 0 and shutil.disk_usage(
+                Path(DB).expanduser().resolve().parent
+            ).free >= STORAGE_FREE_FLOOR:
                 cutoff = datetime.fromtimestamp(
-                    time.time() - 30 * 86400, tz=timezone.utc
+                    time.time() - OBSERVATION_RETENTION_HOURS * 3600,
+                    tz=timezone.utc
                 ).isoformat(timespec="seconds")
-                with conn:
-                    conn.execute("DELETE FROM observations WHERE observed_at < ?", (cutoff,))
+                try:
+                    excess_id = conn.execute(
+                        "SELECT id FROM observations ORDER BY id DESC "
+                        "LIMIT 1 OFFSET ?", (OBSERVATION_MAX_ROWS,)
+                    ).fetchone()
+                    boundary = excess_id[0] if excess_id else -1
+                    with conn:
+                        conn.execute(
+                            "DELETE FROM observations WHERE id IN ("
+                            "SELECT id FROM observations "
+                            "WHERE observed_at < ? OR id <= ? "
+                            "ORDER BY id LIMIT 2000)",
+                            (cutoff, boundary)
+                        )
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.Error as exc:
+                    LOG.warning("STORAGE | limpeza de observações falhou: %s",
+                                type(exc).__name__)
 
             if once:
                 print("✅ Passagem única concluída; só leitura, sem apostas.")
