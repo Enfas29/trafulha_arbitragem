@@ -67,6 +67,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": "PaperTradingV11/1.0", "Accept": "application/json"})
 # Nunca colocar a chave SX nos cabeçalhos globais: também usamos Gamma/CLOB.
+# Sessions não são partilhadas entre threads; reutilizar conexões por worker.
+_HTTP_LOCAL = threading.local()
+
+def http_session():
+    if threading.current_thread() is threading.main_thread():
+        return HTTP
+    session = getattr(_HTTP_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({"User-Agent": "PaperTradingV13/1.0", "Accept": "application/json"})
+        _HTTP_LOCAL.session = session
+    return session
 
 wake = threading.Event()
 watch_lock = threading.Lock()
@@ -80,7 +92,9 @@ def get_json(url, params=None, timeout=12):
     sx_headers = {"x-sx-api-key": SX_KEY} if (
         SX_KEY and url.startswith(SX_API + "/")
     ) else None
-    r = HTTP.get(url, params=params, headers=sx_headers, timeout=timeout)
+    r = http_session().get(url, params=params, headers=sx_headers, timeout=timeout, allow_redirects=False)
+    if 300 <= getattr(r, "status_code", 0) < 400:
+        raise ValueError("Redirecionamento inesperado da API")
     r.raise_for_status()
     data = r.json()
     if isinstance(data, dict) and data.get("status") == "failure":
