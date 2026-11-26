@@ -6,6 +6,10 @@ on:
   push:
     branches:
       - main
+      - v13-speed-storage
+  pull_request:
+    branches:
+      - main
 
 jobs:
   testar:
@@ -72,3 +76,6 @@ jobs:
 
       - name: Testar auditoria de varios jogos e futebol 1X2 (offline)
         run: python auditoria_jogos_v12.py --self-test
+
+      - name: Testar paralelismo e retencao V13 (offline)
+        run: python test_speed_storage_v13.py
