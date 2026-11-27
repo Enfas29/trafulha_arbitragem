@@ -1,5 +1,8 @@
 # Trafulha Paper V14
 
+> Versão atual: [Trafulha Paper V15](README_V15.md), com custos oficiais,
+> auditoria de decisões e mais cobertura. A política de banca abaixo mantém-se.
+
 Versão de 27/11/2026, com banca proporcional e reset explícito sobre a
 V13.3 de análise reativa e direto confirmado. O ponto de entrada continua a ser
 `python monitor_v11.py` por compatibilidade com o serviço Railway.

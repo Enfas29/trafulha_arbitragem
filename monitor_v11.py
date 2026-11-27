@@ -1,4 +1,4 @@
-"""Trafulha V14 — banca proporcional, direto confirmado e contas virtuais.
+"""Trafulha V15 — custos verificados, decisões auditáveis e leituras paralelas.
 
 Nunca executa apostas reais. As operações Paper são hipóteses contabilísticas;
 os resultados dependem de confirmação oficial em ambas as plataformas.
@@ -37,9 +37,12 @@ from monitor_workers_v13 import SnapshotRefresher, AsyncNoticeSender
 from live_candidates_v13 import LiveCandidates
 from live_market_v13 import fetch_live_snapshot, LiveCheckError
 from paper_reset_v14 import apply_requested_reset
+from parallel_books_v15 import ParallelBooks
+from market_costs_v15 import FeeProvider, FeeContext
+import decision_audit_v15 as decision_audit
 
 LOG = logging.getLogger("monitor_v11")
-APP_VERSION = "14.0.0"
+APP_VERSION = "15.0.0"
 CATALOG_GAMES = None
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -78,6 +81,7 @@ PAIR_START_GAP = 1.0 / min(12.0, max(1.0, float(
 )))
 METRICS_INTERVAL = 30.0
 MAX_QUOTE_AGE_SECONDS = 2.0
+BOOK_READ_WORKERS = min(4, max(1, int(os.getenv("MONITOR_BOOK_WORKERS", "3"))))
 # Pré-análise rápida (REST de ambos os lados), apenas diagnóstico.
 # Não abre operações nem lança alertas de lucro.
 FAST_PREVIEW_ENABLED = os.getenv("MONITOR_FAST_PREVIEW_ENABLED", "1").lower() in {"1", "true", "yes"}
@@ -150,10 +154,11 @@ def open_database(path: str):
     );
     """)
     conn.commit()
+    decision_audit.create_schema(conn)
     return conn
 
 
-def normalize_quote(poly_levels, sx_levels):
+def normalize_quote(poly_levels, sx_levels, *, fee_context=None):
     """ROI demonstrativa com payout igual e profundidade real até 10 USDC.
 
     Não transforma diferenças de liquidação em arbitragem garantida.
@@ -175,7 +180,8 @@ def normalize_quote(poly_levels, sx_levels):
     # Margem de referência do V12: taxa taker desportiva Poly e
     # buffers adversos separados para cada perna.
     model = paper.quote_for_payout(
-        poly_levels, sx_levels, capacity, bot.FX if bot.FX > 0 else 1.0
+        poly_levels, sx_levels, capacity, bot.FX if bot.FX > 0 else 1.0,
+        fee_context=fee_context,
     )
     if model is None:
         return None
@@ -183,7 +189,7 @@ def normalize_quote(poly_levels, sx_levels):
     return capacity, gross, buffered
 
 
-def hypothetical_100_eur(poly_levels, sx_levels, fx: float):
+def hypothetical_100_eur(poly_levels, sx_levels, fx: float, *, fee_context=None):
     """Nome legado: tamanho indicativo da banca inicial pela política atual.
 
     Uma cotação positiva NÃO constitui autorização para abrir posições.
@@ -195,6 +201,7 @@ def hypothetical_100_eur(poly_levels, sx_levels, fx: float):
     return paper.select_shadow_quote(
         poly_levels, sx_levels, fx,
         paper.INITIAL_CENTS, paper.INITIAL_CENTS,
+        fee_context=fee_context,
     )
 
 
@@ -221,14 +228,20 @@ def prune_observations(conn, now=None):
     return removed
 
 
-def insert_observation(conn, pair, stage, poly_levels, sx_levels, skew, fx):
-    quote = normalize_quote(poly_levels, sx_levels) if skew <= MAX_SKEW else None
-    hypothetical = hypothetical_100_eur(poly_levels, sx_levels, fx) if quote else None
+def insert_observation(conn, pair, stage, poly_levels, sx_levels, skew, fx,
+                       *, fee_context=None, costs_required=False):
+    quote = normalize_quote(poly_levels, sx_levels, fee_context=fee_context) if skew <= MAX_SKEW else None
+    hypothetical = (hypothetical_100_eur(poly_levels, sx_levels, fx,
+                                       fee_context=fee_context)
+                    if quote and (fee_context is not None or not costs_required) else None)
     p_best = poly_levels[0][0] if poly_levels else None
     s_best = sx_levels[0][0] if sx_levels else None
     event = " vs ".join(pair["sx"]["teams"])
     note = ("Livros lidos; equivalência de liquidação não validada."
             if quote else "Sem preço ou snapshots demasiado afastados.")
+    if costs_required:
+        note += (" Custos oficiais verificados." if fee_context is not None
+                 else " Custos por verificar; margem apenas de referência, entrada bloqueada.")
 
     # Guardar no máximo uma leitura habitual/minuto por direção.
     # Os cálculos e sinais continuam a ser feitos a cada passagem, com
@@ -323,7 +336,8 @@ def select_pairs(pairs):
     )
 
 
-_BOOK_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="books-v13")
+_BOOK_POOL = ThreadPoolExecutor(max_workers=2 * BOOK_READ_WORKERS + 2,
+                                thread_name_prefix="books-v15")
 LATENCIES = LatencyMetrics()
 _BOOK_BACKOFF_LOCK = threading.Lock()
 _BOOK_BACKOFF_UNTIL = 0.0
@@ -376,8 +390,14 @@ def _timed_book(source, function, *args):
         )
 
 
+class BookBackoffActive(RuntimeError):
+    pass
+
+
 def fetch_books(pair):
     """Duas leituras independentes, simultâneas; nunca reutilizar preços."""
+    if time.monotonic() < book_backoff_until():
+        raise BookBackoffActive("Recuo de leitura ativo")
     poly = _BOOK_POOL.submit(_timed_book, "poly", bot.poly_book, pair["poly_asset"])
     sx = _BOOK_POOL.submit(_timed_book, "sx", bot.sx_book, pair["sx"]["hash"], pair["sx_target"])
     wait((poly, sx))  # terminar ambas mesmo quando uma falha
@@ -444,50 +464,129 @@ def fast_preview(pairs, priority_cache, fx, limit=FAST_PREVIEW_LIMIT):
     return previewed
 
 
+def _audit_failure(audit, reason, **details):
+    if audit is not None:
+        audit.update(details)
+        audit["reason"] = reason
+        audit["failure_stage"] = reason
+
+
+def _audit_quote(audit, quote, *, final=False):
+    if audit is None or quote is None:
+        return
+    audit.update({
+        "final_roi_pct" if final else "first_roi_pct": 100 * quote.roi,
+        "stake_eur": quote.total_eur,
+        "poly_stake_eur": quote.poly_debit_cents / 100,
+        "sx_stake_eur": quote.sx_debit_cents / 100,
+        "net_profit_eur": quote.profit_eur,
+        "poly_fee_eur": quote.poly_fee_cents / 100,
+        "sx_fee_eur": quote.sx_payout_fee_cents / 100,
+        "poly_win_credit_cents": quote.poly_net_payout_cents,
+        "sx_win_credit_cents": quote.sx_net_payout_cents,
+    })
+
+
+def _fee_failure_reason(context, pair):
+    if context is None:
+        return None  # explicit offline compatibility; production requires a provider
+    if not isinstance(context, FeeContext):
+        return "fee_context_invalid"
+    if not context.valid(poly_market_id=pair["poly"]["id"]):
+        return "costs_expired" if time.time() >= context.expires_epoch else "fee_context_invalid"
+    return None
+
+
+def _quote_failure(poly_levels, sx_levels, fx, allocation, fee_context=None):
+    """Explain the stage that failed without pretending a missing fill existed."""
+    if not (0 < fx < 10):
+        return "cambio_invalido"
+    if not poly_levels or not sx_levels:
+        return "sem_liquidez"
+    if (allocation.total_cap_cents < paper.MIN_TRADE_CENTS
+            or min(allocation.poly_available_cents, allocation.sx_available_cents) <= 0):
+        return "reserva_banca_insuficiente"
+    ref = normalize_quote(poly_levels, sx_levels, fee_context=fee_context)
+    if ref is not None and ref[2] < 100 * paper.MIN_NET_ROI:
+        return "margem_liquida_insuficiente"
+    if ref is not None and ref[2] >= 100 * paper.MAX_AUTO_PAPER_ROI:
+        return "margem_anomala"
+    return "liquidez_montante_ou_custos_inelegiveis"
+
+
 def confirm_paper_snapshot(pair, first_poly, first_sx, t_poly, t_sx, fx,
-                           paper_conn, sleep_fn=time.sleep):
+                           paper_conn, sleep_fn=time.sleep, *, fee_context=None,
+                           audit=None):
     """Revalidar dois livros antes de QUALQUER nova operação virtual.
 
     Confirmar estabilidade do preço no melhor nível e ROI num segundo
     snapshot fresco e independente; rejeitar ROI >= 10% ou variações
     fortes. Não tocar nas carteiras nem aceitar preços do WebSocket.
     """
+    fee_failure = _fee_failure_reason(fee_context, pair)
+    if fee_failure:
+        _audit_failure(audit, fee_failure)
+        return None
     allocation = paper.allocation_budget(paper_conn)
     first_q = paper.select_shadow_quote(
         first_poly, first_sx, fx,
         allocation.poly_available_cents, allocation.sx_available_cents,
-        allocation=allocation,
+        allocation=allocation, fee_context=fee_context,
     )
     if first_q is None:
+        _audit_failure(audit, _quote_failure(first_poly, first_sx, fx, allocation, fee_context))
         return None
+    _audit_quote(audit, first_q)
     first_age = time.monotonic()
     if (abs(t_poly - t_sx) > min(MAX_SKEW, paper.MAX_SNAPSHOT_GAP_SECONDS)
             or not 0 <= first_age - t_poly <= MAX_QUOTE_AGE_SECONDS
             or not 0 <= first_age - t_sx <= MAX_QUOTE_AGE_SECONDS):
+        _audit_failure(audit, "initial_quote_stale")
         return None
     # Um pico de odds entre chamadas pode gerar um falso positivo.
     first_best = (min(price for price, _ in first_poly),
                   min(price for price, _ in first_sx))
+    if time.monotonic() < book_backoff_until():
+        _audit_failure(audit, "recheck_rate_limit_backoff")
+        return None
     sleep_fn(0.25)
+    if time.monotonic() < book_backoff_until():
+        _audit_failure(audit, "recheck_rate_limit_backoff")
+        return None
+    fee_failure = _fee_failure_reason(fee_context, pair)
+    if fee_failure:
+        _audit_failure(audit, fee_failure)
+        return None
     try:
         (second_poly, p_time), (second_sx, s_time) = fetch_books(pair)
     except Exception as exc:
+        _audit_failure(audit, "recheck_rate_limit_backoff" if isinstance(exc, BookBackoffActive)
+                       else "recheck_api_error", exception_type=type(exc).__name__)
         LOG.warning("PAPER_RECHECK | rejeitado=%s | erro REST %s",
                     pair["key"][:36], type(exc).__name__)
         return None
     age = time.monotonic()
+    fee_failure = _fee_failure_reason(fee_context, pair)
+    if fee_failure:
+        _audit_failure(audit, fee_failure)
+        return None
     if (abs(p_time - s_time) > min(MAX_SKEW, paper.MAX_SNAPSHOT_GAP_SECONDS)
             or abs(t_poly - s_time) > 3.0
             or not 0 <= age - p_time <= MAX_QUOTE_AGE_SECONDS
             or not 0 <= age - s_time <= MAX_QUOTE_AGE_SECONDS):
+        _audit_failure(audit, "recheck_quote_stale")
         LOG.info("PAPER_RECHECK | rejeitado=%s | snapshots desfasados",
                  pair["key"][:36])
         return None
     if not second_poly or not second_sx:
+        _audit_failure(audit, "recheck_no_liquidity")
         return None
     second_best = (min(price for price, _ in second_poly),
                    min(price for price, _ in second_sx))
+    if audit is not None:
+        audit.update(final_poly_price=second_best[0], final_sx_price=second_best[1])
     if any(abs(a-b) > 0.01 for a, b in zip(first_best, second_best)):
+        _audit_failure(audit, "recheck_price_changed")
         LOG.info("PAPER_RECHECK | rejeitado=%s | mudança de preço >1 cêntimo",
                  pair["key"][:36])
         return None
@@ -495,10 +594,13 @@ def confirm_paper_snapshot(pair, first_poly, first_sx, t_poly, t_sx, fx,
     second_q = paper.select_shadow_quote(
         second_poly, second_sx, fx,
         allocation.poly_available_cents, allocation.sx_available_cents,
-        allocation=allocation,
+        allocation=allocation, fee_context=fee_context,
     )
+    _audit_quote(audit, second_q, final=True)
     if (second_q is None or abs(first_q.roi-second_q.roi) > 0.01
             or second_q.roi >= paper.MAX_AUTO_PAPER_ROI):
+        _audit_failure(audit, "recheck_margin_lost" if second_q is None
+                       else "recheck_margin_changed")
         LOG.info("PAPER_RECHECK | rejeitado=%s | ROI instável/inválido",
                  pair["key"][:36])
         return None
@@ -520,7 +622,8 @@ def may_be_live(pair, now_epoch=None):
 
 
 def attempt_paper_entry(pair, poly_levels, sx_levels, t_poly, t_sx, fx,
-                        paper_conn, stage, live_candidates=None):
+                        paper_conn, stage, live_candidates=None, *, fee_context=None,
+                        audit=None):
     """Book only after the complete pregame or confirmed-live validation."""
     def discard():
         if live_candidates is not None:
@@ -544,13 +647,16 @@ def attempt_paper_entry(pair, poly_levels, sx_levels, t_poly, t_sx, fx,
         first_quote = paper.select_shadow_quote(
             poly_levels, sx_levels, fx,
             allocation.poly_available_cents, allocation.sx_available_cents,
-            allocation=allocation,
+            allocation=allocation, fee_context=fee_context,
         )
+        _audit_quote(audit, first_quote)
         now_mono = time.monotonic()
         if (first_quote is None
                 or abs(t_poly - t_sx) > min(MAX_SKEW, paper.MAX_SNAPSHOT_GAP_SECONDS)
                 or not 0 <= now_mono - t_poly <= MAX_QUOTE_AGE_SECONDS
                 or not 0 <= now_mono - t_sx <= MAX_QUOTE_AGE_SECONDS):
+            _audit_failure(audit, _quote_failure(poly_levels, sx_levels, fx, allocation, fee_context)
+                           if first_quote is None else "initial_quote_stale")
             discard()
             return None, "live_preco_margem_saldo_inelegivel"
         # No sleep here: initial checks, official delay and final phase checks
@@ -562,10 +668,11 @@ def attempt_paper_entry(pair, poly_levels, sx_levels, t_poly, t_sx, fx,
 
     validated = confirm_paper_snapshot(
         pair, poly_levels, sx_levels, t_poly, t_sx, fx, paper_conn,
+        fee_context=fee_context, audit=audit,
     )
     if not validated:
         discard()
-        quote = normalize_quote(poly_levels, sx_levels)
+        quote = normalize_quote(poly_levels, sx_levels, fee_context=fee_context)
         return None, (
             "abaixo_margem" if quote and quote[2] < 100 * paper.MIN_NET_ROI
             else "margem_anomala" if quote and quote[2] >= 100 * paper.MAX_AUTO_PAPER_ROI
@@ -583,7 +690,12 @@ def attempt_paper_entry(pair, poly_levels, sx_levels, t_poly, t_sx, fx,
     booked = paper.try_paper_entry(
         paper_conn, pair, final_poly, final_sx, fx, paper_stage, final_skew,
         valid_until_mono=valid_until, live_evidence=live_evidence,
+        fee_context=fee_context,
     )
+    if booked:
+        _audit_quote(audit, booked[1], final=True)
+    else:
+        _audit_failure(audit, _fee_failure_reason(fee_context, pair) or "validacao_final_sem_registo")
     if booked and live_evidence is not None:
         LOG.info(
             "PAPER_LIVE_ENTRADA | id=%d | SX_delay_ms=%d | Poly_delay_ms=%d | "
@@ -624,7 +736,8 @@ def probe_live_markets(pairs, snapshot_fn=fetch_live_snapshot, limit=2):
 
 def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
               priority_cache=None, work_item=None, notify_open=None,
-              notice_sender=None, verbose=True, live_candidates=None):
+              notice_sender=None, verbose=True, live_candidates=None,
+              fee_provider=None, book_read=None):
     scan_started = time.monotonic()
     if not pairs:
         return {"checked": 0, "priced": 0, "positive": 0, "signals": 0,
@@ -673,17 +786,43 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
         checked += 1
         if event is not None:
             hot_checked += 1
-        book_started = time.monotonic()
+        book_started = book_read.started_mono if book_read is not None else time.monotonic()
         book_completed = None
+        stage = "APOS_INICIO_NAO_CONFIRMADO" if may_be_live(pair) else "PRE_JOGO"
+        audit = {}
+        indicative = None
         try:
-            (poly_levels, t_poly), (sx_levels, t_sx) = fetch_books(pair)
-            book_completed = time.monotonic()
+            if book_read is not None:
+                if book_read.item[0]["key"] != pair["key"] or len(window) != 1:
+                    raise ValueError("Leitura paralela pertence a outro despacho")
+                if book_read.error is not None:
+                    raise book_read.error
+                (poly_levels, t_poly), (sx_levels, t_sx) = book_read.books
+                book_completed = book_read.finished_mono
+            else:
+                (poly_levels, t_poly), (sx_levels, t_sx) = fetch_books(pair)
+                book_completed = time.monotonic()
             book_max_ms = max(book_max_ms, 1000 * (book_completed - book_started))
-            stage = "APOS_INICIO_NAO_CONFIRMADO" if may_be_live(pair) else "PRE_JOGO"
+            fee_context, fee_reason = (fee_provider.context_for_pair(pair)
+                                       if fee_provider is not None else (None, "legacy_offline"))
             quote, hypothetical = insert_observation(
                 conn, pair, stage, poly_levels, sx_levels,
                 abs(t_poly - t_sx), fx,
+                fee_context=fee_context, costs_required=fee_provider is not None,
             )
+            indicative = quote[2] if quote is not None else None
+            audit.update(
+                provider_reason=fee_reason,
+                quote_age_ms=1000 * max(time.monotonic()-t_poly, time.monotonic()-t_sx),
+                snapshot_gap_ms=1000 * abs(t_poly-t_sx),
+                best_poly_price=min((p for p, _ in poly_levels), default=None),
+                best_sx_price=min((p for p, _ in sx_levels), default=None),
+                poly_levels=poly_levels[:8], sx_levels=sx_levels[:8],
+            )
+            if fee_context is not None:
+                audit.update(poly_fee_rate=fee_context.poly_rate,
+                             sx_taker_rate=fee_context.sx_taker_payout_rate,
+                             expires_epoch=fee_context.expires_epoch)
             if quote:
                 priced += 1
                 best = quote[2] if best is None else max(best, quote[2])
@@ -700,11 +839,21 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
                 # A simulação é independente do relatório de odds. Nunca faz
                 # chamadas de escrita à Polymarket ou SX Bet.
                 if paper_conn is not None:
-                    booked, reason = attempt_paper_entry(
-                        pair, poly_levels, sx_levels, t_poly, t_sx, fx,
-                        paper_conn, stage, live_candidates=live_candidates,
-                    )
+                    if fee_provider is not None and fee_context is None:
+                        booked, reason = None, fee_reason
+                        if live_candidates is not None:
+                            live_candidates.discard(pair["key"])
+                    else:
+                        booked, reason = attempt_paper_entry(
+                            pair, poly_levels, sx_levels, t_poly, t_sx, fx,
+                            paper_conn, stage, live_candidates=live_candidates,
+                            fee_context=fee_context, audit=audit,
+                        )
                     paper_reasons[reason] += 1
+                    audit["elapsed_ms"] = 1000 * (time.monotonic()-book_started)
+                    _record_decision(conn, pair, stage, indicative,
+                                     audit.pop("reason", reason), audit,
+                                     booked[0] if booked else None)
                     if booked:
                         shadow_id, shadow_quote = booked
                         LOG.info(
@@ -726,6 +875,7 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
                             LOG.warning("PAPER_ALERT | pendente #%d | Telegram não confirmou; retry automático", shadow_id)
             elif paper_conn is not None:
                 paper_reasons["sem_cotacao_valida"] += 1
+                _record_decision(conn, pair, stage, indicative, "sem_cotacao_valida", audit)
                 if live_candidates is not None:
                     live_candidates.discard(pair["key"])
         except Exception as exc:
@@ -736,6 +886,9 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
                 "Book falhou em %s (%s)",
                 pair["key"][:35], type(exc).__name__,
             )
+            _record_decision(conn, pair, stage, indicative,
+                             "rate_limit_backoff" if isinstance(exc, BookBackoffActive) else "book_api_error",
+                             {"exception_type": type(exc).__name__})
         finally:
             # WS -> fila -> REST de ambos os livros -> avaliação/alerta.
             # Mede tempo LOCAL do evento recebido, não latência da rede
@@ -767,6 +920,31 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
     if verbose:
         log_scan_results([result])
     return result
+
+
+def _record_decision(conn, pair, stage, indicative, reason, details=None, trade_id=None):
+    """Audit failure must never roll back a committed virtual operation."""
+    try:
+        recorded = decision_audit.record_decision(
+            conn, pair, stage, indicative, reason, details=details,
+            trade_id=trade_id,
+        )
+        if recorded and ((indicative is not None and indicative > 0) or trade_id):
+            LOG.info("PAPER_DECISAO | jogo=%s | mercado=%s | margem_indicativa=%s | "
+                     "motivo=%s | operacao=%s | custos=%s | virtual",
+                     " vs ".join(pair["sx"].get("teams", ())), pair["key"],
+                     f"{indicative:.2f}%" if indicative is not None else "N/D",
+                     reason, trade_id, (details or {}).get("provider_reason", "N/D"))
+    except (sqlite3.Error, ValueError, TypeError) as exc:
+        LOG.warning("PAPER_AUDIT | falha ao guardar diagnóstico (%s)", type(exc).__name__)
+
+
+def process_book_read(conn, reading, generation, fx, **kwargs):
+    """Consume one dispatch only when it still belongs to the active catalog."""
+    if reading.generation != generation:
+        return None
+    return scan_pass(conn, [reading.item[0]], 0, fx, work_item=reading.item,
+                     book_read=reading, verbose=False, **kwargs)
 
 
 def log_scan_results(results):
@@ -850,7 +1028,7 @@ def format_summary(stats, catalog_count, window_hours=6, fx_available=False):
         f"📈 Melhor margem indicativa (<10%, não validada): {best}",
         f"⚠️ Leituras anómalas (>=10%, excluídas): {stats.get('suspicious', 0)}",
         f"🔎 Sinais potenciais (<10%, por verificar): {potentials}",
-        "🔒 Só leitura · sem apostas",
+        "🔒 Só leitura das plataformas · sem apostas reais",
     ])
 
 
@@ -894,6 +1072,13 @@ def send_summary(conn, catalog_count, startup=False, now_epoch=None, paper_conn=
             f"\n📈 Resultado realizado: {paper.eur(int(round(totals['realized_eur'] * 100)))}"
             "\n⚠️ Saldos virtuais"
         )
+        reset = None
+        if paper_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                              "AND name='paper_v14_resets'").fetchone():
+            reset = paper_conn.execute("SELECT MAX(applied_epoch) FROM paper_v14_resets").fetchone()[0]
+        diagnostics = decision_audit.summary_decisions(
+            conn, now_epoch-hours*3600, reset_epoch=reset, now_epoch=now_epoch)
+        message += "\n" + decision_audit.format_audit_summary(diagnostics)
         suspect_trades = paper_conn.execute("""
             SELECT COUNT(*) FROM paper_v12_trades
             WHERE status IN ('OPEN_CONDITIONAL','REVIEW_REQUIRED')
@@ -1198,6 +1383,9 @@ def main(once=False):
         raise SystemExit("PAPER_RESET exige Paper ativo e câmbio válido; reset não aplicado")
     if paper_conn is not None and not once:
         apply_requested_reset(paper_conn)
+    fee_provider = FeeProvider() if paper_conn is not None else None
+    read_pool = ParallelBooks(fetch_books, BOOK_READ_WORKERS) if not once else None
+    catalog_generation = 0
     live_candidates = (LiveCandidates(max_workers=1) if paper_conn is not None
                        and paper.PAPER_LIVE_ENABLED and not once else None)
     result_worker = None
@@ -1235,8 +1423,8 @@ def main(once=False):
             )
             result_worker.start()
     LOG.info(
-        "REACTIVE V14 | uma direção por despacho; pré-análise integrada; "
-        "REST fresco nas duas fontes e recheck de 250ms preservados"
+        "REACTIVE V15 | até %d pares em leitura paralela; carteira num único escritor; "
+        "REST fresco nas duas fontes e recheck de 250ms preservados", BOOK_READ_WORKERS
     )
     LOG.info(
         "PAPER_LIVE | estado=%s | confirmação oficial Poly+SX obrigatória | "
@@ -1286,10 +1474,14 @@ def main(once=False):
                     raise RuntimeError("Worker dos resumos parou")
                 if live_probe_worker is not None and not live_probe_worker.thread.is_alive():
                     raise RuntimeError("Worker de diagnóstico LIVE parou")
+                if (fee_provider is not None and fee_provider.thread is not None
+                        and not fee_provider.thread.is_alive()):
+                    raise RuntimeError("Worker de custos oficiais parou")
                 last_health_check = started
             if started - last_prune >= 60 or last_prune == 0:
                 try:
                     removed = prune_observations(conn)
+                    removed += decision_audit.prune_decisions(conn)
                     if removed:
                         LOG.info("STORAGE | %d leituras antigas eliminadas", removed)
                 except sqlite3.Error as exc:
@@ -1297,6 +1489,9 @@ def main(once=False):
                 last_prune = started
             if once:
                 pairs = catalog()
+                if fee_provider is not None:
+                    fee_provider.update_pairs(pairs)
+                    fee_provider.start()
                 catalog_ready = True
             else:
                 refreshed = catalog_worker.poll()
@@ -1304,7 +1499,11 @@ def main(once=False):
                     ok, snapshot = refreshed
                     if ok:
                         pairs = accept_catalog(snapshot)
+                        catalog_generation += 1
                         scheduler.rebuild(pairs)
+                        if fee_provider is not None:
+                            fee_provider.update_pairs(pairs)
+                            fee_provider.start()
                         if live_candidates is not None:
                             live_candidates.rebuild(pairs)
                             live_probe_pairs = tuple(pairs)
@@ -1315,9 +1514,13 @@ def main(once=False):
                         next_catalog = started + 30.0
                 if refreshed is not None and refreshed[0]:
                     if ws_feed is not None:
-                        ws_feed.update(p["sx"]["hash"] for p in pairs[:24])
+                        ws_feed.update(p["sx"]["hash"] for p in pairs)
                     if poly_feed is not None:
-                        poly_feed.update(p["poly_asset"] for p in pairs[:24])
+                        poly_feed.update(p["poly_asset"] for p in pairs)
+                    LOG.info("WS_COBERTURA | jogos=%d | SX_mercados=%d | Poly_resultados=%d",
+                             CATALOG_GAMES or 0,
+                             len(getattr(ws_feed, "watched", ())) if ws_feed is not None else 0,
+                             len(getattr(poly_feed, "assets", ())) if poly_feed is not None else 0)
                 if started >= next_catalog and catalog_worker.request():
                     next_catalog = started + CATALOG_INTERVAL
 
@@ -1347,7 +1550,10 @@ def main(once=False):
                 metrics["pending_events"] = len(scheduler.pending)
                 metrics["queue_drops"] = dict(scheduler.metrics)
                 metrics["coverage"] = scheduler.coverage()
+                metrics["book_jobs"] = read_pool.pending if read_pool else 0
                 LOG.info("LATENCY_V13 | %s", json.dumps(metrics, separators=(",", ":")))
+                if fee_provider is not None:
+                    LOG.info("PAPER_CUSTOS | %s", json.dumps(fee_provider.snapshot(), separators=(",", ":")))
                 if live_candidates is not None:
                     LOG.info("PAPER_LIVE_FILA | %s", json.dumps(
                         live_candidates.snapshot(), separators=(",", ":")))
@@ -1364,33 +1570,42 @@ def main(once=False):
                 last_summary_check = started
 
             if once:
-                result = scan_pass(conn, pairs, 0, fx, paper_conn=paper_conn)
+                result = scan_pass(conn, pairs, 0, fx, paper_conn=paper_conn,
+                                   fee_provider=fee_provider)
             else:
                 # Drenar a cada direção, incluindo sinais recebidos durante REST.
                 sx_events = ws_feed.take_events() if ws_feed is not None else {}
                 poly_events = poly_feed.take_events() if poly_feed is not None else {}
                 scheduler.ingest(poly_events, sx_events)
+                finished = []
+                for reading in read_pool.poll():
+                    item = reading.item
+                    try:
+                        # A refreshed catalog invalidates every outstanding read.
+                        result = process_book_read(
+                            conn, reading, catalog_generation, fx, paper_conn=paper_conn,
+                            notify_open=result_worker.notify if result_worker else None,
+                            notice_sender=notice_worker.submit,
+                            live_candidates=live_candidates, fee_provider=fee_provider,
+                        )
+                        if result is not None:
+                            finished.append(result)
+                            batch.append(result)
+                    finally:
+                        scheduler.completed(item[0]["key"])
                 now_mono = time.monotonic()
                 wait_until = max(last_pair_start + PAIR_START_GAP, book_backoff_until())
-                if now_mono < wait_until:
-                    time.sleep(min(0.05, wait_until - now_mono))
-                    continue
-                item = scheduler.choose(now=now_mono)
-                if item is None:
-                    time.sleep(max(0.001, scheduler.idle_seconds(max_wait=0.05)))
-                    continue
-                last_pair_start = time.monotonic()
-                try:
-                    result = scan_pass(
-                        conn, [item[0]], 0, fx, paper_conn=paper_conn,
-                        work_item=item, verbose=False,
-                        notify_open=result_worker.notify if result_worker else None,
-                        notice_sender=notice_worker.submit,
-                        live_candidates=live_candidates,
-                    )
-                finally:
-                    scheduler.completed(item[0]["key"])
-                batch.append(result)
+                if read_pool.available and now_mono >= wait_until:
+                    item = scheduler.choose(now=now_mono)
+                    if item is not None:
+                        if read_pool.submit(item, catalog_generation):
+                            last_pair_start = time.monotonic()
+                        else:
+                            scheduler.completed(item[0]["key"])
+                result = {"checked": sum(r["checked"] for r in finished),
+                          "priced": sum(r["priced"] for r in finished)}
+                # Keep receiving WS/live-ready events while HTTP runs elsewhere.
+                time.sleep(0.005 if read_pool.pending else 0.02)
             outage_notice = update_health(conn, result["checked"], result["priced"])
             if outage_notice:
                 LOG.warning("Sem odds válidas durante o período de alerta.")
@@ -1409,6 +1624,10 @@ def main(once=False):
     except KeyboardInterrupt:
         LOG.info("Monitor interrompido.")
     finally:
+        if read_pool is not None:
+            read_pool.stop()
+        if fee_provider is not None:
+            fee_provider.stop()
         if batch:
             log_scan_results(batch)
         if live_candidates is not None:

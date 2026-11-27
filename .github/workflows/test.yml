@@ -1,5 +1,5 @@
 
-name: Validar Trafulha Paper V13
+name: Validar Trafulha Paper V15
 
 on:
   workflow_dispatch:
@@ -11,6 +11,7 @@ on:
       - v13-speed-safe-20261127
       - v13-live-paper-20261127
       - v14-bankroll-reset-20261127
+      - v15-opportunities-20261127
   pull_request:
     branches:
       - main
@@ -115,3 +116,13 @@ jobs:
           python test_paper_bankroll_v14.py
           python test_paper_reset_v14.py
           python test_monitor_bankroll_v14.py
+
+      - name: Testar custos, diagnóstico, cobertura e paralelismo V15 (offline)
+        run: |
+          python test_market_costs_v15.py
+          python test_paper_costs_v15.py
+          python test_decision_audit_v15.py
+          python test_discovery_v15.py
+          python test_ws_coverage_v15.py
+          python test_parallel_books_v15.py
+          python test_monitor_opportunities_v15.py

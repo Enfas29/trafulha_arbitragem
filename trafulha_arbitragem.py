@@ -20,6 +20,7 @@ import threading
 import time
 import unicodedata
 from dataclasses import dataclass
+from collections import Counter, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -51,6 +52,16 @@ CATALOG_SECONDS = 240        # atualizar novas partidas/mercados
 MAX_SX_PAGES = 30
 MAX_POLY_SERIES = 70
 MAX_EVENTS_PER_SERIES = 150
+# Discovery runs off the hot path. Bound both each series and the whole refresh.
+POLY_MAX_PAGES_PER_SERIES = min(10, max(1, int(
+    os.getenv("MONITOR_POLY_PAGES_PER_SERIES", "4")
+)))
+POLY_MAX_REQUESTS_PER_REFRESH = min(400, max(10, int(
+    os.getenv("MONITOR_POLY_REQUEST_BUDGET", "140")
+)))
+DISCOVERY_STATS = {}
+_POLY_SERIES_CURSOR = 0
+_MATCHED_POLY_SERIES = set()
 MAX_PAIRS_PER_SCAN = 25       # controla requests; aumenta gradualmente
 MAX_LIVE_AGE_H = 8
 MAX_FUTURE_H = 168            # jogos nos próximos 7 dias
@@ -304,140 +315,283 @@ def is_poly_moneyline(market):
     return str(market.get("sportsMarketType") or "").strip().lower() == "moneyline"
 
 
-def discover_poly():
-    metadata = get_json(POLY_GAMMA + "/sports")
-    sports = metadata if isinstance(metadata, list) else []
-    series = {}
-    for row in sports:
-        if not isinstance(row, dict):
-            continue
-        sport = sport_family(row.get("sport") or row.get("name"))
-        for sid in re.findall(r"\d+", str(row.get("series", ""))):
-            series[sid] = sport
+def _discovery_stats(source, stats):
+    """Publish one complete, JSON-safe diagnostics snapshot, never API secrets."""
+    DISCOVERY_STATS[source] = dict(stats)
+    LOG.info("DISCOVERY_V15 | %s | %s", source,
+             json.dumps(stats, sort_keys=True, separators=(",", ":")))
 
-    # Dar prioridade a ligas com maior probabilidade de mercados comparáveis.
-    # Não depender da posição arbitrária da lista devolvida por /sports.
-    sport_priority = {
+
+def _select_poly_series(series):
+    """Retain matched leagues; rotate the remaining compatible leagues fairly.
+
+    This is metadata selection, never a cache of old quotes or old markets.
+    All returned markets are fetched anew in the current discovery pass.
+    """
+    global _POLY_SERIES_CURSOR
+    priorities = {
         "basketball": 0, "american_football": 1, "tennis": 2,
         "baseball": 3, "cricket": 4, "combat": 5, "esports": 6,
-        "soccer": 7, "hockey": 8, "rugby": 9, "volleyball": 10,
-        "handball": 11,
     }
-    selected_series = sorted(
-        series.items(),
-        key=lambda item: (sport_priority.get(item[1], 99), int(item[0])),
-    )[:MAX_POLY_SERIES]
-    LOG.info(
-        "Gamma series: %d conhecidas, %d selecionadas (prioridade NBA/NFL/ténis)",
-        len(series), len(selected_series)
+    eligible = sorted(
+        ((sid, sport) for sid, sport in series.items() if sport in priorities),
+        key=lambda item: (priorities[item[1]], int(item[0])),
     )
+    limit = min(MAX_POLY_SERIES, POLY_MAX_REQUESTS_PER_REFRESH)
+    # Leave at least a quarter of the allowance for discoveries whenever the
+    # catalogue is larger than the allowance; matched leagues cannot starve it.
+    anchor_limit = limit if len(eligible) <= limit else max(0, 3 * limit // 4)
+    anchors = [item for item in eligible if item[0] in _MATCHED_POLY_SERIES][:anchor_limit]
+    anchored = {sid for sid, _ in anchors}
+    rotating = [item for item in eligible if item[0] not in anchored]
+    count = min(max(0, limit - len(anchors)), len(rotating))
+    offset = _POLY_SERIES_CURSOR % len(rotating) if rotating else 0
+    chosen = [rotating[(offset + i) % len(rotating)] for i in range(count)]
+    _POLY_SERIES_CURSOR = (offset + count) % len(rotating) if rotating else 0
+    return anchors + chosen, len(eligible)
+
+
+def _poly_markets_from_event(event, family, sid, fetched_epoch, counts):
+    teams = parse_title(event.get("title", ""))
+    if not teams:
+        counts["unparsed_event_name"] += 1
+        return []
     result = []
-    seen = set()
-    for sid, family in selected_series:
+    for m in event.get("markets", []) or []:
+        if not isinstance(m, dict):
+            counts["invalid_market"] += 1
+            continue
+        if m.get("closed") or m.get("active") is False:
+            counts["inactive_market"] += 1
+            continue
+        if not is_poly_moneyline(m):
+            counts["unsupported_market_type"] += 1
+            continue
+        outs = values(m.get("outcomes"))
+        ids = values(m.get("positionIds")) if m.get("version") == "v2" else values(m.get("clobTokenIds"))
+        if len(outs) != 2 or len(ids) != 2:
+            counts["invalid_outcomes_or_assets"] += 1
+            continue
+        if {ascii_name(x) for x in outs} == {"yes", "no"}:
+            counts["yes_no_not_equivalent"] += 1
+            continue
+        if not ((same_team(outs[0], teams[0]) and same_team(outs[1], teams[1]))
+                or (same_team(outs[1], teams[0]) and same_team(outs[0], teams[1]))):
+            counts["outcomes_not_participants"] += 1
+            continue
+        start = unix_time(m.get("gameStartTime") or event.get("startTime") or event.get("gameStartTime"))
+        if not start or m.get("id") is None:
+            counts["missing_start_or_id"] += 1
+            continue
+        result.append({
+            "id": str(m["id"]), "sport": family, "teams": teams,
+            "event_id": str(event["id"]) if event.get("id") is not None else None,
+            "event_live": event.get("live") is True,
+            "event_ended": event.get("ended") is True,
+            "title": event.get("title", ""), "start": start,
+            "outcomes": outs, "assets": [str(x) for x in ids],
+            "slug": event.get("slug", ""), "type": m.get("sportsMarketType"),
+            "version": m.get("version"), "series_id": sid,
+            # Retain official cost fields without coercing missing/invalid
+            # data to zero. The independent costs module validates them.
+            "feesEnabled": m.get("feesEnabled"),
+            "feeSchedule": m.get("feeSchedule"),
+            "fees_fetched_epoch": fetched_epoch,
+        })
+    return result
+
+
+def discover_poly():
+    try:
+        metadata = get_json(POLY_GAMMA + "/sports")
+    except Exception as exc:
+        _discovery_stats("poly", {"complete": False, "fetch_errors": 1,
+                                  "error": type(exc).__name__})
+        raise
+    if not isinstance(metadata, list):
+        _discovery_stats("poly", {"complete": False, "fetch_errors": 1,
+                                  "error": "invalid_sports_response"})
+        raise ValueError("Gamma sports response invalid")
+    series = {}
+    for row in metadata:
+        if not isinstance(row, dict):
+            continue
+        family = sport_family(row.get("sport") or row.get("name"))
+        for sid in re.findall(r"\d+", str(row.get("series", ""))):
+            series[sid] = family
+    selected, eligible_count = _select_poly_series(series)
+    LOG.info("Gamma series: %d conhecidas, %d compatíveis, %d selecionadas; rotação V15",
+             len(series), eligible_count, len(selected))
+    counts = Counter()
+    queue = deque((sid, family, 0, 0) for sid, family in selected)
+    result, seen_events, seen_markets = [], set(), set()
+    truncated_series, complete_series, failed_series = set(), set(), set()
+    requests = 0
+    # Breadth-first: every selected series gets a first page before a busy
+    # series can consume the entire budget with its following pages.
+    while queue and requests < POLY_MAX_REQUESTS_PER_REFRESH:
+        sid, family, offset, page_index = queue.popleft()
+        requests += 1
         try:
             events = get_json(POLY_GAMMA + "/events", {
                 "active": "true", "closed": "false", "series_id": sid,
-                "limit": MAX_EVENTS_PER_SERIES, "offset": 0,
+                "limit": MAX_EVENTS_PER_SERIES, "offset": offset,
             })
+            if not isinstance(events, list):
+                raise ValueError("Gamma events response invalid")
         except Exception as exc:
-            LOG.warning("Gamma series %s: %s", sid, exc)
-            continue
-        for event in events if isinstance(events, list) else []:
-            if str(event.get("id")) in seen:
+            counts["fetch_errors"] += 1
+            failed_series.add(sid)
+            LOG.warning("Gamma series %s page %d: %s; snapshot incompleto",
+                        sid, page_index + 1, type(exc).__name__)
+            # Retry the catalogue as a unit; do not spend another full request
+            # budget while the upstream is unavailable.
+            break
+        fetched_epoch = time.time()
+        counts["pages"] += 1
+        counts["events_received"] += len(events)
+        for event in events:
+            if not isinstance(event, dict) or event.get("id") is None:
+                counts["invalid_event"] += 1
                 continue
-            seen.add(str(event.get("id")))
-            teams = parse_title(event.get("title", ""))
-            if not teams:
+            eid = str(event["id"])
+            if eid in seen_events:
+                counts["duplicate_event"] += 1
                 continue
-            for m in event.get("markets", []) or []:
-                if m.get("closed") or m.get("active") is False:
+            seen_events.add(eid)
+            for market in _poly_markets_from_event(event, family, sid, fetched_epoch, counts):
+                if market["id"] in seen_markets:
+                    counts["duplicate_market"] += 1
                     continue
-                # Nunca comparar um spread/total/segmento com moneyline da SX.
-                if not is_poly_moneyline(m):
-                    continue
-                outs = values(m.get("outcomes"))
-                ids = values(m.get("positionIds")) if m.get("version") == "v2" else values(m.get("clobTokenIds"))
-                if len(outs) != 2 or len(ids) != 2:
-                    continue
-                # Sem Yes/No: um NO pode não equivaler à vitória do adversário.
-                if {ascii_name(x) for x in outs} == {"yes", "no"}:
-                    continue
-                if not ((same_team(outs[0], teams[0]) and same_team(outs[1], teams[1]))
-                        or (same_team(outs[1], teams[0]) and same_team(outs[0], teams[1]))):
-                    continue
-                start = unix_time(m.get("gameStartTime") or event.get("startTime") or event.get("gameStartTime"))
-                if not start:
-                    continue
-                result.append({
-                    "id": str(m.get("id")), "sport": family, "teams": teams,
-                    "event_id": str(event["id"]) if event.get("id") is not None else None,
-                    "event_live": event.get("live") is True,
-                    "event_ended": event.get("ended") is True,
-                    "title": event.get("title", ""), "start": start,
-                    "outcomes": outs, "assets": [str(x) for x in ids],
-                    "slug": event.get("slug", ""),
-                    "type": m.get("sportsMarketType"),
-                    "version": m.get("version"),
-                })
+                seen_markets.add(market["id"])
+                result.append(market)
+        if len(events) >= MAX_EVENTS_PER_SERIES:
+            if page_index + 1 < POLY_MAX_PAGES_PER_SERIES:
+                queue.append((sid, family, offset + MAX_EVENTS_PER_SERIES, page_index + 1))
+            else:
+                truncated_series.add(sid)
+        else:
+            complete_series.add(sid)
+    truncated_series.update(sid for sid, _, _, _ in queue)
+    stats = dict(counts)
+    stats.update(
+        series_known=len(series), series_compatible=eligible_count,
+        series_selected=len(selected), series_not_selected=eligible_count - len(selected),
+        series_skipped_unsupported=len(series) - eligible_count,
+        series_complete=len(complete_series), series_truncated=len(truncated_series),
+        series_failed=len(failed_series), requests=requests,
+        request_budget=POLY_MAX_REQUESTS_PER_REFRESH,
+        markets=len(result), complete=(not failed_series and not truncated_series
+                                      and len(selected) == eligible_count),
+    )
+    _discovery_stats("poly", stats)
+    if failed_series:
+        # The monitor's SnapshotRefresher retains its previous complete
+        # catalogue, rather than replacing it with a failed partial response.
+        raise ValueError("Gamma catalogue fetch incomplete")
     LOG.info("Polymarket: %d mercados binários desportivos elegíveis", len(result))
     return result
 
 
 def discover_sx():
     all_markets, page_key = [], None
-    for _ in range(MAX_SX_PAGES):
-        params = {"type": "52,226", "pageSize": 100, "onlyMainLine": "true"}
-        if page_key:
-            params["paginationKey"] = page_key
-        data = get_json(SX_API + "/markets/active", params).get("data", {})
-        batch = data.get("markets", [])
-        if not batch:
-            break
-        for m in batch:
-            if (m.get("status") != "ACTIVE" or m.get("type") not in ALLOWED_SX_TYPES
-                    or not m.get("marketHash") or not m.get("teamOneName")
-                    or not m.get("teamTwoName")):
-                continue
-            game = unix_time(m.get("gameTime"))
-            if not game:
-                continue
-            all_markets.append({
-                "hash": m["marketHash"], "teams": (m["teamOneName"], m["teamTwoName"]),
-                "outcomes": (m.get("outcomeOneName", ""), m.get("outcomeTwoName", "")),
-                "start": game, "sport": sx_sport_family(m),
-                "type": m["type"], "league": m.get("leagueLabel", ""),
-                "event_id": m.get("sportXeventId"),
-                "sport_id": m.get("sportId"), "league_id": m.get("leagueId"),
-                "live_enabled": m.get("liveEnabled") is True,
-            })
-        page_key = data.get("nextKey")
-        if not page_key:
-            break
+    seen_markets, used_keys = set(), set()
+    counts = Counter()
+    complete = False
+    try:
+        for _ in range(MAX_SX_PAGES):
+            params = {"type": "52,226", "pageSize": 100, "onlyMainLine": "true"}
+            if page_key:
+                params["paginationKey"] = page_key
+            response = get_json(SX_API + "/markets/active", params)
+            data = response.get("data") if isinstance(response, dict) else None
+            if not isinstance(data, dict) or not isinstance(data.get("markets"), list):
+                raise ValueError("SX markets response invalid")
+            batch = data["markets"]
+            counts["pages"] += 1
+            counts["markets_received"] += len(batch)
+            for m in batch:
+                if (not isinstance(m, dict) or m.get("status") != "ACTIVE"
+                        or m.get("type") not in ALLOWED_SX_TYPES
+                        or not m.get("marketHash") or not m.get("teamOneName")
+                        or not m.get("teamTwoName")):
+                    counts["inactive_or_unsupported"] += 1
+                    continue
+                if m["marketHash"] in seen_markets:
+                    counts["duplicate_market"] += 1
+                    continue
+                game = unix_time(m.get("gameTime"))
+                if not game:
+                    counts["missing_game_time"] += 1
+                    continue
+                seen_markets.add(m["marketHash"])
+                all_markets.append({
+                    "hash": m["marketHash"], "teams": (m["teamOneName"], m["teamTwoName"]),
+                    "outcomes": (m.get("outcomeOneName", ""), m.get("outcomeTwoName", "")),
+                    "start": game, "sport": sx_sport_family(m),
+                    "type": m["type"], "league": m.get("leagueLabel", ""),
+                    "event_id": m.get("sportXeventId"),
+                    "sport_id": m.get("sportId"), "league_id": m.get("leagueId"),
+                    "live_enabled": m.get("liveEnabled") is True,
+                })
+            page_key = data.get("nextKey")
+            if not page_key:
+                complete = True
+                break
+            if not batch or page_key in used_keys:
+                raise ValueError("SX pagination made no progress")
+            used_keys.add(page_key)
+    except Exception:
+        _discovery_stats("sx", {**dict(counts), "complete": False,
+                               "fetch_errors": 1, "markets": len(all_markets)})
+        raise
+    _discovery_stats("sx", {**dict(counts), "complete": complete,
+                           "truncated": not complete, "page_limit": MAX_SX_PAGES,
+                           "markets": len(all_markets)})
+    if not complete:
+        LOG.warning("SX DISCOVERY: limite de %d páginas; há nextKey por consultar", MAX_SX_PAGES)
     LOG.info("SX Bet: %d mercados 2-way ativos", len(all_markets))
     return all_markets
 
 
 def pair_markets(poly, sx):
-    result = []
+    global _MATCHED_POLY_SERIES
+    result, matched_series = [], set()
+    counts = Counter()
+    by_sport = {}
+    for p in poly:
+        by_sport.setdefault(p["sport"], []).append(p)
     for s in sx:
         if s["sport"] in EXCLUDED_SETTLEMENT_SPORTS:
+            counts["excluded_settlement_sport"] += 1
             continue
         a, b = s["teams"]
-        # Para não misturar "tempo regulamentar" com "inclui prolongamento",
-        # restringimos neste protótipo ao moneyline com prolongamento da SX.
-        if s["sport"] in {"basketball", "american_football"}:
-            if s["type"] != 226:
-                continue
-        elif s["type"] != 52:
+        expected_type = 226 if s["sport"] in {"basketball", "american_football"} else 52
+        if s["type"] != expected_type:
+            counts["incompatible_sx_period_type"] += 1
+            continue
+        if not (same_team(s["outcomes"][0], a) and same_team(s["outcomes"][1], b)):
+            counts["sx_outcomes_not_participants"] += 1
+            continue
+        same_sport = by_sport.get(s["sport"], [])
+        if not same_sport:
+            counts["no_poly_sport"] += 1
+            continue
+        same_start = [p for p in same_sport if match_time(p["start"], s["start"])]
+        if not same_start:
+            counts["no_poly_start_match"] += 1
+            continue
+        named = []
+        for p in same_start:
+            x, y = p["teams"]
+            if ((same_team(a, x) and same_team(b, y)) or
+                    (same_team(a, y) and same_team(b, x))):
+                named.append(p)
+        if not named:
+            counts["no_poly_participant_match"] += 1
             continue
         candidates = []
-        for p in poly:
-            if p["sport"] != s["sport"] or not match_time(p["start"], s["start"]):
-                continue
-            x, y = p["teams"]
-            if not ((same_team(a, x) and same_team(b, y)) or
-                    (same_team(a, y) and same_team(b, x))):
-                continue
+        for p in named:
             poly_index = {}
             for idx, label in enumerate(p["outcomes"]):
                 for i, team in enumerate((a, b)):
@@ -445,20 +599,29 @@ def pair_markets(poly, sx):
                         poly_index[i] = idx
             if len(poly_index) != 2 or poly_index[0] == poly_index[1]:
                 continue
-            # SX outcomes devem ser literalmente os dois participantes.
-            if not (same_team(s["outcomes"][0], a) and same_team(s["outcomes"][1], b)):
-                continue
             candidates.append((p, poly_index))
         if len(candidates) == 1:
             p, mapping = candidates[0]
+            counts["matched_sx_market"] += 1
+            if p.get("series_id"):
+                matched_series.add(str(p["series_id"]))
             for target in (0, 1):
                 result.append({
                     "poly": p, "sx": s, "poly_asset": p["assets"][mapping[target]],
                     "poly_label": p["outcomes"][mapping[target]],
-                    "sx_target": 1 - target,  # SX aposta no adversário
+                    "sx_target": 1 - target,
                     "sx_label": s["outcomes"][1 - target],
                     "key": f"{p['id']}:{s['hash']}:{target}",
                 })
+        elif candidates:
+            counts["ambiguous_poly_markets"] += 1
+        else:
+            counts["poly_outcomes_not_participants"] += 1
+    _MATCHED_POLY_SERIES = matched_series
+    stats = {**dict(counts), "poly_markets": len(poly), "sx_markets": len(sx),
+             "directions": len(result), "matched_series": len(matched_series)}
+    DISCOVERY_STATS["matching"] = stats
+    LOG.info("MATCHING_V15 | %s", json.dumps(stats, sort_keys=True, separators=(",", ":")))
     LOG.info("Matching confirmado por nome, desporto e hora: %d pares", len(result))
     return result
 

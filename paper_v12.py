@@ -26,6 +26,7 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import bankroll_v14 as bankroll
+from market_costs_v15 import FeeContext
 
 INITIAL_CENTS = 100_000                 # 1.000 EUR em cada plataforma
 MIN_TRADE_CENTS = 500                  # mínimo de 5 EUR por operação
@@ -61,7 +62,7 @@ PAPER_LIVE_ENABLED = os.getenv("PAPER_LIVE_ENABLED", "1").strip().lower() in {"1
 MAX_LIVE_EVIDENCE_SECONDS = 3.0
 MAX_ENTRY_EVIDENCE_BYTES = 8192
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 MIGRATION_RESERVE_BYTES = 32 * 1024 * 1024
 LOG = logging.getLogger("paper_v13")
 TRADE_COLUMNS_V13 = {
@@ -76,6 +77,10 @@ TRADE_COLUMNS_V13 = {
     "resolution_evidence_json": "TEXT",
     "entry_evidence_json": "TEXT",
     "bankroll_evidence_json": "TEXT",
+    "fee_evidence_json": "TEXT",
+    "poly_net_payout_cents": "INTEGER",
+    "sx_net_payout_cents": "INTEGER",
+    "sx_payout_fee_cents": "INTEGER",
 }
 
 
@@ -87,7 +92,7 @@ def cents_down(value: float) -> int:
     return int((Decimal(str(value)) * 100).to_integral_value(rounding=ROUND_FLOOR))
 
 
-def walk_book(levels, payout):
+def walk_book(levels, payout, *, fee_rate=POLY_TAKER_FEE_RATE):
     """Custo e distribuição por níveis para um mesmo payout em USD/USDC.
 
     Ambos os livros têm formato (preço/probabilidade, capacidade em payout).
@@ -103,7 +108,7 @@ def walk_book(levels, payout):
             continue
         size = min(remaining, capacity)
         cost += size * price
-        poly_fee_units += size * POLY_TAKER_FEE_RATE * price * (1 - price)
+        poly_fee_units += size * fee_rate * price * (1 - price)
         remaining -= size
         if remaining <= 1e-7:
             return cost, poly_fee_units
@@ -121,6 +126,13 @@ class ShadowQuote:
     payout_eur_cents: int
     conditional_profit_cents: int
     roi: float
+    # None identifies a legacy/offline quote. Production supplies verified
+    # context and freezes both possible net credits separately.
+    fee_context: FeeContext | None = None
+    poly_net_payout_cents: int | None = None
+    sx_net_payout_cents: int | None = None
+    sx_payout_fee_cents: int = 0
+    sx_stake_usdc: float = 0.0
 
     @property
     def total_eur(self):
@@ -131,11 +143,14 @@ class ShadowQuote:
         return self.conditional_profit_cents / 100
 
 
-def quote_for_payout(poly_levels, sx_levels, payout_usdc, fx):
+def quote_for_payout(poly_levels, sx_levels, payout_usdc, fx, *, fee_context=None):
     """Inclui fee de taker Poly, buffers, arredondamento a cêntimos."""
     if not (math.isfinite(fx) and 0 < fx < 10):
         return None
-    poly = walk_book(poly_levels, payout_usdc)
+    if fee_context is not None and (not isinstance(fee_context, FeeContext) or not fee_context.valid()):
+        return None
+    rate = fee_context.poly_rate if fee_context is not None else POLY_TAKER_FEE_RATE
+    poly = walk_book(poly_levels, payout_usdc, fee_rate=rate)
     sx = walk_book(sx_levels, payout_usdc)
     if poly is None or sx is None:
         return None
@@ -146,18 +161,29 @@ def quote_for_payout(poly_levels, sx_levels, payout_usdc, fx):
     sx_debit = cents_up(sx_stake * (1 + ADVERSE_PRICE_BUFFER) * fx)
     fee_cents = cents_up(poly_fee * fx)
     total = poly_debit + sx_debit
-    payout_cents = cents_down(payout_usdc * fx)
+    gross_payout_cents = cents_down(payout_usdc * fx)
+    # SX charges the actual profit of its winning leg, not the fictitious
+    # adverse-price reserve. A lost leg pays no payout fee.
+    sx_payout_fee = (cents_up(max(0.0, payout_usdc - sx_stake)
+                             * fee_context.sx_taker_payout_rate * fx)
+                     if fee_context is not None else 0)
+    sx_net_payout = max(0, gross_payout_cents - sx_payout_fee)
+    payout_cents = min(gross_payout_cents, sx_net_payout)
     if total <= 0:
         return None
     profit = payout_cents - total
     return ShadowQuote(
         payout_usdc, fx, poly_debit, sx_debit, fee_cents, total,
-        payout_cents, profit, profit / total
+        payout_cents, profit, profit / total, fee_context,
+        gross_payout_cents if fee_context is not None else None,
+        sx_net_payout if fee_context is not None else None,
+        sx_payout_fee, sx_stake,
     )
 
 
 def select_shadow_quote(poly_levels, sx_levels, fx,
-                        free_poly_cents, free_sx_cents, *, allocation=None):
+                        free_poly_cents, free_sx_cents, *, allocation=None,
+                        fee_context=None):
     """Size a virtual pair using current reserves, depth and the net margin.
 
     Production supplies ``allocation_budget(conn)`` so already committed
@@ -166,6 +192,8 @@ def select_shadow_quote(poly_levels, sx_levels, fx,
     presumed open stakes. No fixed EUR trade, payout or exposure cap applies.
     """
     if not (poly_levels and sx_levels and 0 < fx < 10):
+        return None
+    if fee_context is not None and (not isinstance(fee_context, FeeContext) or not fee_context.valid()):
         return None
     if allocation is None:
         allocation = bankroll.budget_for_entry(
@@ -198,7 +226,7 @@ def select_shadow_quote(poly_levels, sx_levels, fx,
     low, high = 0.0, capacity
     for _ in range(45):
         middle = (low + high) / 2
-        quote = quote_for_payout(poly_levels, sx_levels, middle, fx)
+        quote = quote_for_payout(poly_levels, sx_levels, middle, fx, fee_context=fee_context)
         allowed = (
             quote is not None
             and quote.total_cents <= total_limit
@@ -212,7 +240,7 @@ def select_shadow_quote(poly_levels, sx_levels, fx,
 
     def rounded_quote(payout):
         payout = math.floor(payout * 1_000_000) / 1_000_000
-        return quote_for_payout(poly_levels, sx_levels, payout, fx)
+        return quote_for_payout(poly_levels, sx_levels, payout, fx, fee_context=fee_context)
 
     quote = rounded_quote(low)
     if quote is None:
@@ -224,7 +252,7 @@ def select_shadow_quote(poly_levels, sx_levels, fx,
         minimum, maximum = 0.0, low
         for _ in range(45):
             middle = (minimum + maximum) / 2
-            trial = quote_for_payout(poly_levels, sx_levels, middle, fx)
+            trial = quote_for_payout(poly_levels, sx_levels, middle, fx, fee_context=fee_context)
             if trial is not None and trial.total_cents >= MIN_TRADE_CENTS:
                 maximum = middle
             else:
@@ -688,12 +716,38 @@ def _valid_shadow_amounts(quote):
             or quote.poly_fee_cents > quote.poly_debit_cents):
         return False
     try:
+        gross_payout = cents_down(quote.payout_usdc * quote.fx_eur_per_usd)
+        if quote.fee_context is None:
+            if (quote.payout_eur_cents != gross_payout
+                    or quote.poly_net_payout_cents is not None
+                    or quote.sx_net_payout_cents is not None
+                    or quote.sx_payout_fee_cents != 0):
+                return False
+        else:
+            if not isinstance(quote.fee_context, FeeContext) or not quote.fee_context.valid():
+                return False
+            payouts = (quote.poly_net_payout_cents, quote.sx_net_payout_cents,
+                       quote.sx_payout_fee_cents)
+            if (any(type(value) is not int or value < 0 for value in payouts)
+                    or type(quote.sx_stake_usdc) not in (int, float)
+                    or not math.isfinite(quote.sx_stake_usdc)
+                    or not 0 < quote.sx_stake_usdc < quote.payout_usdc):
+                return False
+            expected_fee = cents_up((quote.payout_usdc - quote.sx_stake_usdc)
+                                    * quote.fee_context.sx_taker_payout_rate
+                                    * quote.fx_eur_per_usd)
+            if (quote.poly_net_payout_cents != gross_payout
+                    or quote.sx_payout_fee_cents != expected_fee
+                    or quote.sx_net_payout_cents != max(0, gross_payout - expected_fee)
+                    or quote.payout_eur_cents != min(payouts[:2])
+                    or quote.sx_debit_cents != cents_up(quote.sx_stake_usdc
+                                * (1 + ADVERSE_PRICE_BUFFER) * quote.fx_eur_per_usd)):
+                return False
         return (math.isfinite(quote.roi) and MIN_NET_ROI <= quote.roi < MAX_AUTO_PAPER_ROI
                 and math.isclose(quote.roi, quote.conditional_profit_cents / quote.total_cents,
                                  rel_tol=1e-12, abs_tol=1e-12)
                 and math.isfinite(quote.payout_usdc) and quote.payout_usdc > 0
-                and math.isfinite(quote.fx_eur_per_usd) and 0 < quote.fx_eur_per_usd < 10
-                and quote.payout_eur_cents == cents_down(quote.payout_usdc * quote.fx_eur_per_usd))
+                and math.isfinite(quote.fx_eur_per_usd) and 0 < quote.fx_eur_per_usd < 10)
     except (TypeError, ValueError, OverflowError):
         return False
 
@@ -706,7 +760,7 @@ def _fits_allocation(quote, allocation):
 
 def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
                       opening_odds=None, *, valid_until_mono=None,
-                      live_evidence=None):
+                      live_evidence=None, fee_context=None):
     """Duas pernas virtuais numa única transação SQLite. Nunca faz apostas.
 
     Uma única simulação por par de mercados, mesmo que a direção mude.
@@ -731,6 +785,16 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
         return None
     if not _valid_shadow_amounts(quote):
         return None
+    if fee_context is None:
+        fee_context = quote.fee_context
+    if fee_context is not None and (
+            fee_context != quote.fee_context
+            or not fee_context.valid(poly_market_id=pair["poly"]["id"])):
+        return None
+    fee_evidence_json = (json.dumps({**fee_context.evidence(),
+                                   "sx_stake_usdc": quote.sx_stake_usdc}, sort_keys=True,
+                                   separators=(",", ":"), allow_nan=False)
+                         if fee_context is not None else None)
 
     eid = event_key(pair)
     now_epoch = int(time.time() if now_epoch is None else now_epoch)
@@ -742,7 +806,9 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
         conn.execute("BEGIN IMMEDIATE")
         # A busy SQLite writer can outlive an otherwise fresh quote. Check
         # after obtaining the lock, before any debit or outbox insert.
-        if not _entry_guard_valid(pair, stage, valid_until_mono, live_evidence):
+        if (not _entry_guard_valid(pair, stage, valid_until_mono, live_evidence)
+                or (fee_context is not None and not fee_context.valid(
+                    poly_market_id=pair["poly"]["id"]))):
             conn.rollback()
             return None
         if valid_until_mono is not None:
@@ -773,8 +839,9 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
             poly_debit_cents, sx_debit_cents, poly_fee_cents,
             conditional_payout_cents, conditional_profit_cents, status, note,
             game_start_epoch, poly_token_id, sx_outcome_one, entry_evidence_json,
-            bankroll_evidence_json
-          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'OPEN_CONDITIONAL',?,?,?,?,?,?)
+            bankroll_evidence_json, fee_evidence_json, poly_net_payout_cents,
+            sx_net_payout_cents, sx_payout_fee_cents
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'OPEN_CONDITIONAL',?,?,?,?,?,?,?,?,?,?)
         """, (
             eid, now_epoch, pair["sx"]["sport"],
             " vs ".join(pair["sx"]["teams"]), str(pair["poly"]["id"]),
@@ -786,6 +853,8 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
             "Só simulação; fills presumidos. Lucro apenas se ambos os "
             "mercados resolverem normalmente; exceções exigem revisão.",
             game_start, poly_token_id, sx_outcome_one, evidence_json, bankroll_evidence,
+            fee_evidence_json, quote.poly_net_payout_cents, quote.sx_net_payout_cents,
+            quote.sx_payout_fee_cents if fee_context is not None else None,
         ))
         trade_id = result.lastrowid
         if opening_odds is not None:
@@ -803,7 +872,9 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
             )
         # Formatting/writing the operation can also cross the freshness or
         # pre-game boundary. Roll back both wallets, the trade and its notice.
-        if not _entry_guard_valid(pair, stage, valid_until_mono, live_evidence):
+        if (not _entry_guard_valid(pair, stage, valid_until_mono, live_evidence)
+                or (fee_context is not None and not fee_context.valid(
+                    poly_market_id=pair["poly"]["id"]))):
             conn.rollback()
             return None
         conn.commit()
@@ -893,6 +964,15 @@ def format_open_message(conn, trade_id, odds_poly=None, odds_sx=None,
             # A legacy/invalid audit field cannot invent a displayed policy.
             bankroll_lines = []
     phase = "EM DIRETO confirmado" if record["stage"] == "LIVE_CONFIRMADO" else record["stage"]
+    fee_lines = []
+    if record["fee_evidence_json"]:
+        fee_lines = [
+            f"🧮 Taxa Polymarket simulada, incluída no débito: {eur(record['poly_fee_cents'])}",
+            f"🧮 Comissão SX se vencer, descontada no crédito: {eur(record['sx_payout_fee_cents'])}",
+            f"💵 Crédito líquido se vencer Polymarket: {eur(record['poly_net_payout_cents'])}",
+            f"💵 Crédito líquido se vencer SX Bet: {eur(record['sx_net_payout_cents'])}",
+            "ℹ️ Margem calculada pelo menor dos dois retornos líquidos.",
+        ]
     live_lines = []
     if record["stage"] == "LIVE_CONFIRMADO":
         try:
@@ -934,6 +1014,7 @@ def format_open_message(conn, trade_id, odds_poly=None, odds_sx=None,
         "",
         "ℹ️ Odds indicadas: melhor nível de compra REST, NÃO execução confirmada.",
         f"💶 Total aplicado: {eur(record['poly_debit_cents'] + record['sx_debit_cents'])}",
+        *fee_lines,
         *bankroll_lines,
         "💰 SALDOS (antes → depois)",
         f"Carteira Polymarket: {eur(balances['poly'] + record['poly_debit_cents'])} → {eur(balances['poly'])}",
@@ -988,6 +1069,9 @@ def _settlement_message(record, balances_after, balances_before=None, demo=False
         f"{'✅' if net >= 0 else '🔴'} Resultado líquido: {'+' if net > 0 else ''}{eur(net)}",
         "",
     ])
+    if record["fee_evidence_json"]:
+        fee = int(record["sx_payout_fee_cents"]) if sx_won else 0
+        lines.append(f"🧮 Comissão SX simulada neste fecho: {eur(fee)} (já descontada).")
     if balances_before is not None:
         lines.extend([
             "💰 SALDOS (antes → depois)",
@@ -1221,6 +1305,40 @@ def _validate_resolution_evidence(record, poly_won, sx_won, evidence, allow_manu
         raise ValueError("Operação com margem histórica invulgar exige revisão manual")
 
 
+def _frozen_net_credits(record):
+    """Settlement uses the verified opening contract, never today's fee rates."""
+    fields = ("poly_net_payout_cents", "sx_net_payout_cents", "sx_payout_fee_cents")
+    values = tuple(record[name] for name in fields)
+    if not record["fee_evidence_json"]:
+        if any(value is not None for value in values):
+            raise ValueError("Custos parciais na operação; revisão necessária")
+        payout = int(record["conditional_payout_cents"])
+        return payout, payout
+    if any(type(value) is not int or value < 0 for value in values):
+        raise ValueError("Créditos líquidos inválidos; revisão necessária")
+    saved = json.loads(record["fee_evidence_json"])
+    if not isinstance(saved, dict) or saved.get("method") != "official_fees_v15":
+        raise ValueError("Snapshot de custos inválido")
+    context = FeeContext(**{name: saved[name] for name in (
+        "poly_market_id", "poly_rate", "poly_exponent", "sx_taker_payout_rate",
+        "observed_epoch", "expires_epoch")})
+    if not context.valid(context.observed_epoch, record["poly_market"]):
+        raise ValueError("Taxas históricas inválidas")
+    sx_stake = saved.get("sx_stake_usdc")
+    if (type(sx_stake) not in (int, float) or not math.isfinite(sx_stake)
+            or not 0 < sx_stake < float(record["payout_usdc"])):
+        raise ValueError("Base de comissão SX inválida")
+    gross = cents_down(float(record["payout_usdc"]) * float(record["fx_eur_per_usd"]))
+    expected_fee = cents_up((float(record["payout_usdc"]) - sx_stake)
+                           * context.sx_taker_payout_rate * float(record["fx_eur_per_usd"]))
+    poly_net, sx_net, sx_fee = values
+    if (poly_net != gross or sx_fee != expected_fee
+            or sx_net != max(0, gross - expected_fee)
+            or int(record["conditional_payout_cents"]) != min(poly_net, sx_net)):
+        raise ValueError("Créditos não correspondem às taxas históricas")
+    return poly_net, sx_net
+
+
 def _settle_outcomes(conn, trade_id, poly_won, sx_won, evidence, now_epoch=None, allow_manual=False):
     """Só movimenta cêntimos virtuais, na mesma transação que a prova e outbox."""
     now_epoch = int(time.time() if now_epoch is None else now_epoch)
@@ -1245,7 +1363,8 @@ def _settle_outcomes(conn, trade_id, poly_won, sx_won, evidence, now_epoch=None,
         ))
         if min(payout, poly_debit, sx_debit) < 0:
             raise ValueError("Montantes virtuais inválidos; revisão necessária")
-        poly_credit, sx_credit = (payout if won else 0 for won in (poly_won, sx_won))
+        net_poly, net_sx = _frozen_net_credits(row)
+        poly_credit, sx_credit = (net_poly if poly_won else 0), (net_sx if sx_won else 0)
         net = poly_credit + sx_credit - poly_debit - sx_debit
         before = free_balances(conn)
         for platform, credit in (("poly", poly_credit), ("sx", sx_credit)):
@@ -1314,9 +1433,13 @@ def flag_exception(conn, trade_id, reason):
 
 
 def try_paper_entry(conn, pair, poly_levels, sx_levels, fx, stage, skew,
-                    *, valid_until_mono=None, live_evidence=None):
+                    *, valid_until_mono=None, live_evidence=None, fee_context=None):
     """Um candidato de paper: NÃO chama nenhuma API de escrita."""
     if not _entry_guard_valid(pair, stage, valid_until_mono, live_evidence):
+        return None
+    if fee_context is not None and (
+            not isinstance(fee_context, FeeContext)
+            or not fee_context.valid(poly_market_id=pair["poly"]["id"])):
         return None
     if skew > MAX_SNAPSHOT_GAP_SECONDS:
         return None
@@ -1330,7 +1453,7 @@ def try_paper_entry(conn, pair, poly_levels, sx_levels, fx, stage, skew,
     free = free_balances(conn)
     quote = select_shadow_quote(
         poly_levels, sx_levels, fx, free["poly"], free["sx"],
-        allocation=allocation_budget(conn),
+        allocation=allocation_budget(conn), fee_context=fee_context,
     )
     if not quote:
         return None
@@ -1342,7 +1465,7 @@ def try_paper_entry(conn, pair, poly_levels, sx_levels, fx, stage, skew,
         conn, pair, quote, stage,
         opening_odds=(1.0 / best_poly, 1.0 / best_sx),
         valid_until_mono=valid_until_mono,
-        live_evidence=live_evidence,
+        live_evidence=live_evidence, fee_context=fee_context,
     )
     return (trade_id, quote) if trade_id is not None else None
 
