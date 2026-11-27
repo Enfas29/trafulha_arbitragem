@@ -1,4 +1,4 @@
-"""Trafulha V13.3 — pré-jogo/direto confirmado e contabilidade virtual.
+"""Trafulha V14 — banca proporcional, direto confirmado e contas virtuais.
 
 Nunca executa apostas reais. As operações Paper são hipóteses contabilísticas;
 os resultados dependem de confirmação oficial em ambas as plataformas.
@@ -36,9 +36,10 @@ from latency_metrics_v13 import LatencyMetrics
 from monitor_workers_v13 import SnapshotRefresher, AsyncNoticeSender
 from live_candidates_v13 import LiveCandidates
 from live_market_v13 import fetch_live_snapshot, LiveCheckError
+from paper_reset_v14 import apply_requested_reset
 
 LOG = logging.getLogger("monitor_v11")
-APP_VERSION = "13.3.0"
+APP_VERSION = "14.0.0"
 CATALOG_GAMES = None
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -183,9 +184,10 @@ def normalize_quote(poly_levels, sx_levels):
 
 
 def hypothetical_100_eur(poly_levels, sx_levels, fx: float):
-    """Tamanho máximo de 100 € total usando o modelo prudente existente.
+    """Nome legado: tamanho indicativo da banca inicial pela política atual.
 
     Uma cotação positiva NÃO constitui autorização para abrir posições.
+    O Paper usa os saldos e a exposição atuais, não esta hipótese do relatório.
     """
     if fx <= 0:
         return None
@@ -450,9 +452,11 @@ def confirm_paper_snapshot(pair, first_poly, first_sx, t_poly, t_sx, fx,
     snapshot fresco e independente; rejeitar ROI >= 10% ou variações
     fortes. Não tocar nas carteiras nem aceitar preços do WebSocket.
     """
+    allocation = paper.allocation_budget(paper_conn)
     first_q = paper.select_shadow_quote(
         first_poly, first_sx, fx,
-        *[paper.free_balances(paper_conn)[k] for k in ("poly", "sx")]
+        allocation.poly_available_cents, allocation.sx_available_cents,
+        allocation=allocation,
     )
     if first_q is None:
         return None
@@ -487,9 +491,11 @@ def confirm_paper_snapshot(pair, first_poly, first_sx, t_poly, t_sx, fx,
         LOG.info("PAPER_RECHECK | rejeitado=%s | mudança de preço >1 cêntimo",
                  pair["key"][:36])
         return None
-    balances = paper.free_balances(paper_conn)
+    allocation = paper.allocation_budget(paper_conn)
     second_q = paper.select_shadow_quote(
-        second_poly, second_sx, fx, balances["poly"], balances["sx"]
+        second_poly, second_sx, fx,
+        allocation.poly_available_cents, allocation.sx_available_cents,
+        allocation=allocation,
     )
     if (second_q is None or abs(first_q.roi-second_q.roi) > 0.01
             or second_q.roi >= paper.MAX_AUTO_PAPER_ROI):
@@ -534,9 +540,11 @@ def attempt_paper_entry(pair, poly_levels, sx_levels, t_poly, t_sx, fx,
         if not paper.PAPER_LIVE_ENABLED or live_candidates is None:
             discard()
             return None, "live_desativado_ou_sem_coordenador"
-        balances = paper.free_balances(paper_conn)
+        allocation = paper.allocation_budget(paper_conn)
         first_quote = paper.select_shadow_quote(
-            poly_levels, sx_levels, fx, balances["poly"], balances["sx"]
+            poly_levels, sx_levels, fx,
+            allocation.poly_available_cents, allocation.sx_available_cents,
+            allocation=allocation,
         )
         now_mono = time.monotonic()
         if (first_quote is None
@@ -1156,7 +1164,7 @@ def main(once=False):
 
     if fx == 0:
         LOG.warning(
-            "EUR_PER_USD ausente: cálculo de stake de 100 EUR e alertas "
+            "EUR_PER_USD ausente: dimensionamento virtual e alertas "
             "de oportunidades desativados; só se guarda o histórico."
         )
 
@@ -1184,16 +1192,33 @@ def main(once=False):
     if poly_feed is not None:
         poly_feed.start()
     paper_conn = paper.open_database() if PAPER_V12_ENABLED and fx > 0 else None
+    # Explicit one-shot request. Run before any live/result/notification worker.
+    if os.getenv("PAPER_RESET_REQUEST_ID", "").strip() and paper_conn is None:
+        conn.close()
+        raise SystemExit("PAPER_RESET exige Paper ativo e câmbio válido; reset não aplicado")
+    if paper_conn is not None and not once:
+        apply_requested_reset(paper_conn)
     live_candidates = (LiveCandidates(max_workers=1) if paper_conn is not None
                        and paper.PAPER_LIVE_ENABLED and not once else None)
     result_worker = None
     if PAPER_V12_ENABLED and paper_conn is None:
         LOG.warning("PAPER V12 pediu ativação, mas EUR_PER_USD inválido/ausente: desativado.")
     if paper_conn is not None:
-        LOG.info("PAPER V12 ATIVO: ROI mínimo %.2f%% após custos simulados; "
-                 "1000 EUR virtuais por plataforma, "
-                 "máximo 100 EUR total por operação, sem apostas reais.",
-                 100 * paper.MIN_NET_ROI)
+        allocation = paper.allocation_budget(paper_conn)
+        LOG.info("PAPER ATIVO: ROI mínimo %.2f%% após custos simulados; "
+                 "banca proporcional, sem apostas reais.", 100 * paper.MIN_NET_ROI)
+        LOG.info(
+            "PAPER_BANCA | reserva_por_carteira_pct=%.2f | operação_pct=%.2f | "
+            "exposição_pct=%.2f | capital_contabilistico=%.2f | "
+            "maximo_operacao_atual=%.2f | reserva_poly=%.2f | reserva_sx=%.2f | virtual",
+            allocation.policy.reserve_bps / 100,
+            allocation.policy.max_operation_bps / 100,
+            allocation.policy.max_exposure_bps / 100,
+            allocation.total_equity_cents / 100,
+            allocation.total_cap_cents / 100,
+            allocation.poly_reserve_cents / 100,
+            allocation.sx_reserve_cents / 100,
+        )
         balances = paper.paper_summary(paper_conn)
         LOG.info(
             "PAPER_ESTADO | abertas=%d | liquidadas=%d | revisao=%d | "
@@ -1210,7 +1235,7 @@ def main(once=False):
             )
             result_worker.start()
     LOG.info(
-        "REACTIVE V13.3 | uma direção por despacho; pré-análise integrada; "
+        "REACTIVE V14 | uma direção por despacho; pré-análise integrada; "
         "REST fresco nas duas fontes e recheck de 250ms preservados"
     )
     LOG.info(

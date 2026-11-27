@@ -1,8 +1,9 @@
-> **Versão atual:** [Trafulha Paper V13.3](README_V13.md).
+> **Versão atual:** [Trafulha Paper V14](README_V13.md).
 > O texto abaixo é o registo histórico V12; os estados de disco e os
 > procedimentos de liquidação descritos referem-se às datas indicadas.
 > Novas operações em direto exigem `LIVE_CONFIRMADO`; a antiga variável
 > `PAPER_V12_LIVE_UNVERIFIED` já não autoriza entradas.
+> Os limites monetários antigos foram substituídos pela política proporcional V14.
 
 ## Recuperação de armazenamento Railway — 24 nov 2026
 
