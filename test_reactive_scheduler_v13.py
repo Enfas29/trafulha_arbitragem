@@ -184,6 +184,58 @@ class SchedulerTests(unittest.TestCase):
             "max_dispatch_age_s": 1.0,
         })
 
+    def test_live_delay_longer_than_ws_ttl_keeps_original_time_and_short_deadline(self):
+        scheduler = ReactiveScheduler(pairs(2), ttl_seconds=5)
+        scheduler.ingest_ready({"1": 10.0}, {"1": 32.5}, now=30.0)
+        item = scheduler.choose(now=30.1)
+        self.assertEqual(item[0]["key"], "1")
+        self.assertEqual(item[1], (10.0, {"LIVE"}))
+        self.assertFalse(scheduler._ready_expiries)
+        scheduler.completed("1", now=30.2)
+        scheduler.ingest_ready({"1": 10.0}, {"1": 32.5}, now=30.3)
+        scheduler.ingest_ready({"1": 10.0}, {"1": 33.0}, now=31.0)  # Cannot extend.
+        scheduler.ingest(now=32.6)
+        self.assertNotIn("1", scheduler.pending)
+        self.assertEqual(scheduler.metrics["ttl"], 1)
+
+    def test_live_and_ws_events_coalesce_without_replacing_the_oldest_time(self):
+        scheduler = ReactiveScheduler(pairs(2))
+        scheduler.ingest({"p1": 19.0}, now=20.0)
+        scheduler.ingest_ready({"1": 12.0}, {"1": 22.5}, now=20.0)
+        scheduler.ingest(sx_events={"s1": 20.1}, now=20.2)
+        self.assertEqual(scheduler.pending["1"], (12.0, {"LIVE", "POLY", "SX"}))
+        scheduler.rebuild(pairs(1), now=20.3)
+        self.assertFalse(scheduler.pending)
+        self.assertFalse(scheduler._ready_expiries)
+
+    def test_live_ready_hints_obey_cap_and_validate_timestamps(self):
+        scheduler = ReactiveScheduler(pairs(4), max_pending=2)
+        scheduler.ingest_ready({"0": 10.0, "1": 10.1, "2": 10.2},
+                               {"0": 22.0, "1": 22.1, "2": 22.2}, now=20.0)
+        self.assertEqual(set(scheduler.pending), {"1", "2"})
+        self.assertEqual(set(scheduler._ready_expiries), {"1", "2"})
+        scheduler.ingest_ready({"3": float("nan"), "missing": 10.0},
+                               {"3": 22.0, "missing": 22.0}, now=20.0)
+        scheduler.ingest_ready({"3": True}, {"3": 22.0}, now=20.0)
+        scheduler.ingest_ready({"3": 21.0}, {"3": 22.0}, now=20.0)
+        scheduler.ingest_ready({"3": 1.0}, {"3": 72.0}, now=70.0)
+        self.assertEqual(scheduler.metrics["invalid"], 4)
+        self.assertEqual(scheduler.metrics["unknown"], 1)
+        self.assertFalse(scheduler.pending)
+
+    def test_short_live_proof_precedes_old_ws_hints_without_renewing_its_lifetime(self):
+        scheduler = ReactiveScheduler(pairs(6), min_key_interval=0)
+        scheduler.ingest({"p0": 90, "p1": 90, "p2": 90, "p3": 90}, now=100)
+        scheduler.ingest_ready({"4": 92}, {"4": 101.0}, now=100)
+        item = scheduler.choose(now=100)
+        self.assertEqual((item[0]["key"], item[1], item[2]),
+                         ("4", (92.0, {"LIVE"}), "live"))
+        scheduler.completed("4", now=100.2)
+        scheduler.ingest_ready({"4": 92}, {"4": 100.1}, now=100.2)
+        self.assertNotIn("4", scheduler.pending)
+        self.assertEqual(scheduler.metrics["ttl"], 1)
+        self.assertEqual(scheduler.choose(now=100.2)[0]["key"], "0")
+
 
 if __name__ == "__main__":
     unittest.main()
