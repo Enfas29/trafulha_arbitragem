@@ -1,4 +1,4 @@
-"""Trafulha V13.1 — monitorização e contabilidade exclusivamente virtual.
+"""Trafulha V13.2 — análise reativa e contabilidade exclusivamente virtual.
 
 Nunca executa apostas reais. As operações Paper são hipóteses contabilísticas;
 os resultados dependem de confirmação oficial em ambas as plataformas.
@@ -9,16 +9,20 @@ Teste das APIs (uma passagem): python monitor_v11.py --once
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import math
 import os
 import signal
 import shutil
 import sqlite3
 import sys
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import trafulha_arbitragem as bot
@@ -27,9 +31,12 @@ import sx_ws_v12 as sx_hints
 import poly_ws_v12 as poly_hints
 import ws_priority_v12 as ws_priority
 from paper_service_v13 import PaperLifecycleWorker
+from reactive_scheduler_v13 import ReactiveScheduler
+from latency_metrics_v13 import LatencyMetrics
+from monitor_workers_v13 import SnapshotRefresher, AsyncNoticeSender
 
 LOG = logging.getLogger("monitor_v11")
-APP_VERSION = "13.1.0"
+APP_VERSION = "13.2.0"
 CATALOG_GAMES = None
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -59,6 +66,15 @@ WS_PRIORITY_MAX = min(6, max(1, int(os.getenv("MONITOR_WS_PRIORITY_MAX", "4"))))
 WS_EVENT_TTL = min(60.0, max(5.0,
     float(os.getenv("MONITOR_WS_EVENT_TTL_SECONDS", "20"))
 ))
+WS_KEY_INTERVAL = max(0.25, min(5.0, float(
+    os.getenv("MONITOR_WS_KEY_INTERVAL_SECONDS", "0.25")
+)))
+# Limite global de arranques de pares; cada par lê uma vez cada plataforma.
+PAIR_START_GAP = 1.0 / min(12.0, max(1.0, float(
+    os.getenv("MONITOR_MAX_PAIRS_PER_SECOND", "10")
+)))
+METRICS_INTERVAL = 30.0
+MAX_QUOTE_AGE_SECONDS = 2.0
 # Pré-análise rápida (REST de ambos os lados), apenas diagnóstico.
 # Não abre operações nem lança alertas de lucro.
 FAST_PREVIEW_ENABLED = os.getenv("MONITOR_FAST_PREVIEW_ENABLED", "1").lower() in {"1", "true", "yes"}
@@ -259,7 +275,7 @@ def telegram(text: str):
     bot.telegram(text)
 
 
-def maybe_alert(conn, pair, quote, hypothetical, now):
+def maybe_alert(conn, pair, quote, hypothetical, now, sender=None):
     if (not hypothetical or not quote
             or quote[2] < MIN_ROI * 100
             or quote[2] >= 100 * paper.MAX_AUTO_PAPER_ROI):
@@ -279,7 +295,7 @@ def maybe_alert(conn, pair, quote, hypothetical, now):
         """, (pair["key"], now, 100 * hypothetical.roi))
     s = pair["sx"]
     total = hypothetical.total_eur
-    telegram(
+    (sender or telegram)(
         "🔎 SINAL V11 · NÃO EXECUTADO\n"
         f"{s['sport']} | {s['teams'][0]} vs {s['teams'][1]}\n"
         f"Poly: {pair['poly_label']} · SX: {pair['sx_label']}\n"
@@ -304,12 +320,62 @@ def select_pairs(pairs):
 
 
 _BOOK_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="books-v13")
+LATENCIES = LatencyMetrics()
+_BOOK_BACKOFF_LOCK = threading.Lock()
+_BOOK_BACKOFF_UNTIL = 0.0
+
+
+def book_backoff_until():
+    with _BOOK_BACKOFF_LOCK:
+        return _BOOK_BACKOFF_UNTIL
+
+
+def retry_after_seconds(value, now_epoch=None):
+    """Respeitar Retry-After em segundos ou data HTTP; nunca acelerar um 429."""
+    now_epoch = time.time() if now_epoch is None else float(now_epoch)
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        try:
+            date = parsedate_to_datetime(str(value))
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            seconds = date.timestamp() - now_epoch
+        except (TypeError, ValueError, OverflowError):
+            seconds = 2.0
+    return max(2.0, seconds) if math.isfinite(seconds) else 2.0
+
+
+def _timed_book(source, function, *args):
+    """Medir cada fonte, sem guardar preços nem dados de autenticação."""
+    global _BOOK_BACKOFF_UNTIL
+    started = time.monotonic()
+    status_code, ok = None, False
+    try:
+        result = function(*args)
+        ok = True
+        return result
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code == 429:
+            delay = retry_after_seconds(getattr(response, "headers", {}).get("Retry-After", "2"))
+            with _BOOK_BACKOFF_LOCK:
+                _BOOK_BACKOFF_UNTIL = max(
+                    _BOOK_BACKOFF_UNTIL, time.monotonic() + delay
+                )
+        raise
+    finally:
+        LATENCIES.record_source(
+            source, 1000 * (time.monotonic() - started), ok=ok,
+            status_code=status_code,
+        )
 
 
 def fetch_books(pair):
     """Duas leituras independentes, simultâneas; nunca reutilizar preços."""
-    poly = _BOOK_POOL.submit(bot.poly_book, pair["poly_asset"])
-    sx = _BOOK_POOL.submit(bot.sx_book, pair["sx"]["hash"], pair["sx_target"])
+    poly = _BOOK_POOL.submit(_timed_book, "poly", bot.poly_book, pair["poly_asset"])
+    sx = _BOOK_POOL.submit(_timed_book, "sx", bot.sx_book, pair["sx"]["hash"], pair["sx_target"])
     wait((poly, sx))  # terminar ambas mesmo quando uma falha
     return poly.result(), sx.result()
 
@@ -388,7 +454,10 @@ def confirm_paper_snapshot(pair, first_poly, first_sx, t_poly, t_sx, fx,
     )
     if first_q is None:
         return None
-    if abs(t_poly - t_sx) > MAX_SKEW:
+    first_age = time.monotonic()
+    if (abs(t_poly - t_sx) > min(MAX_SKEW, paper.MAX_SNAPSHOT_GAP_SECONDS)
+            or not 0 <= first_age - t_poly <= MAX_QUOTE_AGE_SECONDS
+            or not 0 <= first_age - t_sx <= MAX_QUOTE_AGE_SECONDS):
         return None
     # Um pico de odds entre chamadas pode gerar um falso positivo.
     first_best = (min(price for price, _ in first_poly),
@@ -403,7 +472,8 @@ def confirm_paper_snapshot(pair, first_poly, first_sx, t_poly, t_sx, fx,
     age = time.monotonic()
     if (abs(p_time - s_time) > min(MAX_SKEW, paper.MAX_SNAPSHOT_GAP_SECONDS)
             or abs(t_poly - s_time) > 3.0
-            or age - p_time > 2.0 or age - s_time > 2.0):
+            or not 0 <= age - p_time <= MAX_QUOTE_AGE_SECONDS
+            or not 0 <= age - s_time <= MAX_QUOTE_AGE_SECONDS):
         LOG.info("PAPER_RECHECK | rejeitado=%s | snapshots desfasados",
                  pair["key"][:36])
         return None
@@ -430,16 +500,22 @@ def confirm_paper_snapshot(pair, first_poly, first_sx, t_poly, t_sx, fx,
         pair["key"][:36], 100 * first_q.roi, 100 * second_q.roi,
         round(1000 * (s_time - t_sx)),
     )
-    return second_poly, second_sx, abs(p_time-s_time)
+    return (second_poly, second_sx, abs(p_time-s_time),
+            min(p_time, s_time) + MAX_QUOTE_AGE_SECONDS)
 
 
 def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
-              priority_cache=None):
+              priority_cache=None, work_item=None, notify_open=None,
+              notice_sender=None, verbose=True):
     scan_started = time.monotonic()
     if not pairs:
         return {"checked": 0, "priced": 0, "positive": 0, "signals": 0,
                 "next_offset": 0, "best": None}
-    if priority_cache is not None:
+    if work_item is not None:
+        pair, event, _kind = work_item
+        window, new_offset = [pair], offset
+        ws_events = {pair["key"]: event} if event is not None else {}
+    elif priority_cache is not None:
         window, new_offset, ws_events = priority_cache.choose(
             pairs, offset, MAX_PAIRS, now=scan_started
         )
@@ -455,10 +531,10 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
     ws_latencies = []
     book_max_ms = 0.0
     best = None
-    now = time.time()
     paper_reasons = Counter()
 
     for pair in window:
+        now = time.time()
         sx = pair["sx"]
         start = sx["start"]
         event = ws_events.get(pair["key"])
@@ -481,7 +557,7 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
             (poly_levels, t_poly), (sx_levels, t_sx) = fetch_books(pair)
             book_completed = time.monotonic()
             book_max_ms = max(book_max_ms, 1000 * (book_completed - book_started))
-            stage = "APOS_INICIO_NAO_CONFIRMADO" if start <= now else "PRE_JOGO"
+            stage = "APOS_INICIO_NAO_CONFIRMADO" if start <= time.time() else "PRE_JOGO"
             quote, hypothetical = insert_observation(
                 conn, pair, stage, poly_levels, sx_levels,
                 abs(t_poly - t_sx), fx,
@@ -494,7 +570,8 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
                 # Evitar duas mensagens por uma oportunidade: quando PAPER V12
                 # está ativo, só a operação shadow emite alerta individual.
                 if paper_conn is None and maybe_alert(
-                    conn, pair, quote, hypothetical, int(time.time())
+                    conn, pair, quote, hypothetical, int(time.time()),
+                    sender=notice_sender,
                 ):
                     signals += 1
 
@@ -521,11 +598,19 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
                                 fx, paper_conn
                             )
                         if validated:
-                            final_poly, final_sx, final_skew = validated
-                            booked = paper.try_paper_entry(
-                                paper_conn, pair, final_poly, final_sx, fx,
-                                paper_stage, final_skew
-                            )
+                            final_poly, final_sx, final_skew, valid_until = validated
+                            # O pré-jogo não é uma autorização reutilizável
+                            # depois de atravessar o início durante o recheck.
+                            if paper_stage == "PRE_JOGO" and start <= time.time():
+                                paper_reasons["inicio_durante_validacao"] += 1
+                            elif start < time.time() - bot.MAX_LIVE_AGE_H * 3600:
+                                paper_reasons["fora_da_janela"] += 1
+                            else:
+                                booked = paper.try_paper_entry(
+                                    paper_conn, pair, final_poly, final_sx, fx,
+                                    paper_stage, final_skew,
+                                    valid_until_mono=valid_until,
+                                )
                         if not existing and not booked:
                             reason = (
                                 "abaixo_margem" if quote[2] < 100 * paper.MIN_NET_ROI
@@ -548,7 +633,10 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
                         # Mensagem completa guardada no SQLite na mesma
                         # transação da operação virtual. Nunca usar o envio
                         # genérico sem confirmação de entrega.
-                        if paper.send_open_once(paper_conn, shadow_id):
+                        if notify_open is not None:
+                            notify_open()
+                            LOG.info("PAPER_ALERT | guardado #%d | envio em segundo plano", shadow_id)
+                        elif paper.send_open_once(paper_conn, shadow_id):
                             LOG.info("PAPER_ALERT | enviado #%d | Telegram confirmado", shadow_id)
                         else:
                             LOG.warning("PAPER_ALERT | pendente #%d | Telegram não confirmou; retry automático", shadow_id)
@@ -575,6 +663,27 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
                     "decision": max(0, decided-received_mono)*1000,
                     "sources": sources,
                 })
+    for timing in ws_latencies:
+        LATENCIES.record_decision(
+            timing["queue"], timing["rest"], timing["decision"],
+            sources=timing["sources"],
+        )
+    result = {
+        "checked": checked, "priced": priced, "positive": positive,
+        "signals": signals, "next_offset": new_offset, "best": best,
+        "ws_latencies": ws_latencies, "ws_skipped": ws_skipped,
+        "book_max_ms": book_max_ms, "hot_checked": hot_checked,
+        "duration_ms": 1000 * (time.monotonic() - scan_started),
+        "paper_reasons": dict(paper_reasons),
+    }
+    if verbose:
+        log_scan_results([result])
+    return result
+
+
+def log_scan_results(results):
+    """Agrupar até MAX_PAIRS análises para comparar os máximos com V13.1."""
+    ws_latencies = [entry for result in results for entry in result.get("ws_latencies", [])]
     if ws_latencies:
         confirmed = [x["confirmed"] for x in ws_latencies if x["confirmed"] is not None]
         LOG.info(
@@ -588,21 +697,25 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
             round(max(x["rest"] for x in ws_latencies)),
             str(round(max(confirmed))) if confirmed else "N/D",
             round(max(x["decision"] for x in ws_latencies)),
-            ws_skipped,
+            sum(result.get("ws_skipped", 0) for result in results),
         )
     LOG.info(
         "SCAN | direções=%d | preços válidos=%d | margens positivas=%d "
         "| sinais=%d | melhor buffer=%s | duracao_ms=%d "
         "| maior_leitura_ms=%d | sinais_WS_verificados=%d",
-        checked, priced, positive, signals,
-        f"{best:+.2f}%" if best is not None else "N/D",
-        round(1000 * (time.monotonic() - scan_started)),
-        round(book_max_ms), hot_checked,
+        sum(r["checked"] for r in results), sum(r["priced"] for r in results),
+        sum(r["positive"] for r in results), sum(r["signals"] for r in results),
+        (f"{max(r['best'] for r in results if r['best'] is not None):+.2f}%"
+         if any(r["best"] is not None for r in results) else "N/D"),
+        round(sum(r.get("duration_ms", 0) for r in results)),
+        round(max((r.get("book_max_ms", 0) for r in results), default=0)),
+        sum(r.get("hot_checked", 0) for r in results),
     )
-    if paper_conn is not None:
+    paper_reasons = Counter()
+    for result in results:
+        paper_reasons.update(result.get("paper_reasons", {}))
+    if paper_reasons:
         LOG.info("PAPER_DIAGNOSTICO | %s", dict(paper_reasons))
-    return {"checked": checked, "priced": priced, "positive": positive,
-            "signals": signals, "next_offset": new_offset, "best": best}
 
 
 def summary(conn, since_hours=6, now_epoch=None):
@@ -672,7 +785,8 @@ def record_report_attempt(conn, now_epoch=None):
         """, (now_epoch,))
 
 
-def send_summary(conn, catalog_count, startup=False, now_epoch=None, paper_conn=None):
+def send_summary(conn, catalog_count, startup=False, now_epoch=None, paper_conn=None,
+                 sender=None):
     """Envia resumo de 6h; memoriza o envio para não repetir após reinício."""
     now_epoch = time.time() if now_epoch is None else now_epoch
     hours = SUMMARY_INTERVAL / 3600.0
@@ -703,7 +817,10 @@ def send_summary(conn, catalog_count, startup=False, now_epoch=None, paper_conn=
                 f"\n🚨 {suspect_trades} operação(ões) antigas com ROI >=10%"
                 " — REVISÃO MANUAL RECOMENDADA, sem liquidação automática"
             )
-    telegram(message)
+    if sender is None:
+        telegram(message)
+    elif sender(message) is False:
+        return False
     record_report_attempt(conn, now_epoch)
     LOG.info(
         "Relatório Telegram de %.0fh: confrontos=%d, odds=%d/%d, "
@@ -765,22 +882,33 @@ def update_health(conn, checked, priced, now_epoch=None):
     )
 
 
-def catalog():
-    global CATALOG_GAMES
+def catalog_snapshot():
+    """Construir metadados completos; não toca no catálogo em utilização."""
     poly = bot.discover_poly()
     sx = bot.discover_sx()
     pairs = select_pairs(bot.pair_markets(poly, sx))
     stats = dict(Counter(p["sx"]["sport"] for p in pairs))
-    CATALOG_GAMES = len({
+    games = len({
         (p["sx"]["sport"], p["sx"]["start"],
          tuple(sorted(bot.ascii_name(team) for team in p["sx"]["teams"])))
         for p in pairs
     })
+    return pairs, games, len(poly), len(sx), stats
+
+
+def accept_catalog(snapshot):
+    global CATALOG_GAMES
+    pairs, games, poly_count, sx_count, stats = snapshot
+    CATALOG_GAMES = games
     LOG.info(
         "CATALOGO | Poly=%d SX=%d jogos=%d direções=%d | desportos=%s",
-        len(poly), len(sx), CATALOG_GAMES, len(pairs), stats,
+        poly_count, sx_count, games, len(pairs), stats,
     )
     return pairs
+
+
+def catalog():
+    return accept_catalog(catalog_snapshot())
 
 
 def self_test():
@@ -964,8 +1092,9 @@ def main(once=False):
     if any(shutil.disk_usage(path if path.exists() else path.parent).free < STORAGE_FREE_FLOOR for path in storage_paths):
         raise SystemExit("STORAGE | menos de 32MiB livres; arranque bloqueado, bases preservadas")
     conn = open_database(DB)
-    priority_cache = ws_priority.PriorityCache(
-        max_priority=WS_PRIORITY_MAX, ttl_seconds=WS_EVENT_TTL
+    scheduler = ReactiveScheduler(
+        max_hot_burst=WS_PRIORITY_MAX, normal_interval=INTERVAL / MAX_PAIRS,
+        min_key_interval=WS_KEY_INTERVAL, ttl_seconds=WS_EVENT_TTL,
     )
     ws_feed = sx_hints.SXBookHints() if SX_WS_V12_ENABLED else None
     if ws_feed is not None and not ws_feed.start():
@@ -990,36 +1119,54 @@ def main(once=False):
             balances["open_trades"], balances["settled"],
             balances["requires_review"], balances["poly_free_eur"], balances["sx_free_eur"],
         )
-        if PAPER_RESULTS_ENABLED and not once:
+        if not once:
             result_worker = PaperLifecycleWorker(
                 paper.PAPER_DB,
                 interval_seconds=int(os.getenv("PAPER_RESULTS_INTERVAL_SECONDS", "60")),
                 batch_size=int(os.getenv("PAPER_RESULTS_BATCH_SIZE", "5")),
+                results_enabled=PAPER_RESULTS_ENABLED,
             )
             result_worker.start()
     LOG.info(
-        "FAST PREVIEW V12.1: %s; objetivo de calculo <1s; "
-        "REST obrigatorio nas duas fontes, SEM operacoes/alertas.",
-        "ATIVO" if FAST_PREVIEW_ENABLED else "DESATIVADO"
+        "REACTIVE V13.2 | uma direção por despacho; pré-análise integrada; "
+        "REST fresco nas duas fontes e recheck de 250ms preservados"
     )
     LOG.info(
-        "WS PRIORITY: janela %.1fs; direções/passo=%d; "
-        "prioridade máx=%d; cache eventos=%.0fs (SEM cache de odds); "
-        "REST valida ambos os livros. Sem apostas reais.",
-        WS_REACT_GAP_SECONDS, MAX_PAIRS,
-        WS_PRIORITY_MAX, WS_EVENT_TTL,
+        "WS PRIORITY | quota=%d | rotação=%.2fs | mínimo/chave=%.2fs | "
+        "máximo_pares/s=%.1f | timeout_livros=%.1fs | TTL=%.0fs | sem cache de odds",
+        WS_PRIORITY_MAX, INTERVAL / MAX_PAIRS, WS_KEY_INTERVAL,
+        1.0 / PAIR_START_GAP, bot.BOOK_TIMEOUT_SECONDS, WS_EVENT_TTL,
     )
-    pairs, cursor = [], 0
-    last_catalog = 0.0
+    pairs = []
+    catalog_ready = False
+    catalog_worker = SnapshotRefresher(catalog_snapshot) if not once else None
+    notice_worker = AsyncNoticeSender(telegram) if not once else None
+    if catalog_worker is not None:
+        catalog_worker.start()
+    if notice_worker is not None:
+        notice_worker.start()
+    next_catalog = 0.0
     iteration = 0
     last_prune = 0.0
+    last_health_check = 0.0
+    last_summary_check = 0.0
+    last_metrics = time.monotonic()
+    last_batch_log = last_metrics
+    last_pair_start = 0.0
+    batch = []
     try:
         while True:
             started = time.monotonic()
-            if any(shutil.disk_usage(path).free < STORAGE_FREE_FLOOR for path in storage_paths):
-                raise SystemExit("STORAGE | reserva de 32MiB atingida; parar com erro explícito e preservar bases")
-            if result_worker is not None and not result_worker.thread.is_alive():
-                raise RuntimeError("Worker de resultados parou; reiniciar serviço para recuperar")
+            if started - last_health_check >= 1 or last_health_check == 0:
+                if any(shutil.disk_usage(path).free < STORAGE_FREE_FLOOR for path in storage_paths):
+                    raise SystemExit("STORAGE | reserva de 32MiB atingida; parar com erro explícito e preservar bases")
+                if result_worker is not None and not result_worker.is_alive():
+                    raise RuntimeError("Worker Paper parou; reiniciar serviço para recuperar")
+                if catalog_worker is not None and not catalog_worker.thread.is_alive():
+                    raise RuntimeError("Worker do catálogo parou")
+                if notice_worker is not None and not notice_worker.thread.is_alive():
+                    raise RuntimeError("Worker dos resumos parou")
+                last_health_check = started
             if started - last_prune >= 60 or last_prune == 0:
                 try:
                     removed = prune_observations(conn)
@@ -1028,80 +1175,101 @@ def main(once=False):
                 except sqlite3.Error as exc:
                     LOG.warning("STORAGE | falha na limpeza: %s", type(exc).__name__)
                 last_prune = started
-            if last_catalog == 0.0 or started - last_catalog >= CATALOG_INTERVAL:
-                try:
-                    pairs = catalog()
-                    cursor = cursor % len(pairs) if pairs else 0
-                    priority_cache.rebuild(pairs)
+            if once:
+                pairs = catalog()
+                catalog_ready = True
+            else:
+                refreshed = catalog_worker.poll()
+                if refreshed is not None:
+                    ok, snapshot = refreshed
+                    if ok:
+                        pairs = accept_catalog(snapshot)
+                        scheduler.rebuild(pairs)
+                        catalog_ready = True
+                    else:
+                        LOG.warning("CATALOGO | atualização adiada (%s); manter snapshot completo", snapshot)
+                        next_catalog = started + 30.0
+                if refreshed is not None and refreshed[0]:
                     if ws_feed is not None:
                         ws_feed.update(p["sx"]["hash"] for p in pairs[:24])
                     if poly_feed is not None:
                         poly_feed.update(p["poly_asset"] for p in pairs[:24])
-                    last_catalog = time.monotonic()
-                except Exception as exc:
-                    LOG.error("Erro a atualizar catálogo: %s", type(exc).__name__)
-                    last_catalog = time.monotonic()
-                    if once:
-                        raise
+                if started >= next_catalog and catalog_worker.request():
+                    next_catalog = started + CATALOG_INTERVAL
 
-            sx_events = ws_feed.take_events() if ws_feed is not None else {}
-            poly_events = poly_feed.take_events() if poly_feed is not None else {}
-            priority_cache.ingest(poly_events, sx_events)
-            # Pré-análise com prioridade, antes das restantes 15 direções.
-            # Nunca altera a base de dados nem executa paper trading.
-            if FAST_PREVIEW_ENABLED:
-                fast_preview(pairs, priority_cache, fx)
-            result = scan_pass(
-                conn, pairs, cursor, fx, paper_conn=paper_conn,
-                priority_cache=priority_cache
-            )
-            cursor = result["next_offset"]
-            if paper_conn is not None and result_worker is None and iteration % 12 == 0:
+            if batch and (len(batch) >= MAX_PAIRS or started - last_batch_log >= 5):
+                log_scan_results(batch)
+                batch.clear()
+                last_batch_log = started
+            if started - last_metrics >= METRICS_INTERVAL:
+                metrics = LATENCIES.snapshot()
+                metrics["pending_events"] = len(scheduler.pending)
+                metrics["queue_drops"] = dict(scheduler.metrics)
+                metrics["coverage"] = scheduler.coverage()
+                LOG.info("LATENCY_V13 | %s", json.dumps(metrics, separators=(",", ":")))
+                last_metrics = started
+
+            # Também emitir resumos se um catálogo completo tiver zero pares,
+            # ou se a leitura estiver em recuo por limite da API.
+            if not once and catalog_ready and started - last_summary_check >= 1:
+                if report_due(conn):
+                    send_summary(
+                        conn, len(pairs), startup=(iteration == 0),
+                        paper_conn=paper_conn, sender=notice_worker.submit,
+                    )
+                last_summary_check = started
+
+            if once:
+                result = scan_pass(conn, pairs, 0, fx, paper_conn=paper_conn)
+            else:
+                # Drenar a cada direção, incluindo sinais recebidos durante REST.
+                sx_events = ws_feed.take_events() if ws_feed is not None else {}
+                poly_events = poly_feed.take_events() if poly_feed is not None else {}
+                scheduler.ingest(poly_events, sx_events)
+                now_mono = time.monotonic()
+                wait_until = max(last_pair_start + PAIR_START_GAP, book_backoff_until())
+                if now_mono < wait_until:
+                    time.sleep(min(0.05, wait_until - now_mono))
+                    continue
+                item = scheduler.choose(now=now_mono)
+                if item is None:
+                    time.sleep(max(0.001, scheduler.idle_seconds(max_wait=0.05)))
+                    continue
+                last_pair_start = time.monotonic()
                 try:
-                    retried = paper.retry_pending_open_notices(paper_conn)
-                    if retried:
-                        LOG.info("PAPER_ALERT | %d aviso(s) pendente(s) confirmado(s)", retried)
-                except Exception as exc:
-                    LOG.warning("PAPER_ALERT | erro a retentar: %s", type(exc).__name__)
+                    result = scan_pass(
+                        conn, [item[0]], 0, fx, paper_conn=paper_conn,
+                        work_item=item, verbose=False,
+                        notify_open=result_worker.notify if result_worker else None,
+                        notice_sender=notice_worker.submit,
+                    )
+                finally:
+                    scheduler.completed(item[0]["key"])
+                batch.append(result)
             outage_notice = update_health(conn, result["checked"], result["priced"])
             if outage_notice:
                 LOG.warning("Sem odds válidas durante o período de alerta.")
-                telegram(outage_notice)
+                if notice_worker is None:
+                    telegram(outage_notice)
+                else:
+                    notice_worker.submit(outage_notice)
             iteration += 1
 
-            if once or report_due(conn):
-                send_summary(conn, len(pairs), startup=(iteration == 1),
-                             paper_conn=paper_conn)
+            if once:
+                send_summary(conn, len(pairs), startup=True, paper_conn=paper_conn)
 
             if once:
                 print("✅ Passagem única concluída; só leitura, sem apostas.")
                 break
-            wait_seconds = max(1.0, INTERVAL - (time.monotonic() - started))
-            if ws_feed is None and poly_feed is None:
-                time.sleep(wait_seconds)
-            else:
-                # Polling de eventos de ambas as fontes; REST continua obrigatório.
-                deadline = time.monotonic() + wait_seconds
-                wake_received = False
-                while time.monotonic() < deadline:
-                    if ((ws_feed is not None and ws_feed.wake.is_set())
-                            or (poly_feed is not None and poly_feed.wake.is_set())):
-                        wake_received = True
-                        break
-                    remaining = max(0.0, deadline - time.monotonic())
-                    if remaining <= 0:
-                        break
-                    # Antes dormia 1s e forçava 8s mínimos mesmo após WS.
-                    # Poll a cada 50ms quando o scanner está ocioso; não é SLA.
-                    # Intervalo mínimo configurável entre ciclos WS.
-                    time.sleep(min(0.05, remaining))
-                elapsed = time.monotonic() - started
-                pause = websocket_reaction_pause(elapsed, wake_received)
-                if pause > 0:
-                    time.sleep(pause)
     except KeyboardInterrupt:
         LOG.info("Monitor interrompido.")
     finally:
+        if batch:
+            log_scan_results(batch)
+        if catalog_worker is not None:
+            catalog_worker.stop()
+        if notice_worker is not None:
+            notice_worker.stop()
         if result_worker is not None:
             result_worker.stop()
         if ws_feed is not None:

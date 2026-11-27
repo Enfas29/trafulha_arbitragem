@@ -25,18 +25,52 @@ class PolyBookHints:
         self.socket = None
         self.valid_updates = 0
         self.last_update_epoch = None
+        self._close_thread = None
+        self._closing_socket = None
+        self._close_pending = None
+
+    def _request_close_locked(self, ws):
+        """Coalesce reconnect requests; caller holds ``self.lock``.
+
+        Keep at most one close in progress and one pending socket. A newer
+        current socket supersedes an obsolete pending one; ``opened`` reads
+        the final asset selection under the same lock when reconnecting.
+        """
+        if ws is None or ws is self._closing_socket or ws is self._close_pending:
+            return
+        self._close_pending = ws
+        if self._close_thread is None:
+            self._close_thread = threading.Thread(
+                target=self._close_sockets, name="PolyBookHintsClose", daemon=True,
+            )
+            self._close_thread.start()
+
+    def _close_sockets(self):
+        while True:
+            with self.lock:
+                ws = self._close_pending
+                self._close_pending = None
+                if ws is None:
+                    self._close_thread = None
+                    return
+                self._closing_socket = ws
+            try:
+                # websocket-client may wait for its close handshake. Never
+                # hold the state lock or block the scanner on this call.
+                ws.close()
+            except Exception:
+                pass
+            finally:
+                with self.lock:
+                    self._closing_socket = None
 
     def update(self, assets):
         selection = tuple(dict.fromkeys(str(a) for a in assets if a))[:MAX_ASSETS]
         with self.lock:
             changed = selection != self.assets
             self.assets = selection
-            ws = self.socket
-        if changed and ws is not None:
-            try:
-                ws.close()  # reconectar com um conjunto de ativos coerente
-            except Exception:
-                pass
+            if changed:
+                self._request_close_locked(self.socket)
 
     def mark(self, asset):
         asset = str(asset)
@@ -154,12 +188,7 @@ class PolyBookHints:
     def stop(self):
         self.running = False
         with self.lock:
-            ws = self.socket
-        if ws is not None:
-            try:
-                ws.close()
-            except Exception:
-                pass
+            self._request_close_locked(self.socket)
         self.wake.set()
 
 
