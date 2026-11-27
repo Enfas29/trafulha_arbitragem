@@ -370,10 +370,14 @@ def discover_poly():
                     continue
                 result.append({
                     "id": str(m.get("id")), "sport": family, "teams": teams,
+                    "event_id": str(event["id"]) if event.get("id") is not None else None,
+                    "event_live": event.get("live") is True,
+                    "event_ended": event.get("ended") is True,
                     "title": event.get("title", ""), "start": start,
                     "outcomes": outs, "assets": [str(x) for x in ids],
                     "slug": event.get("slug", ""),
                     "type": m.get("sportsMarketType"),
+                    "version": m.get("version"),
                 })
     LOG.info("Polymarket: %d mercados binários desportivos elegíveis", len(result))
     return result
@@ -402,7 +406,9 @@ def discover_sx():
                 "outcomes": (m.get("outcomeOneName", ""), m.get("outcomeTwoName", "")),
                 "start": game, "sport": sx_sport_family(m),
                 "type": m["type"], "league": m.get("leagueLabel", ""),
-                "live_enabled": bool(m.get("liveEnabled")),
+                "event_id": m.get("sportXeventId"),
+                "sport_id": m.get("sportId"), "league_id": m.get("leagueId"),
+                "live_enabled": m.get("liveEnabled") is True,
             })
         page_key = data.get("nextKey")
         if not page_key:

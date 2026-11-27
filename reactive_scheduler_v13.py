@@ -21,6 +21,9 @@ class ReactiveScheduler:
         self.ttl_seconds = self._nonnegative(ttl_seconds)
         self.max_pending = max(1, int(max_pending))
         self.pending = {}  # key -> (first local receipt, set of sources)
+        # A finished live check is actionable for its own short proof lifetime.
+        # Its original timestamp still includes the official betting delay.
+        self._ready_expiries = {}
         self.metrics = Counter(dict(ttl=0, overflow=0, unknown=0,
                                     invalid=0, rebuild=0))
         self.pairs = []
@@ -79,6 +82,8 @@ class ReactiveScheduler:
         self.metrics["rebuild"] += len(removed)
         self.pending = {key: event for key, event in self.pending.items()
                         if key in keys}
+        self._ready_expiries = {key: value for key, value in self._ready_expiries.items()
+                               if key in self.pending}
         self._last_completed = {key: value for key, value in self._last_completed.items()
                                 if key in keys}
         self._last_dispatched = {key: value for key, value in self._last_dispatched.items()
@@ -92,9 +97,11 @@ class ReactiveScheduler:
 
     def _expire(self, now):
         expired = [key for key, (stamp, _) in self.pending.items()
-                   if now - stamp > self.ttl_seconds]
+                   if (now > self._ready_expiries[key] if key in self._ready_expiries
+                       else now - stamp > self.ttl_seconds)]
         for key in expired:
             del self.pending[key]
+            self._ready_expiries.pop(key, None)
         self.metrics["ttl"] += len(expired)
 
     def ingest(self, poly_events=None, sx_events=None, now=None):
@@ -139,6 +146,10 @@ class ReactiveScheduler:
                         old_stamp, old_sources = previous
                         self.pending[key] = (min(old_stamp, stamp),
                                              old_sources | {source})
+        self._enforce_cap()
+        return added
+
+    def _enforce_cap(self):
         excess = len(self.pending) - self.max_pending
         if excess > 0:
             # Prefer recent actionable hints if bursts exceed the hard cap.
@@ -146,7 +157,54 @@ class ReactiveScheduler:
                             key=lambda key: (self.pending[key][0], key))
             for key in oldest[:excess]:
                 del self.pending[key]
+                self._ready_expiries.pop(key, None)
             self.metrics["overflow"] += excess
+
+    def ingest_ready(self, events, deadlines, now=None):
+        """Wake a live candidate after its delay without hiding that wait.
+
+        Only identifiers are queued. The consumer must revalidate the proof,
+        both order books and the wallet guards before any virtual debit.
+        """
+        now = self._now(now)
+        self._expire(now)
+        if not hasattr(events, "items") or not hasattr(deadlines, "get"):
+            self.metrics["invalid"] += 1
+            return 0
+        added = 0
+        for key, raw_stamp in events.items():
+            try:
+                if isinstance(raw_stamp, bool):
+                    raise ValueError("Boolean timestamp")
+                stamp = float(raw_stamp)
+                if not math.isfinite(stamp) or not 0 <= now - stamp <= 60:
+                    raise ValueError("Invalid candidate timestamp")
+                raw_deadline = deadlines.get(key)
+                if type(raw_deadline) not in (int, float):
+                    raise ValueError("Invalid proof deadline")
+                deadline = float(raw_deadline)
+                if not math.isfinite(deadline) or deadline > now + 3.0:
+                    raise ValueError("Invalid proof deadline")
+            except (TypeError, ValueError, OverflowError):
+                self.metrics["invalid"] += 1
+                continue
+            if key not in self.by_key:
+                self.metrics["unknown"] += 1
+                continue
+            if deadline <= now:
+                self.metrics["ttl"] += 1
+                continue
+            previous = self.pending.get(key)
+            if previous is None:
+                self.pending[key] = (stamp, {"LIVE"})
+                added += 1
+            else:
+                old_stamp, old_sources = previous
+                self.pending[key] = (min(old_stamp, stamp), old_sources | {"LIVE"})
+            self._ready_expiries[key] = min(
+                self._ready_expiries.get(key, deadline), deadline
+            )
+        self._enforce_cap()
         return added
 
     def _eligible(self, key, now):
@@ -171,6 +229,7 @@ class ReactiveScheduler:
     def _dispatch(self, pair, kind, now, rotation_index=None):
         key = pair["key"]
         event = self.pending.pop(key, None)
+        self._ready_expiries.pop(key, None)
         self._inflight.add(key)
         self._last_dispatched[key] = now
         if kind == "rotation":
@@ -187,7 +246,11 @@ class ReactiveScheduler:
         self._expire(now)
         if not self.pairs:
             return None
-        hot = next((self.by_key[key]
+        live = next((self.by_key[key] for key in sorted(
+                        self._ready_expiries,
+                        key=lambda key: (self._ready_expiries[key], key))
+                     if self._eligible(key, now)), None)
+        hot = live if live is not None else next((self.by_key[key]
                     for key in sorted(self.pending,
                                       key=lambda key: (self.pending[key][0], key))
                     if self._eligible(key, now)), None)
@@ -200,7 +263,7 @@ class ReactiveScheduler:
                 index, pair = normal
                 return self._dispatch(pair, "rotation", now, index)
         if hot is not None:
-            return self._dispatch(hot, "ws", now)
+            return self._dispatch(hot, "live" if live is not None else "ws", now)
         return None
 
     def completed(self, key, now=None):

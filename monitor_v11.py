@@ -1,4 +1,4 @@
-"""Trafulha V13.2 — análise reativa e contabilidade exclusivamente virtual.
+"""Trafulha V13.3 — pré-jogo/direto confirmado e contabilidade virtual.
 
 Nunca executa apostas reais. As operações Paper são hipóteses contabilísticas;
 os resultados dependem de confirmação oficial em ambas as plataformas.
@@ -34,9 +34,11 @@ from paper_service_v13 import PaperLifecycleWorker
 from reactive_scheduler_v13 import ReactiveScheduler
 from latency_metrics_v13 import LatencyMetrics
 from monitor_workers_v13 import SnapshotRefresher, AsyncNoticeSender
+from live_candidates_v13 import LiveCandidates
+from live_market_v13 import fetch_live_snapshot, LiveCheckError
 
 LOG = logging.getLogger("monitor_v11")
-APP_VERSION = "13.2.0"
+APP_VERSION = "13.3.0"
 CATALOG_GAMES = None
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -56,7 +58,7 @@ INTERVAL = max(10, int(os.getenv("MONITOR_INTERVAL_SECONDS", "20")))
 CATALOG_INTERVAL = max(180, int(os.getenv("MONITOR_CATALOG_SECONDS", "600")))
 MAX_PAIRS = min(60, max(1, int(os.getenv("MONITOR_PAIRS_PER_PASS", "15"))))
 # Reação a eventos WS: intervalo conservador de 1s; medir carga e 429.
-# NÃO é promessa de execução <10s, nem habilita apostas reais/virtuais LIVE.
+# Parâmetro legado; os atrasos oficiais LIVE são tratados separadamente.
 WS_REACT_GAP_SECONDS = min(10.0, max(
     1.0, float(os.getenv("MONITOR_WS_REACT_GAP_SECONDS", "1.0"))
 ))
@@ -504,9 +506,117 @@ def confirm_paper_snapshot(pair, first_poly, first_sx, t_poly, t_sx, fx,
             min(p_time, s_time) + MAX_QUOTE_AGE_SECONDS)
 
 
+def may_be_live(pair, now_epoch=None):
+    """Scheduling hint only; a timestamp or cached flag is never live proof."""
+    now_epoch = time.time() if now_epoch is None else now_epoch
+    return (pair["sx"]["start"] <= now_epoch
+            or pair["poly"].get("event_live") is True)
+
+
+def attempt_paper_entry(pair, poly_levels, sx_levels, t_poly, t_sx, fx,
+                        paper_conn, stage, live_candidates=None):
+    """Book only after the complete pregame or confirmed-live validation."""
+    def discard():
+        if live_candidates is not None:
+            live_candidates.discard(pair["key"])
+
+    existing = paper_conn.execute(
+        "SELECT 1 FROM paper_v12_trades WHERE event_key=?",
+        (paper.event_key(pair),),
+    ).fetchone()
+    if existing:
+        discard()
+        return None, "ja_registada"
+
+    live_evidence = None
+    paper_stage = "PRE_JOGO"
+    if stage != "PRE_JOGO":
+        if not paper.PAPER_LIVE_ENABLED or live_candidates is None:
+            discard()
+            return None, "live_desativado_ou_sem_coordenador"
+        balances = paper.free_balances(paper_conn)
+        first_quote = paper.select_shadow_quote(
+            poly_levels, sx_levels, fx, balances["poly"], balances["sx"]
+        )
+        now_mono = time.monotonic()
+        if (first_quote is None
+                or abs(t_poly - t_sx) > min(MAX_SKEW, paper.MAX_SNAPSHOT_GAP_SECONDS)
+                or not 0 <= now_mono - t_poly <= MAX_QUOTE_AGE_SECONDS
+                or not 0 <= now_mono - t_sx <= MAX_QUOTE_AGE_SECONDS):
+            discard()
+            return None, "live_preco_margem_saldo_inelegivel"
+        # No sleep here: initial checks, official delay and final phase checks
+        # run in a bounded coordinator while the scanner handles other games.
+        live_evidence, reason = live_candidates.consider(pair)
+        if live_evidence is None:
+            return None, reason
+        paper_stage = "LIVE_CONFIRMADO"
+
+    validated = confirm_paper_snapshot(
+        pair, poly_levels, sx_levels, t_poly, t_sx, fx, paper_conn,
+    )
+    if not validated:
+        discard()
+        quote = normalize_quote(poly_levels, sx_levels)
+        return None, (
+            "abaixo_margem" if quote and quote[2] < 100 * paper.MIN_NET_ROI
+            else "margem_anomala" if quote and quote[2] >= 100 * paper.MAX_AUTO_PAPER_ROI
+            else "validacao_sem_registo"
+        )
+    final_poly, final_sx, final_skew, valid_until = validated
+    if paper_stage == "PRE_JOGO" and may_be_live(pair):
+        discard()
+        return None, "inicio_durante_validacao"
+    if pair["sx"]["start"] < time.time() - bot.MAX_LIVE_AGE_H * 3600:
+        discard()
+        return None, "fora_da_janela"
+    if live_evidence is not None:
+        valid_until = min(valid_until, live_evidence["valid_until_mono"])
+    booked = paper.try_paper_entry(
+        paper_conn, pair, final_poly, final_sx, fx, paper_stage, final_skew,
+        valid_until_mono=valid_until, live_evidence=live_evidence,
+    )
+    if booked and live_evidence is not None:
+        LOG.info(
+            "PAPER_LIVE_ENTRADA | id=%d | SX_delay_ms=%d | Poly_delay_ms=%d | "
+            "candidato_ate_registo_ms=%d | estado=confirmado_duas_fontes | virtual",
+            booked[0], live_evidence["sx_delay_ms"], live_evidence["poly_delay_ms"],
+            round(1000 * (time.monotonic() - live_evidence["candidate_started_mono"])),
+        )
+    return booked, "registada" if booked else "validacao_sem_registo"
+
+
+def probe_live_markets(pairs, snapshot_fn=fetch_live_snapshot, limit=2):
+    """Read-only diagnostic; its evidence never authorizes a virtual entry."""
+    selected = sorted(pairs, key=lambda pair: (
+        pair["poly"].get("event_live") is not True,
+        not may_be_live(pair), abs(time.time() - pair["sx"]["start"]),
+    ))
+    checked, seen = [], set()
+    for pair in selected:
+        identity = (pair["poly"]["id"], pair["sx"]["hash"])
+        if identity in seen:
+            continue
+        seen.add(identity)
+        item = {"poly_market": pair["poly"]["id"],
+                "apos_hora_inicio": pair["sx"]["start"] <= time.time()}
+        try:
+            evidence = snapshot_fn(pair)
+            item.update(estado="live_confirmado", sx_delay_ms=evidence["sx_delay_ms"],
+                        poly_delay_ms=evidence["poly_delay_ms"])
+        except LiveCheckError as exc:
+            item["estado"] = exc.reason
+        except Exception as exc:
+            item["estado"] = "erro_" + type(exc).__name__
+        checked.append(item)
+        if len(checked) >= limit:
+            break
+    return checked
+
+
 def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
               priority_cache=None, work_item=None, notify_open=None,
-              notice_sender=None, verbose=True):
+              notice_sender=None, verbose=True, live_candidates=None):
     scan_started = time.monotonic()
     if not pairs:
         return {"checked": 0, "priced": 0, "positive": 0, "signals": 0,
@@ -540,11 +650,15 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
         event = ws_events.get(pair["key"])
         if not (now - bot.MAX_LIVE_AGE_H * 3600 <= start
                 <= now + bot.MAX_FUTURE_H * 3600):
+            if live_candidates is not None:
+                live_candidates.discard(pair["key"])
             if event is not None:
                 ws_skipped += 1
             continue
         # Início ≠ jogo oficialmente ao vivo.
-        if start <= now and not sx["live_enabled"]:
+        if may_be_live(pair, now) and sx.get("live_enabled") is not True:
+            if live_candidates is not None:
+                live_candidates.discard(pair["key"])
             if event is not None:
                 ws_skipped += 1
             continue
@@ -557,7 +671,7 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
             (poly_levels, t_poly), (sx_levels, t_sx) = fetch_books(pair)
             book_completed = time.monotonic()
             book_max_ms = max(book_max_ms, 1000 * (book_completed - book_started))
-            stage = "APOS_INICIO_NAO_CONFIRMADO" if start <= time.time() else "PRE_JOGO"
+            stage = "APOS_INICIO_NAO_CONFIRMADO" if may_be_live(pair) else "PRE_JOGO"
             quote, hypothetical = insert_observation(
                 conn, pair, stage, poly_levels, sx_levels,
                 abs(t_poly - t_sx), fx,
@@ -578,50 +692,12 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
                 # A simulação é independente do relatório de odds. Nunca faz
                 # chamadas de escrita à Polymarket ou SX Bet.
                 if paper_conn is not None:
-                    paper_stage = ("PRE_JOGO" if stage == "PRE_JOGO"
-                                   else "LIVE_NAO_CONFIRMADO")
-                    booked = None
-                    # Evitar REST duplicado em todas as direções. Só repetir
-                    # quando a primeira leitura sugerir entrada elegível.
-                    if (stage == "PRE_JOGO"
-                            or paper.ALLOW_LIVE_UNVERIFIED):
-                        existing = paper_conn.execute(
-                            "SELECT 1 FROM paper_v12_trades WHERE event_key=?",
-                            (paper.event_key(pair),),
-                        ).fetchone()
-                        if existing:
-                            paper_reasons["ja_registada"] += 1
-                            validated = None
-                        else:
-                            validated = confirm_paper_snapshot(
-                                pair, poly_levels, sx_levels, t_poly, t_sx,
-                                fx, paper_conn
-                            )
-                        if validated:
-                            final_poly, final_sx, final_skew, valid_until = validated
-                            # O pré-jogo não é uma autorização reutilizável
-                            # depois de atravessar o início durante o recheck.
-                            if paper_stage == "PRE_JOGO" and start <= time.time():
-                                paper_reasons["inicio_durante_validacao"] += 1
-                            elif start < time.time() - bot.MAX_LIVE_AGE_H * 3600:
-                                paper_reasons["fora_da_janela"] += 1
-                            else:
-                                booked = paper.try_paper_entry(
-                                    paper_conn, pair, final_poly, final_sx, fx,
-                                    paper_stage, final_skew,
-                                    valid_until_mono=valid_until,
-                                )
-                        if not existing and not booked:
-                            reason = (
-                                "abaixo_margem" if quote[2] < 100 * paper.MIN_NET_ROI
-                                else "margem_anomala" if quote[2] >= 100 * paper.MAX_AUTO_PAPER_ROI
-                                else "validacao_sem_registo"
-                            )
-                            paper_reasons[reason] += 1
-                    else:
-                        paper_reasons["fase_nao_confirmada"] += 1
+                    booked, reason = attempt_paper_entry(
+                        pair, poly_levels, sx_levels, t_poly, t_sx, fx,
+                        paper_conn, stage, live_candidates=live_candidates,
+                    )
+                    paper_reasons[reason] += 1
                     if booked:
-                        paper_reasons["registada"] += 1
                         shadow_id, shadow_quote = booked
                         LOG.info(
                             "PAPER V12 #%d | %s | %.2f EUR | "
@@ -642,7 +718,11 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
                             LOG.warning("PAPER_ALERT | pendente #%d | Telegram não confirmou; retry automático", shadow_id)
             elif paper_conn is not None:
                 paper_reasons["sem_cotacao_valida"] += 1
+                if live_candidates is not None:
+                    live_candidates.discard(pair["key"])
         except Exception as exc:
+            if live_candidates is not None:
+                live_candidates.discard(pair["key"])
             book_max_ms = max(book_max_ms, 1000 * (time.monotonic() - book_started))
             LOG.warning(
                 "Book falhou em %s (%s)",
@@ -1104,6 +1184,8 @@ def main(once=False):
     if poly_feed is not None:
         poly_feed.start()
     paper_conn = paper.open_database() if PAPER_V12_ENABLED and fx > 0 else None
+    live_candidates = (LiveCandidates(max_workers=1) if paper_conn is not None
+                       and paper.PAPER_LIVE_ENABLED and not once else None)
     result_worker = None
     if PAPER_V12_ENABLED and paper_conn is None:
         LOG.warning("PAPER V12 pediu ativação, mas EUR_PER_USD inválido/ausente: desativado.")
@@ -1128,8 +1210,13 @@ def main(once=False):
             )
             result_worker.start()
     LOG.info(
-        "REACTIVE V13.2 | uma direção por despacho; pré-análise integrada; "
+        "REACTIVE V13.3 | uma direção por despacho; pré-análise integrada; "
         "REST fresco nas duas fontes e recheck de 250ms preservados"
+    )
+    LOG.info(
+        "PAPER_LIVE | estado=%s | confirmação oficial Poly+SX obrigatória | "
+        "atrasos oficiais e revalidação sem bloquear outros jogos | exclusivamente_virtual",
+        "ATIVO" if live_candidates is not None else "DESATIVADO",
     )
     LOG.info(
         "WS PRIORITY | quota=%d | rotação=%.2fs | mínimo/chave=%.2fs | "
@@ -1141,10 +1228,16 @@ def main(once=False):
     catalog_ready = False
     catalog_worker = SnapshotRefresher(catalog_snapshot) if not once else None
     notice_worker = AsyncNoticeSender(telegram) if not once else None
+    live_probe_pairs = ()
+    live_probe_pending = False
+    live_probe_worker = (SnapshotRefresher(lambda: probe_live_markets(live_probe_pairs))
+                         if live_candidates is not None else None)
     if catalog_worker is not None:
         catalog_worker.start()
     if notice_worker is not None:
         notice_worker.start()
+    if live_probe_worker is not None:
+        live_probe_worker.start()
     next_catalog = 0.0
     iteration = 0
     last_prune = 0.0
@@ -1166,6 +1259,8 @@ def main(once=False):
                     raise RuntimeError("Worker do catálogo parou")
                 if notice_worker is not None and not notice_worker.thread.is_alive():
                     raise RuntimeError("Worker dos resumos parou")
+                if live_probe_worker is not None and not live_probe_worker.thread.is_alive():
+                    raise RuntimeError("Worker de diagnóstico LIVE parou")
                 last_health_check = started
             if started - last_prune >= 60 or last_prune == 0:
                 try:
@@ -1185,6 +1280,10 @@ def main(once=False):
                     if ok:
                         pairs = accept_catalog(snapshot)
                         scheduler.rebuild(pairs)
+                        if live_candidates is not None:
+                            live_candidates.rebuild(pairs)
+                            live_probe_pairs = tuple(pairs)
+                            live_probe_pending = True
                         catalog_ready = True
                     else:
                         LOG.warning("CATALOGO | atualização adiada (%s); manter snapshot completo", snapshot)
@@ -1197,6 +1296,23 @@ def main(once=False):
                 if started >= next_catalog and catalog_worker.request():
                     next_catalog = started + CATALOG_INTERVAL
 
+            if live_candidates is not None:
+                live_candidates.tick()
+                ready_events = live_candidates.take_ready_events()
+                ready_deadlines = live_candidates.ready_deadlines()
+                scheduler.ingest_ready(ready_events, ready_deadlines)
+            if live_probe_worker is not None:
+                probe_result = live_probe_worker.poll()
+                if probe_result is not None:
+                    ok, report = probe_result
+                    LOG.info("PAPER_LIVE_API | %s | apenas diagnóstico, sem débitos",
+                             json.dumps(report if ok else {"erro": report},
+                                        separators=(",", ":")))
+                if (live_probe_pending and live_candidates.snapshot()["pending"] == 0
+                        and started >= book_backoff_until()
+                        and live_probe_worker.request()):
+                    live_probe_pending = False
+
             if batch and (len(batch) >= MAX_PAIRS or started - last_batch_log >= 5):
                 log_scan_results(batch)
                 batch.clear()
@@ -1207,6 +1323,9 @@ def main(once=False):
                 metrics["queue_drops"] = dict(scheduler.metrics)
                 metrics["coverage"] = scheduler.coverage()
                 LOG.info("LATENCY_V13 | %s", json.dumps(metrics, separators=(",", ":")))
+                if live_candidates is not None:
+                    LOG.info("PAPER_LIVE_FILA | %s", json.dumps(
+                        live_candidates.snapshot(), separators=(",", ":")))
                 last_metrics = started
 
             # Também emitir resumos se um catálogo completo tiver zero pares,
@@ -1242,6 +1361,7 @@ def main(once=False):
                         work_item=item, verbose=False,
                         notify_open=result_worker.notify if result_worker else None,
                         notice_sender=notice_worker.submit,
+                        live_candidates=live_candidates,
                     )
                 finally:
                     scheduler.completed(item[0]["key"])
@@ -1266,6 +1386,10 @@ def main(once=False):
     finally:
         if batch:
             log_scan_results(batch)
+        if live_candidates is not None:
+            live_candidates.stop()
+        if live_probe_worker is not None:
+            live_probe_worker.stop()
         if catalog_worker is not None:
             catalog_worker.stop()
         if notice_worker is not None:

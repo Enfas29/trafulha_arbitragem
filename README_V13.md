@@ -1,4 +1,4 @@
-# Trafulha Paper V13.2
+# Trafulha Paper V13.3
 
 Versão reativa de 27/11/2026, sobre a V13.1 integrada a partir de `main`
 e da candidata `v13-speed-storage`. O ponto de entrada continua a ser
@@ -40,6 +40,61 @@ carteira ou transferências. Os montantes das mensagens são fictícios.
 
 Um timeout depois de o Telegram aceitar uma mensagem pode originar um
 aviso repetido. A contabilidade é idempotente: não duplica o crédito.
+
+## Jogos em direto na V13.3
+
+`PAPER_LIVE_ENABLED=1` ativa entradas **exclusivamente virtuais** durante
+jogos confirmados em direto. É o valor padrão; exige também o Paper ativo
+e câmbio válido. Passar a hora de início ou receber `liveEnabled=true` do
+SX não prova que o jogo esteja em curso.
+
+Uma candidata deve ter margem, profundidade e saldo elegíveis. Depois:
+
+1. O robô consulta em paralelo o evento Gamma, o mercado SX, o estado
+   oficial do jogo SX e os metadados atuais dos atrasos SX. Exige Poly
+   `live=true`/`ended=false`, mercado ativo e a aceitar ordens, SX
+   `status=ACTIVE`/`liveEnabled=true`, sem resultado, e fixture `status=2`.
+2. Compara exatamente IDs, seleções, tokens, tipo e participantes com o
+   catálogo. O protocolo Polymarket deve ser `v1` ou `v2` explícito; a
+   versão determina `clobTokenIds` ou `positionIds`. Valores desconhecidos
+   ou contraditórios bloqueiam a candidata.
+3. Lê `secondsDelay` do mercado Poly e `bettingDelay` dos metadados SX.
+   Na SX, após `gameTime`, a prioridade é liga, modalidade, valor padrão;
+   antes usa o atraso de pré-jogo. Não converte um atraso ausente em zero.
+4. Espera pelo maior dos dois atrasos numa fila limitada em segundo plano.
+   O scanner continua nos outros jogos. Se o atraso exigido aumentar na
+   revalidação, prolonga a espera. Não reserva nem debita carteiras nesta fase.
+5. Depois do prazo, repete as quatro consultas oficiais. Só então volta
+   aos livros, mantém a segunda confirmação independente após 250 ms e
+   reavalia margem, liquidez, saldos e exposição antes da transação.
+
+A prova de fase dura no máximo três segundos, contados **antes** de iniciar
+as consultas. O prazo das cotações continua em dois segundos. Ambos são
+verificados no ledger antes da transação, após obter o lock e antes do
+commit; uma espera no SQLite não torna uma prova antiga válida. A prova
+fica guardada com a operação e o aviso na mesma transação. A migração para
+schema14 faz backup e preserva operações, carteiras e avisos anteriores.
+
+Um preço que desaparece, uma fonte inconclusiva, uma suspensão, um mercado
+fechado ou uma prova expirada descartam a candidata. O limite é uma
+operação por par de mercados, partilhado entre pré-jogo e direto. Mantêm-se
+o máximo total de 100 € virtuais por operação e os filtros de mercados
+binários de vencedor com regras compatíveis; não se acrescentam futebol
+1X2, totais ou handicaps sem uma validação própria dessas regras.
+
+O aviso identifica `EM DIRETO confirmado`, o marcador/período disponibilizado
+pelo Polymarket e os atrasos considerados. É uma hipótese depois de
+revalidar, não uma simulação de cada preenchimento real: as duas ordens
+reais teriam riscos separados de atraso, suspensão e execução parcial.
+A subida da odd de uma favorita a perder não constitui arbitragem por si;
+o conjunto de seleções opostas ainda tem de passar os custos e o limiar.
+
+`PAPER_LIVE_API` faz uma pequena consulta de diagnóstico por atualização
+do catálogo, sem poder abrir operações. `PAPER_LIVE_FILA` regista fases,
+limites e razões de rejeição. Eventos `LIVE` na fila conservam o instante
+inicial da candidata: a duração inclui a espera oficial, não apenas o
+tempo de processamento. Uma prova pronta ganha prioridade por até três
+segundos, sem renovar a sua validade original no ledger.
 
 ## Rapidez e validações na V13.2
 
@@ -158,8 +213,9 @@ tempestade contínua; a quota evita starvation e a cobertura torna-o visível.
 Os antigos
 `MONITOR_FAST_PREVIEW_ENABLED` e `MONITOR_WS_REACT_GAP_SECONDS` já não
 controlam o caminho reativo normal; não se acrescenta a pausa global de 1s.
-O estado de `PAPER_V12_LIVE_UNVERIFIED` é preservado; o agendamento do jogo
-por si só não comprova que já está ao vivo.
+`PAPER_V12_LIVE_UNVERIFIED` fica obsoleto e não autoriza novas entradas,
+mesmo quando vale `1`. Operações antigas com essa fase permanecem no
+histórico. O modo `--once` não espera atrasos LIVE nem abre entradas LIVE.
 
 A suite GitHub Actions valida Python 3.11, migração, concorrência,
 idempotência, resultados oficiais com dados fictícios, recuperação de
@@ -170,6 +226,8 @@ fusos portugueses no contentor.
 Logs úteis: `TRAFULHA`, `PAPER_SCHEMA`, `PAPER_ESTADO`, `CATALOGO`,
 `PAPER_DIAGNOSTICO`, `PAPER_API_CHECK`, `PAPER_RESULTADOS`, `PAPER_FECHO`,
 `PAPER_AVISOS`, `LATENCY_V13` e `WS_LATENCY`.
+Diagnóstico de direto: `PAPER_LIVE`, `PAPER_LIVE_API`, `PAPER_LIVE_FILA`
+e `PAPER_LIVE_ENTRADA`.
 O resumo Telegram distingue jogos analisados, comparações possíveis e
 operações virtuais. Mais jogos não implica uma operação elegível diária.
 
@@ -179,5 +237,10 @@ operações virtuais. Mais jogos não implica uma operação elegível diária.
 - [Polymarket — detalhes de mercados](https://docs.polymarket.com/market-data/market-details)
 - [SX Bet — mercados](https://docs.sx.bet/developers/markets-and-events)
 - [SX Bet — Find Markets](https://docs.sx.bet/api-reference/get-markets-find)
+- [Polymarket — evento e estado de direto](https://docs.polymarket.com/api-reference/events/get-event-by-id)
+- [SX Bet — estado oficial do jogo](https://docs.sx.bet/api-reference/get-fixture-status)
+- [SX Bet — códigos de estado](https://docs.sx.bet/api-reference/fixture-statuses)
+- [SX Bet — atrasos de apostas](https://docs.sx.bet/developers/betting-delays)
+- [SX Bet — metadados e atrasos atuais](https://docs.sx.bet/api-reference/get-metadata-obv3)
 - [SX Bet — referência oficial de outcomes](https://github.com/sx-bet/sx-bet-api-docs/blob/main/source/includes/_markets.md)
 - [Railway — regiões e migração de volumes](https://docs.railway.com/deployments/regions)

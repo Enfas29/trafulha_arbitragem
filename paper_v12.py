@@ -54,10 +54,14 @@ PAPER_DB = os.getenv("PAPER_V12_DB", "/data/paper_v12.sqlite3")
 ALLOWED_SPORTS = {"tennis", "basketball", "american_football",
                   "baseball", "cricket", "esports", "combat"}
 # Observação: elegibilidade em paper não prova equivalência de liquidação.
-# Live pode ser analisado, mas só é simulado com adesão explícita.
+# Variável antiga mantida apenas para compatibilidade das configurações.
+# Nunca autoriza novas operações LIVE_NAO_CONFIRMADO.
 ALLOW_LIVE_UNVERIFIED = os.getenv("PAPER_V12_LIVE_UNVERIFIED", "0") == "1"
+PAPER_LIVE_ENABLED = os.getenv("PAPER_LIVE_ENABLED", "1").strip().lower() in {"1", "true"}
+MAX_LIVE_EVIDENCE_SECONDS = 3.0
+MAX_ENTRY_EVIDENCE_BYTES = 8192
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 MIGRATION_RESERVE_BYTES = 32 * 1024 * 1024
 LOG = logging.getLogger("paper_v13")
 TRADE_COLUMNS_V13 = {
@@ -70,6 +74,7 @@ TRADE_COLUMNS_V13 = {
     "poly_credit_cents": "INTEGER",
     "sx_credit_cents": "INTEGER",
     "resolution_evidence_json": "TEXT",
+    "entry_evidence_json": "TEXT",
 }
 
 
@@ -213,7 +218,9 @@ def _migration_needed(conn):
     tables = _table_names(conn)
     return (not set(TRADE_COLUMNS_V13).issubset(_trade_column_names(conn))
             or "paper_v12_settlement_notifications" not in tables
-            or "paper_v13_migrations" not in tables)
+            or "paper_v13_migrations" not in tables
+            or conn.execute("SELECT 1 FROM paper_v13_migrations WHERE version=?",
+                            (SCHEMA_VERSION,)).fetchone() is None)
 
 
 def _migration_snapshot(conn):
@@ -250,7 +257,7 @@ def _backup_before_migration(conn, source_path):
         raise RuntimeError("Migração PAPER bloqueada: menos de 32 MiB livres no volume original")
     backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    target = backup_dir / f"{source_path.stem}-pre-v13-{stamp}-{uuid.uuid4().hex[:8]}.sqlite3"
+    target = backup_dir / f"{source_path.stem}-pre-v{SCHEMA_VERSION}-{stamp}-{uuid.uuid4().hex[:8]}.sqlite3"
     partial = Path(str(target) + ".partial")
     deadline = time.monotonic() + 30
 
@@ -432,12 +439,133 @@ def _portugal_time(value):
             return "não disponível"
 
 
-def _entry_guard_valid(pair, stage, valid_until_mono):
-    """A guarded live observation must remain fresh until its virtual commit.
+def _finite_number(value):
+    if type(value) not in (int, float):
+        return None
+    try:
+        return float(value) if math.isfinite(value) else None
+    except (ValueError, TypeError, OverflowError):
+        return None
 
-    ``None`` preserves legacy/manual fixtures. Production supplies a monotonic
-    deadline derived from the older of its two final REST snapshots.
+
+def _exact_identifier(value, expected):
+    """Identifiers are exact; numeric API IDs may be canonical decimal text."""
+    return (isinstance(value, str) and 0 < len(value) <= 512
+            and type(expected) in (str, int) and not isinstance(expected, bool)
+            and value == str(expected))
+
+
+def _live_evidence_valid(pair, evidence, valid_until_mono):
+    """Validate a coordinator proof, never infer live from scheduled time.
+
+    The price deadline is supplied by the fresh-book coordinator. It must
+    also fit within the stricter lifetime of the official phase checks.
+    No network call or claimed execution is made by the ledger.
     """
+    if not PAPER_LIVE_ENABLED or type(evidence) is not dict:
+        return False
+    if evidence.get("method") != "official_live_v1":
+        return False
+    try:
+        identities = {
+            "pair_key": pair["key"],
+            "poly_event_id": pair["poly"]["event_id"],
+            "poly_market_id": pair["poly"]["id"],
+            "poly_asset_id": pair["poly_asset"],
+            "poly_side": pair["poly_label"],
+            "sx_event_id": pair["sx"]["event_id"],
+            "sx_market_hash": pair["sx"]["hash"],
+            "sx_side": pair["sx_label"],
+        }
+        if any(not _exact_identifier(evidence.get(name), expected)
+               for name, expected in identities.items()):
+            return False
+        target = pair["sx_target"]
+        if (type(target) is not int or target not in (0, 1)
+                or type(evidence.get("sx_target")) is not int
+                or evidence["sx_target"] != target):
+            return False
+        for field in ("poly_live", "poly_active", "poly_accepting_orders",
+                      "sx_live_enabled", "verified_after_delay"):
+            if evidence.get(field) is not True:
+                return False
+        for field in ("poly_ended", "poly_closed", "sx_reported"):
+            if evidence.get(field) is not False:
+                return False
+        if (type(evidence.get("sx_fixture_status")) is not int
+                or evidence["sx_fixture_status"] != 2
+                or evidence.get("sx_status") != "ACTIVE"):
+            return False
+
+        delay_fields = ("sx_delay_ms", "poly_delay_ms", "required_delay_ms",
+                        "initial_required_delay_ms")
+        if any(type(evidence.get(field)) is not int or evidence[field] < 0
+               for field in delay_fields):
+            return False
+        required_ms = max(evidence["sx_delay_ms"], evidence["poly_delay_ms"])
+        if evidence["required_delay_ms"] != required_ms:
+            return False
+        times = {}
+        for field in ("candidate_started_mono", "delay_started_mono",
+                      "delay_ready_mono", "checks_started_mono", "checked_mono",
+                      "checked_epoch", "valid_until_mono"):
+            value = _finite_number(evidence.get(field))
+            if value is None:
+                return False
+            times[field] = value
+        quote_deadline = _finite_number(valid_until_mono)
+        now_mono, now_epoch = time.monotonic(), time.time()
+        if quote_deadline is None or not all(map(math.isfinite, (now_mono, now_epoch))):
+            return False
+        if not (times["candidate_started_mono"] <= times["delay_started_mono"]
+                <= times["delay_ready_mono"] <= times["checks_started_mono"]
+                <= times["checked_mono"] <= now_mono
+                <= quote_deadline <= times["valid_until_mono"]):
+            return False
+        if not math.isclose(
+                times["valid_until_mono"],
+                times["checks_started_mono"] + MAX_LIVE_EVIDENCE_SECONDS,
+                rel_tol=0, abs_tol=1e-6):
+            return False
+        # checked_epoch may be stored as whole seconds; the monotonic bound
+        # above remains exact and is never enlarged by that rounding.
+        if not (times["checked_epoch"] > 0
+                and 0 <= now_epoch - times["checked_epoch"] <= MAX_LIVE_EVIDENCE_SECONDS + 1):
+            return False
+        delay_seconds = max(required_ms, evidence["initial_required_delay_ms"]) / 1000
+        if not math.isfinite(delay_seconds):
+            return False
+        if times["delay_ready_mono"] - times["delay_started_mono"] + 1e-6 < delay_seconds:
+            return False
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    return True
+
+
+def _freeze_live_evidence(evidence):
+    """Persist exactly the bounded proof used by the in-transaction guards."""
+    if type(evidence) is not dict:
+        return None, None
+    try:
+        encoded = json.dumps(evidence, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":"), allow_nan=False)
+        if len(encoded.encode("utf-8")) > MAX_ENTRY_EVIDENCE_BYTES:
+            return None, None
+        return json.loads(encoded), encoded
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        return None, None
+
+
+def _entry_guard_valid(pair, stage, valid_until_mono, live_evidence=None):
+    """A guarded observation must remain fresh until its virtual commit.
+
+    ``None`` preserves pre-game legacy/manual fixtures. Confirmed live always
+    requires official evidence and a monotonic final-book deadline.
+    """
+    if stage == "LIVE_CONFIRMADO":
+        return _live_evidence_valid(pair, live_evidence, valid_until_mono)
+    if stage != "PRE_JOGO":
+        return False
     if valid_until_mono is None:
         return True
     if isinstance(valid_until_mono, (str, bytes, bool)):
@@ -456,17 +584,17 @@ def _entry_guard_valid(pair, stage, valid_until_mono):
 
 
 def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
-                      opening_odds=None, *, valid_until_mono=None):
+                      opening_odds=None, *, valid_until_mono=None,
+                      live_evidence=None):
     """Duas pernas virtuais numa única transação SQLite. Nunca faz apostas.
 
     Uma única simulação por par de mercados, mesmo que a direção mude.
     Não marca como REAL_EXECUTED nem como garantia de arbitragem.
     """
-    if not _entry_guard_valid(pair, stage, valid_until_mono):
-        return None
-    if stage not in {"PRE_JOGO", "LIVE_NAO_CONFIRMADO"}:
-        return None
-    if stage == "LIVE_NAO_CONFIRMADO" and not ALLOW_LIVE_UNVERIFIED:
+    evidence_json = None
+    if stage == "LIVE_CONFIRMADO":
+        live_evidence, evidence_json = _freeze_live_evidence(live_evidence)
+    if not _entry_guard_valid(pair, stage, valid_until_mono, live_evidence):
         return None
     if pair["sx"]["sport"] not in ALLOWED_SPORTS:
         return None
@@ -496,7 +624,7 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
         conn.execute("BEGIN IMMEDIATE")
         # A busy SQLite writer can outlive an otherwise fresh quote. Check
         # after obtaining the lock, before any debit or outbox insert.
-        if not _entry_guard_valid(pair, stage, valid_until_mono):
+        if not _entry_guard_valid(pair, stage, valid_until_mono, live_evidence):
             conn.rollback()
             return None
         if valid_until_mono is not None:
@@ -522,8 +650,8 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
             poly_side, sx_side, stage, payout_usdc, fx_eur_per_usd,
             poly_debit_cents, sx_debit_cents, poly_fee_cents,
             conditional_payout_cents, conditional_profit_cents, status, note,
-            game_start_epoch, poly_token_id, sx_outcome_one
-          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'OPEN_CONDITIONAL',?,?,?,?)
+            game_start_epoch, poly_token_id, sx_outcome_one, entry_evidence_json
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'OPEN_CONDITIONAL',?,?,?,?,?)
         """, (
             eid, now_epoch, pair["sx"]["sport"],
             " vs ".join(pair["sx"]["teams"]), str(pair["poly"]["id"]),
@@ -534,7 +662,7 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
             quote.conditional_profit_cents,
             "Só simulação; fills presumidos. Lucro apenas se ambos os "
             "mercados resolverem normalmente; exceções exigem revisão.",
-            game_start, poly_token_id, sx_outcome_one,
+            game_start, poly_token_id, sx_outcome_one, evidence_json,
         ))
         trade_id = result.lastrowid
         if opening_odds is not None:
@@ -552,7 +680,7 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
             )
         # Formatting/writing the operation can also cross the freshness or
         # pre-game boundary. Roll back both wallets, the trade and its notice.
-        if not _entry_guard_valid(pair, stage, valid_until_mono):
+        if not _entry_guard_valid(pair, stage, valid_until_mono, live_evidence):
             conn.rollback()
             return None
         conn.commit()
@@ -623,12 +751,37 @@ def format_open_message(conn, trade_id, odds_poly=None, odds_sx=None,
 
     game_time = _portugal_time(game_start if game_start is not None else record["game_start_epoch"])
     balances = free_balances(conn)
+    phase = "EM DIRETO confirmado" if record["stage"] == "LIVE_CONFIRMADO" else record["stage"]
+    live_lines = []
+    if record["stage"] == "LIVE_CONFIRMADO":
+        try:
+            evidence = json.loads(record["entry_evidence_json"] or "{}")
+        except (TypeError, ValueError):
+            evidence = {}
+        if isinstance(evidence, dict):
+            for label, names in (("Marcador observado", ("score", "poly_score")),
+                                 ("Período observado", ("period", "poly_period"))):
+                value = next((evidence.get(name) for name in names
+                              if evidence.get(name) is not None), None)
+                if type(value) in (str, int) and str(value).strip():
+                    text = " ".join(str(value).split())[:120]
+                    live_lines.append(f"🏟️ {label}: {text}")
+            delay_poly = _finite_number(evidence.get("poly_delay_ms"))
+            delay_sx = _finite_number(evidence.get("sx_delay_ms"))
+            if delay_poly is not None and delay_sx is not None:
+                poly_text = f"{delay_poly / 1000:.2f}".replace(".", ",")
+                sx_text = f"{delay_sx / 1000:.2f}".replace(".", ",")
+                live_lines.append(
+                    f"⏱️ Atrasos considerados: Polymarket {poly_text} s · SX Bet {sx_text} s"
+                )
+        live_lines.append("ℹ️ Hipótese após revalidação; não execução real.")
     message = [
         f"🧪 {'DEMONSTRAÇÃO FICTÍCIA' if demo else 'APOSTA VIRTUAL'} #{trade_id}",
         f"🏟️ {record['event']}",
         f"📅 Início previsto: {game_time}",
         f"🕒 Registo: {time.strftime('%d/%m/%Y %H:%M:%S UTC', time.gmtime(record['created_epoch']))}",
-        f"🏷️ Modalidade: {record['sport']} | fase: {record['stage']}",
+        f"🏷️ Modalidade: {record['sport']} | fase: {phase}",
+        *live_lines,
         "",
         "1️⃣ POLYMARKET",
         f"Equipa: {record['poly_side']}{odds(odds_poly)}",
@@ -1012,17 +1165,13 @@ def flag_exception(conn, trade_id, reason):
 
 
 def try_paper_entry(conn, pair, poly_levels, sx_levels, fx, stage, skew,
-                    *, valid_until_mono=None):
+                    *, valid_until_mono=None, live_evidence=None):
     """Um candidato de paper: NÃO chama nenhuma API de escrita."""
-    if not _entry_guard_valid(pair, stage, valid_until_mono):
+    if not _entry_guard_valid(pair, stage, valid_until_mono, live_evidence):
         return None
     if skew > MAX_SNAPSHOT_GAP_SECONDS:
         return None
     if pair["sx"]["sport"] not in ALLOWED_SPORTS:
-        return None
-    if stage not in ("PRE_JOGO", "LIVE_NAO_CONFIRMADO"):
-        return None
-    if stage == "LIVE_NAO_CONFIRMADO" and not ALLOW_LIVE_UNVERIFIED:
         return None
     if fx <= 0 or fx >= 10:
         return None
@@ -1041,6 +1190,7 @@ def try_paper_entry(conn, pair, poly_levels, sx_levels, fx, stage, skew,
         conn, pair, quote, stage,
         opening_odds=(1.0 / best_poly, 1.0 / best_sx),
         valid_until_mono=valid_until_mono,
+        live_evidence=live_evidence,
     )
     return (trade_id, quote) if trade_id is not None else None
 
