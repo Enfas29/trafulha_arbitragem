@@ -10,6 +10,7 @@ on:
       - v13-paper-refresh-20261127
       - v13-speed-safe-20261127
       - v13-live-paper-20261127
+      - v14-bankroll-reset-20261127
   pull_request:
     branches:
       - main
@@ -107,3 +108,10 @@ jobs:
           python test_live_candidates_v13.py
           python test_paper_live_v13.py
           python test_monitor_live_v13.py
+
+      - name: Testar banca proporcional, concorrência e reset V14 (offline)
+        run: |
+          python test_bankroll_v14.py
+          python test_paper_bankroll_v14.py
+          python test_paper_reset_v14.py
+          python test_monitor_bankroll_v14.py

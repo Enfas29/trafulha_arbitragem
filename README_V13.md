@@ -1,8 +1,71 @@
-# Trafulha Paper V13.3
+# Trafulha Paper V14
 
-Versão reativa de 27/11/2026, sobre a V13.1 integrada a partir de `main`
-e da candidata `v13-speed-storage`. O ponto de entrada continua a ser
+Versão de 27/11/2026, com banca proporcional e reset explícito sobre a
+V13.3 de análise reativa e direto confirmado. O ponto de entrada continua a ser
 `python monitor_v11.py` por compatibilidade com o serviço Railway.
+
+## Banca proporcional e reset na V14
+
+O montante de cada operação virtual é calculado a partir das duas carteiras,
+do dinheiro já comprometido, da profundidade dos livros e da margem líquida.
+Foram retirados os tetos monetários fixos de 100 € por operação, 500 € de
+exposição aberta e 1.000 € de payout. Mantêm-se limites proporcionais para
+deixar capital disponível em cada plataforma.
+
+| Regra inicial | Percentagem | Com 1.000 € em cada carteira |
+| --- | ---: | ---: |
+| Reserva mínima por carteira | 30% | 300 € em cada plataforma |
+| Máximo total de uma operação | 20% do capital conjunto | 400 € entre as duas plataformas |
+| Exposição conjunta máxima para novas entradas | 70% | 1.400 € no total |
+
+Capital contabilístico é saldo livre mais o custo das operações ainda
+abertas/em revisão. Não inclui lucros previstos nem valor de mercado
+inventado. Reservas são arredondadas para cima; limites para baixo. A
+carteira mais limitada pode reduzir a operação abaixo do máximo total.
+Depois de cada resultado, os limites acompanham o novo capital. Se perdas
+deixarem a exposição acima da percentagem permitida, novas entradas ficam
+bloqueadas até existir capacidade; o robô não inventa uma saída das posições.
+
+O robô pode escolher uma operação menor quando os níveis mais fundos do
+livro fazem desaparecer a margem. Cada cotação final volta a verificar
+custos, arredondamento, liquidez e ROI. O orçamento é recalculado dentro do
+lock de escrita SQLite, antes dos dois débitos, e fica guardado com a operação
+em `bankroll_evidence_json` (schema15). Duas entradas concorrentes não podem
+reutilizar a mesma reserva. A mensagem mostra o teto disponível nessa entrada
+e as reservas das duas carteiras.
+
+Configuração, em percentagens:
+
+```text
+PAPER_BANKROLL_RESERVE_PCT=30
+PAPER_BANKROLL_MAX_OPERATION_PCT=20
+PAPER_BANKROLL_MAX_EXPOSURE_PCT=70
+```
+
+A configuração é validada no arranque. A exposição máxima não pode exceder
+100% menos a reserva. Uma alteração exige reiniciar o processo; nenhuma destas
+variáveis ativa dinheiro real. O limiar de margem continua independente.
+
+### Reset explícito das carteiras virtuais
+
+`PAPER_RESET_REQUEST_ID` identifica um pedido único autorizado para repor
+**1.000 € fictícios em cada carteira**. Sem identificador não há reset.
+O monitor executa-o no arranque, antes dos workers de análise/resultados/avisos.
+O modo `--once` não aplica pedidos de reset.
+
+Antes de alterar saldos, cria e verifica um backup SQLite que inclui o WAL.
+Sob o mesmo lock, guarda as linhas originais em `paper_v14_reset_trades`,
+arquiva as operações anteriores como `RESET_ARCHIVED`, liberta as suas chaves
+de deduplicação e repõe ambos os saldos numa única transação. Qualquer falha
+faz rollback. Aberturas antigas e resultados antigos não podem enviar novos
+avisos nem creditar a nova banca. Os outboxes históricos permanecem intactos;
+não são marcados artificialmente como enviados.
+
+O pedido concluído fica em `paper_v14_resets`. Deixar o mesmo identificador
+configurado ou reiniciar o Railway **não volta a repor dinheiro**, mesmo depois
+de novas operações ou ganhos. Só um identificador novo pede outro reset. O
+histórico anterior e o backup mantêm-se disponíveis, mas não entram nas
+contagens nem no resultado realizado do ciclo novo.
 
 ## Funcionamento
 
@@ -73,12 +136,13 @@ as consultas. O prazo das cotações continua em dois segundos. Ambos são
 verificados no ledger antes da transação, após obter o lock e antes do
 commit; uma espera no SQLite não torna uma prova antiga válida. A prova
 fica guardada com a operação e o aviso na mesma transação. A migração para
-schema14 faz backup e preserva operações, carteiras e avisos anteriores.
+schema15 faz backup e preserva operações, carteiras e avisos anteriores,
+exceto quando existe um pedido explícito de reset conforme descrito acima.
 
 Um preço que desaparece, uma fonte inconclusiva, uma suspensão, um mercado
 fechado ou uma prova expirada descartam a candidata. O limite é uma
-operação por par de mercados, partilhado entre pré-jogo e direto. Mantêm-se
-o máximo total de 100 € virtuais por operação e os filtros de mercados
+operação por par de mercados no ciclo atual, partilhado entre pré-jogo e direto.
+Mantêm-se os filtros de mercados
 binários de vencedor com regras compatíveis; não se acrescentam futebol
 1X2, totais ou handicaps sem uma validação própria dessas regras.
 
@@ -153,7 +217,8 @@ reconstituição de preços ou fills que nunca foram observados.
 ## Preservação dos dados
 
 Mantêm-se os mesmos caminhos `MONITOR_DB` e `PAPER_V12_DB` no volume
-persistente `/data`. Carteiras existentes não são reiniciadas.
+persistente `/data`. Carteiras existentes só são reiniciadas quando existe
+um novo pedido explícito `PAPER_RESET_REQUEST_ID`; um simples deploy não as repõe.
 
 A primeira abertura de uma base antiga faz um backup consistente SQLite
 em `/data/backups`, incluindo o WAL, verifica a integridade e só depois
@@ -192,9 +257,9 @@ carteiras. Um diagnóstico pendente não é convertido num resultado.
 
 As chaves existentes continuam nas variáveis Railway. Não colocar segredos
 no repositório. `PAPER_V12_ENABLED=1` ativa apenas simulação e o limiar
-acordado é `PAPER_V12_MIN_NET_ROI_PCT=0.5`. O máximo continua a ser 100 €
-virtuais no total por operação, com 1.000 € iniciais por plataforma apenas
-na criação de uma base nova. O câmbio é o valor configurado, e o pagamento
+acordado é `PAPER_V12_MIN_NET_ROI_PCT=0.5`. Os montantes seguem a política
+proporcional V14, com 1.000 € iniciais por plataforma na criação de uma base
+nova ou num reset explicitamente pedido. O câmbio é o valor configurado, e o pagamento
 de cada operação usa a referência guardada na abertura.
 
 Novas variáveis opcionais: `PAPER_RESULTS_ENABLED=1`,
@@ -223,7 +288,7 @@ envio, classificação, armazenamento e isolamento das chaves. As versões
 das dependências são fixadas em `requirements.txt`; `tzdata` garante os
 fusos portugueses no contentor.
 
-Logs úteis: `TRAFULHA`, `PAPER_SCHEMA`, `PAPER_ESTADO`, `CATALOGO`,
+Logs úteis: `TRAFULHA`, `PAPER_SCHEMA`, `PAPER_RESET`, `PAPER_BANCA`, `PAPER_ESTADO`, `CATALOGO`,
 `PAPER_DIAGNOSTICO`, `PAPER_API_CHECK`, `PAPER_RESULTADOS`, `PAPER_FECHO`,
 `PAPER_AVISOS`, `LATENCY_V13` e `WS_LATENCY`.
 Diagnóstico de direto: `PAPER_LIVE`, `PAPER_LIVE_API`, `PAPER_LIVE_FILA`

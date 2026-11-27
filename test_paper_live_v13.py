@@ -259,12 +259,12 @@ class LiveLedgerTests(unittest.TestCase):
                 self.assertEqual(row["note"], "historical note to preserve")
                 self.assertIsNone(row["entry_evidence_json"])
                 self.assertEqual(migrated.execute("SELECT message FROM paper_v12_open_notifications WHERE trade_id=7").fetchone()[0], "original notification")
-                self.assertEqual([tuple(row) for row in migrated.execute("SELECT version FROM paper_v13_migrations ORDER BY version")], [(13,), (14,)])
+                self.assertEqual([tuple(row) for row in migrated.execute("SELECT version FROM paper_v13_migrations ORDER BY version")], [(13,), (paper.SCHEMA_VERSION,)])
             finally:
                 migrated.close()
             backups = list((Path(directory) / "backups").glob("*.sqlite3"))
             self.assertEqual(len(backups), 1)
-            self.assertIn("-pre-v14-", backups[0].name)
+            self.assertIn(f"-pre-v{paper.SCHEMA_VERSION}-", backups[0].name)
             with sqlite3.connect(backups[0]) as previous:
                 self.assertNotIn("entry_evidence_json", {r[1] for r in previous.execute("PRAGMA table_info(paper_v12_trades)")})
                 self.assertEqual(previous.execute("SELECT stage FROM paper_v12_trades WHERE id=7").fetchone()[0], "LIVE_NAO_CONFIRMADO")

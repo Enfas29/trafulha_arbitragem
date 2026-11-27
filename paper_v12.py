@@ -18,16 +18,16 @@ import shutil
 import sqlite3
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
+import bankroll_v14 as bankroll
+
 INITIAL_CENTS = 100_000                 # 1.000 EUR em cada plataforma
-MAX_TRADE_CENTS = 10_000                # 100 EUR TOTAL, incluindo custos
-MAX_OPEN_EXPOSURE_CENTS = 50_000        # máximo 500 EUR expostos em conjunto
 MIN_TRADE_CENTS = 500                  # mínimo de 5 EUR por operação
 # Percentagem para papel: PAPER_V12_MIN_NET_ROI_PCT=0.5 significa 0,5%.
 # A configuração não ativa ordens REAIS; só muda o limiar de registo virtual.
@@ -61,7 +61,7 @@ PAPER_LIVE_ENABLED = os.getenv("PAPER_LIVE_ENABLED", "1").strip().lower() in {"1
 MAX_LIVE_EVIDENCE_SECONDS = 3.0
 MAX_ENTRY_EVIDENCE_BYTES = 8192
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 MIGRATION_RESERVE_BYTES = 32 * 1024 * 1024
 LOG = logging.getLogger("paper_v13")
 TRADE_COLUMNS_V13 = {
@@ -75,6 +75,7 @@ TRADE_COLUMNS_V13 = {
     "sx_credit_cents": "INTEGER",
     "resolution_evidence_json": "TEXT",
     "entry_evidence_json": "TEXT",
+    "bankroll_evidence_json": "TEXT",
 }
 
 
@@ -156,9 +157,26 @@ def quote_for_payout(poly_levels, sx_levels, payout_usdc, fx):
 
 
 def select_shadow_quote(poly_levels, sx_levels, fx,
-                        free_poly_cents, free_sx_cents):
-    """Procura stake comum, respeitando profundidade, carteiras e 100 EUR."""
+                        free_poly_cents, free_sx_cents, *, allocation=None):
+    """Size a virtual pair using current reserves, depth and the net margin.
+
+    Production supplies ``allocation_budget(conn)`` so already committed
+    stakes participate in accounting equity and exposure. Standalone callers
+    get a conservative budget from their supplied free balances, with no
+    presumed open stakes. No fixed EUR trade, payout or exposure cap applies.
+    """
     if not (poly_levels and sx_levels and 0 < fx < 10):
+        return None
+    if allocation is None:
+        allocation = bankroll.budget_for_entry(
+            {"poly": free_poly_cents, "sx": free_sx_cents}, {"poly": 0, "sx": 0},
+        )
+    if not isinstance(allocation, bankroll.EntryBudget):
+        raise ValueError("Orçamento de banca inválido")
+    total_limit = allocation.total_cap_cents
+    poly_limit = min(allocation.poly_available_cents, free_poly_cents)
+    sx_limit = min(allocation.sx_available_cents, free_sx_cents)
+    if total_limit < MIN_TRADE_CENTS or min(poly_limit, sx_limit) <= 0:
         return None
     for book in (poly_levels, sx_levels):
         for price, capacity in book:
@@ -169,9 +187,12 @@ def select_shadow_quote(poly_levels, sx_levels, fx,
     capacity = min(
         sum(cap for _, cap in poly_levels),
         sum(cap for _, cap in sx_levels),
-        1_000.0 / fx,
+        # Even the cheapest levels cannot buy more payout than this bound.
+        # Fees and buffers only reduce the eventual capacity further.
+        total_limit / (100 * fx * (min(p for p, _ in poly_levels)
+                                   + min(p for p, _ in sx_levels))),
     )
-    if capacity <= 0:
+    if not math.isfinite(capacity) or capacity <= 0:
         return None
 
     low, high = 0.0, capacity
@@ -180,23 +201,68 @@ def select_shadow_quote(poly_levels, sx_levels, fx,
         quote = quote_for_payout(poly_levels, sx_levels, middle, fx)
         allowed = (
             quote is not None
-            and quote.total_cents <= MAX_TRADE_CENTS
-            and quote.poly_debit_cents <= free_poly_cents
-            and quote.sx_debit_cents <= free_sx_cents
+            and quote.total_cents <= total_limit
+            and quote.poly_debit_cents <= poly_limit
+            and quote.sx_debit_cents <= sx_limit
         )
         if allowed:
             low = middle
         else:
             high = middle
 
-    # Reduz para 6 decimais e recalcula depois do arredondamento.
-    payout = math.floor(low * 1_000_000) / 1_000_000
-    quote = quote_for_payout(poly_levels, sx_levels, payout, fx)
+    def rounded_quote(payout):
+        payout = math.floor(payout * 1_000_000) / 1_000_000
+        return quote_for_payout(poly_levels, sx_levels, payout, fx)
+
+    quote = rounded_quote(low)
     if quote is None:
         return None
-    if not (MIN_TRADE_CENTS <= quote.total_cents <= MAX_TRADE_CENTS):
+    if quote.roi < MIN_NET_ROI and quote.total_cents >= MIN_TRADE_CENTS:
+        # Taking deeper, worse prices can consume the margin before the money
+        # budget. Keep a smaller valid opportunity instead of discarding it
+        # merely because the largest affordable stake has an inadequate ROI.
+        minimum, maximum = 0.0, low
+        for _ in range(45):
+            middle = (minimum + maximum) / 2
+            trial = quote_for_payout(poly_levels, sx_levels, middle, fx)
+            if trial is not None and trial.total_cents >= MIN_TRADE_CENTS:
+                maximum = middle
+            else:
+                minimum = middle
+        # Move one payout micro-unit past the minimum to survive flooring.
+        smallest = rounded_quote(maximum + 0.000001)
+        if (smallest is not None and smallest.total_cents >= MIN_TRADE_CENTS
+                and smallest.roi >= MAX_AUTO_PAPER_ROI):
+            return None
+        # Exact cent rounding is stepwise near the 5 EUR minimum. Do not
+        # assume an unprofitable minimum rules out a larger, good shallow
+        # level. Book breakpoints provide finite anchors for that case.
+        anchors = [smallest] if smallest is not None else []
+        for book in (poly_levels, sx_levels):
+            cumulative = 0.0
+            for _, size in sorted(book):
+                cumulative += size
+                if cumulative > low:
+                    break
+                anchors.append(rounded_quote(cumulative))
+        eligible = [item for item in anchors if item is not None
+                    and MIN_TRADE_CENTS <= item.total_cents <= total_limit
+                    and MIN_NET_ROI <= item.roi < MAX_AUTO_PAPER_ROI]
+        if not eligible:
+            return None
+        best = max(eligible, key=lambda item: item.payout_usdc)
+        minimum, maximum = best.payout_usdc, low
+        for _ in range(45):
+            middle = (minimum + maximum) / 2
+            trial = rounded_quote(middle)
+            if trial is not None and trial.roi >= MIN_NET_ROI:
+                minimum, best = middle, trial
+            else:
+                maximum = middle
+        quote = best
+    if not (MIN_TRADE_CENTS <= quote.total_cents <= total_limit):
         return None
-    if quote.poly_debit_cents > free_poly_cents or quote.sx_debit_cents > free_sx_cents:
+    if quote.poly_debit_cents > poly_limit or quote.sx_debit_cents > sx_limit:
         return None
     if (quote.roi < MIN_NET_ROI or quote.roi >= MAX_AUTO_PAPER_ROI
             or quote.conditional_profit_cents <= 0):
@@ -402,6 +468,29 @@ def free_balances(conn):
     ).fetchall())
 
 
+def allocation_budget(conn):
+    """Read both wallets and committed cost in one consistent SQL snapshot.
+
+    Open operations and cases awaiting review keep their debits reserved.
+    Settled or reset-archived records cannot inflate the new entry budget.
+    Accounting equity is cash plus committed cost, never hypothetical profit.
+    """
+    free_poly, free_sx, reserved_poly, reserved_sx = conn.execute("""
+        SELECT
+          (SELECT free_cents FROM paper_v12_wallets WHERE platform='poly'),
+          (SELECT free_cents FROM paper_v12_wallets WHERE platform='sx'),
+          COALESCE(SUM(CASE WHEN status IN ('OPEN_CONDITIONAL','REVIEW_REQUIRED')
+                           THEN poly_debit_cents ELSE 0 END),0),
+          COALESCE(SUM(CASE WHEN status IN ('OPEN_CONDITIONAL','REVIEW_REQUIRED')
+                           THEN sx_debit_cents ELSE 0 END),0)
+        FROM paper_v12_trades
+    """).fetchone()
+    return bankroll.budget_for_entry(
+        {"poly": free_poly, "sx": free_sx},
+        {"poly": reserved_poly, "sx": reserved_sx},
+    )
+
+
 def event_key(pair):
     poly_id = str(pair["poly"]["id"])
     sx_hash = str(pair["sx"]["hash"])
@@ -583,6 +672,38 @@ def _entry_guard_valid(pair, stage, valid_until_mono, live_evidence=None):
     return True
 
 
+def _valid_shadow_amounts(quote):
+    """A direct ledger caller cannot bypass positive, consistent cent amounts."""
+    if not isinstance(quote, ShadowQuote):
+        return False
+    monetary = (quote.poly_debit_cents, quote.sx_debit_cents,
+                quote.poly_fee_cents, quote.total_cents, quote.payout_eur_cents,
+                quote.conditional_profit_cents)
+    if any(type(value) is not int or value < 0 for value in monetary):
+        return False
+    if (min(quote.poly_debit_cents, quote.sx_debit_cents) <= 0
+            or quote.total_cents < MIN_TRADE_CENTS
+            or quote.total_cents != quote.poly_debit_cents + quote.sx_debit_cents
+            or quote.conditional_profit_cents != quote.payout_eur_cents - quote.total_cents
+            or quote.poly_fee_cents > quote.poly_debit_cents):
+        return False
+    try:
+        return (math.isfinite(quote.roi) and MIN_NET_ROI <= quote.roi < MAX_AUTO_PAPER_ROI
+                and math.isclose(quote.roi, quote.conditional_profit_cents / quote.total_cents,
+                                 rel_tol=1e-12, abs_tol=1e-12)
+                and math.isfinite(quote.payout_usdc) and quote.payout_usdc > 0
+                and math.isfinite(quote.fx_eur_per_usd) and 0 < quote.fx_eur_per_usd < 10
+                and quote.payout_eur_cents == cents_down(quote.payout_usdc * quote.fx_eur_per_usd))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _fits_allocation(quote, allocation):
+    return (quote.total_cents <= allocation.total_cap_cents
+            and quote.poly_debit_cents <= allocation.poly_available_cents
+            and quote.sx_debit_cents <= allocation.sx_available_cents)
+
+
 def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
                       opening_odds=None, *, valid_until_mono=None,
                       live_evidence=None):
@@ -608,10 +729,7 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
         return None
     if str(pair["poly_label"]).strip().lower() == str(pair["sx_label"]).strip().lower():
         return None
-    if (quote.total_cents > MAX_TRADE_CENTS
-            or quote.roi < MIN_NET_ROI
-            or not math.isfinite(quote.roi)
-            or quote.roi >= MAX_AUTO_PAPER_ROI):
+    if not _valid_shadow_amounts(quote):
         return None
 
     eid = event_key(pair)
@@ -632,13 +750,17 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
         if conn.execute("SELECT 1 FROM paper_v12_trades WHERE event_key=?", (eid,)).fetchone():
             conn.rollback()
             return None
+        # Recompute under the writer lock: a quote selected before another
+        # operation/settlement cannot consume the newly protected reserve.
+        allocation = allocation_budget(conn)
+        if not _fits_allocation(quote, allocation):
+            conn.rollback()
+            return None
         free = free_balances(conn)
-        if free["poly"] < quote.poly_debit_cents or free["sx"] < quote.sx_debit_cents:
-            conn.rollback()
-            return None
-        if open_exposure(conn) + quote.total_cents > MAX_OPEN_EXPOSURE_CENTS:
-            conn.rollback()
-            return None
+        bankroll_evidence = json.dumps({
+            "method": "bankroll_proportional_v1", "free_before_cents": free,
+            "allocation": asdict(allocation),
+        }, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
         conn.execute("UPDATE paper_v12_wallets SET free_cents=free_cents-? WHERE platform='poly'",
                      (quote.poly_debit_cents,))
@@ -650,8 +772,9 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
             poly_side, sx_side, stage, payout_usdc, fx_eur_per_usd,
             poly_debit_cents, sx_debit_cents, poly_fee_cents,
             conditional_payout_cents, conditional_profit_cents, status, note,
-            game_start_epoch, poly_token_id, sx_outcome_one, entry_evidence_json
-          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'OPEN_CONDITIONAL',?,?,?,?,?)
+            game_start_epoch, poly_token_id, sx_outcome_one, entry_evidence_json,
+            bankroll_evidence_json
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'OPEN_CONDITIONAL',?,?,?,?,?,?)
         """, (
             eid, now_epoch, pair["sx"]["sport"],
             " vs ".join(pair["sx"]["teams"]), str(pair["poly"]["id"]),
@@ -662,7 +785,7 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
             quote.conditional_profit_cents,
             "Só simulação; fills presumidos. Lucro apenas se ambos os "
             "mercados resolverem normalmente; exceções exigem revisão.",
-            game_start, poly_token_id, sx_outcome_one, evidence_json,
+            game_start, poly_token_id, sx_outcome_one, evidence_json, bankroll_evidence,
         ))
         trade_id = result.lastrowid
         if opening_odds is not None:
@@ -751,6 +874,24 @@ def format_open_message(conn, trade_id, odds_poly=None, odds_sx=None,
 
     game_time = _portugal_time(game_start if game_start is not None else record["game_start_epoch"])
     balances = free_balances(conn)
+    bankroll_lines = []
+    if record["bankroll_evidence_json"]:
+        try:
+            saved_budget = json.loads(record["bankroll_evidence_json"])["allocation"]
+            policy = saved_budget["policy"]
+            reserve_pct = f"{policy['reserve_bps'] / 100:g}".replace(".", ",")
+            operation_pct = f"{policy['max_operation_bps'] / 100:g}".replace(".", ",")
+            bankroll_lines = [
+                f"🧮 Gestão automática: até {operation_pct}% da banca contabilizada por operação.",
+                f"💶 Teto disponível nesta entrada: {eur(saved_budget['total_cap_cents'])}.",
+                f"🛟 Reserva mínima ({reserve_pct}% por carteira): "
+                f"Polymarket {eur(saved_budget['poly_reserve_cents'])} · "
+                f"SX Bet {eur(saved_budget['sx_reserve_cents'])}.",
+                "ℹ️ O valor pode ser menor devido a liquidez, margem ou capital já reservado.",
+            ]
+        except (KeyError, TypeError, ValueError):
+            # A legacy/invalid audit field cannot invent a displayed policy.
+            bankroll_lines = []
     phase = "EM DIRETO confirmado" if record["stage"] == "LIVE_CONFIRMADO" else record["stage"]
     live_lines = []
     if record["stage"] == "LIVE_CONFIRMADO":
@@ -793,6 +934,7 @@ def format_open_message(conn, trade_id, odds_poly=None, odds_sx=None,
         "",
         "ℹ️ Odds indicadas: melhor nível de compra REST, NÃO execução confirmada.",
         f"💶 Total aplicado: {eur(record['poly_debit_cents'] + record['sx_debit_cents'])}",
+        *bankroll_lines,
         "💰 SALDOS (antes → depois)",
         f"Carteira Polymarket: {eur(balances['poly'] + record['poly_debit_cents'])} → {eur(balances['poly'])}",
         f"Carteira SX Bet: {eur(balances['sx'] + record['sx_debit_cents'])} → {eur(balances['sx'])}",
@@ -906,8 +1048,10 @@ def send_open_once(conn, trade_id, now_epoch=None, retry_seconds=60):
     """
     now_epoch = int(time.time() if now_epoch is None else now_epoch)
     row = conn.execute("""
-        SELECT message, sent_epoch, last_attempt_epoch
-        FROM paper_v12_open_notifications WHERE trade_id=?
+        SELECT n.message, n.sent_epoch, n.last_attempt_epoch
+        FROM paper_v12_open_notifications n
+        JOIN paper_v12_trades t ON t.id=n.trade_id
+        WHERE n.trade_id=? AND t.status IN ('OPEN_CONDITIONAL','REVIEW_REQUIRED','SETTLED')
     """, (int(trade_id),)).fetchone()
     if row is None:
         return False  # operação antiga ou teste sem snapshot de odds
@@ -923,6 +1067,9 @@ def send_open_once(conn, trade_id, now_epoch=None, retry_seconds=60):
             SET attempts=attempts+1, last_attempt_epoch=?
             WHERE trade_id=? AND sent_epoch IS NULL
               AND (last_attempt_epoch IS NULL OR last_attempt_epoch<=?)
+              AND EXISTS(SELECT 1 FROM paper_v12_trades t
+                         WHERE t.id=paper_v12_open_notifications.trade_id
+                           AND t.status IN ('OPEN_CONDITIONAL','REVIEW_REQUIRED','SETTLED'))
         """, (now_epoch, int(trade_id), now_epoch - retry_seconds)).rowcount
     if claimed != 1:
         return False
@@ -1001,7 +1148,9 @@ def send_settlement_once(conn, trade_id, now_epoch=None, retry_seconds=60):
         claimed = conn.execute(
             "UPDATE paper_v12_settlement_notifications SET attempts=attempts+1,last_attempt_epoch=? "
             "WHERE trade_id=? AND sent_epoch IS NULL "
-            "AND (last_attempt_epoch IS NULL OR last_attempt_epoch<=?)",
+            "AND (last_attempt_epoch IS NULL OR last_attempt_epoch<=?) "
+            "AND EXISTS(SELECT 1 FROM paper_v12_trades t "
+            "WHERE t.id=paper_v12_settlement_notifications.trade_id AND t.status='SETTLED')",
             (now_epoch, int(trade_id), now_epoch - retry_seconds),
         ).rowcount
     if claimed != 1:
@@ -1179,7 +1328,10 @@ def try_paper_entry(conn, pair, poly_levels, sx_levels, fx, stage, skew,
     if conn.execute("SELECT 1 FROM paper_v12_trades WHERE event_key=?", (eid,)).fetchone():
         return None
     free = free_balances(conn)
-    quote = select_shadow_quote(poly_levels, sx_levels, fx, free["poly"], free["sx"])
+    quote = select_shadow_quote(
+        poly_levels, sx_levels, fx, free["poly"], free["sx"],
+        allocation=allocation_budget(conn),
+    )
     if not quote:
         return None
     # Best asks na 2.ª leitura REST: não confundir com odd média garantida
@@ -1199,7 +1351,7 @@ def self_test():
     import tempfile
 
     # Um livro sintético com ROI entre 0,5 e 1,5% tem de passar SOMENTE
-    # no piloto, continuando a aplicar taxa, buffer e limite de 100 EUR.
+    # no piloto, continuando a aplicar taxa, buffer e orçamento proporcional.
     global MIN_NET_ROI
     saved_min = MIN_NET_ROI
     try:
@@ -1209,7 +1361,9 @@ def self_test():
             100_000, 100_000,
         )
         assert pilot is not None and 0.005 <= pilot.roi < 0.015, pilot
-        assert pilot.total_cents <= MAX_TRADE_CENTS
+        assert pilot.total_cents <= bankroll.budget_for_entry(
+            {"poly": 100_000, "sx": 100_000}, {"poly": 0, "sx": 0}
+        ).total_cap_cents
         MIN_NET_ROI = 0.015
         assert select_shadow_quote(
             [(0.45, 300)], [(0.516, 300)], 0.91,
@@ -1224,7 +1378,7 @@ def self_test():
     ) is None
 
     q = select_shadow_quote([(0.43, 300)], [(0.50, 300)], 0.91, 100_000, 100_000)
-    assert q and q.total_cents <= 10_000 and q.profit_eur > 0
+    assert q and q.total_cents <= 40_000 and q.profit_eur > 0
     assert q.total_eur >= 5 and q.roi >= MIN_NET_ROI
     assert select_shadow_quote([(0.55, 300)], [(0.55, 300)], 0.91, 100_000, 100_000) is None
     assert select_shadow_quote([(0.43, 0.1)], [(0.50, 300)], 0.91, 100_000, 100_000) is None
@@ -1331,7 +1485,7 @@ def self_test():
         assert "Paga a carteira: SX BET" in text_result
         assert "SALDOS (antes → depois)" in text_result
         db.close()
-    print("✅ PAPER V12 | matemática, carteiras, limite 100€, duplicados e liquidação OK")
+    print("✅ PAPER | matemática, carteiras, banca proporcional, duplicados e liquidação OK")
 
 
 def cli():

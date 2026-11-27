@@ -57,7 +57,9 @@ def main():
                 assert first["priced"] == 1, first
                 stats = paper.paper_summary(paper_db)
                 assert stats["open_trades"] == 1, stats
-                assert 0 < stats["exposure_eur"] <= 100, stats
+                assert 0 < stats["exposure_eur"] <= 400, stats
+                assert stats["poly_free_eur"] >= 300
+                assert stats["sx_free_eur"] >= 300
                 assert stats["poly_free_eur"] < 1000
                 assert stats["sx_free_eur"] < 1000
                 assert any("APOSTA VIRTUAL" in msg for msg in sent), sent
@@ -214,7 +216,7 @@ def main():
         paper.send_telegram_notice = original_notice
         monitor.bot.FX = original_fx
 
-    print("✅ PAPER V12 integrado: preços, duas carteiras, 100€, dedup, Telegram, exceções OK")
+    print("✅ PAPER integrado: preços, duas carteiras, banca proporcional, dedup, Telegram, exceções OK")
 
 
 if __name__ == "__main__":
