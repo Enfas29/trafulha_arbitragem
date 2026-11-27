@@ -10,16 +10,16 @@ from poly_ws_v12 import PolyBookHints
 class CoverageTests(unittest.TestCase):
     def test_current_catalogue_fits_both_feeds(self):
         sx, poly = SXBookHints(key="test"), PolyBookHints()
-        sx.update(f"market-{i}" for i in range(45))
-        poly.update(f"asset-{i}" for i in range(90))
-        self.assertEqual(len(sx.watched), 45)
-        self.assertEqual(len(poly.assets), 90)
+        sx.update(f"market-{i}" for i in range(200))
+        poly.update(f"asset-{i}" for i in range(400))
+        self.assertEqual(len(sx.watched), 200)
+        self.assertEqual(len(poly.assets), 400)
         self.assertEqual(sx.coverage()["omitted"], 0)
         self.assertEqual(poly.coverage()["omitted"], 0)
-        sx.signal("market-44")
-        poly.mark("asset-89")
-        self.assertEqual(set(sx.take_events()), {"market-44"})
-        self.assertEqual(set(poly.take_events()), {"asset-89"})
+        sx.signal("market-199")
+        poly.mark("asset-399")
+        self.assertEqual(set(sx.take_events()), {"market-199"})
+        self.assertEqual(set(poly.take_events()), {"asset-399"})
 
     def test_catalogue_order_changes_do_not_force_reconnections(self):
         sx, poly = SXBookHints(key="test"), PolyBookHints()

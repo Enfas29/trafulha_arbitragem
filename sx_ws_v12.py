@@ -19,7 +19,7 @@ SX_WS = "wss://realtime.sx.bet/connection/websocket"
 SX_TOKEN_URL = "https://api.sx.bet/user/realtime-token-v3/api-key"
 # SX documents 512 channels/connection; leave ample headroom by default.
 # https://docs.sx.bet/developers/realtime-reference
-MAX_WATCHED = read_limit("MONITOR_SX_WS_MARKETS", 128, 512)
+MAX_WATCHED = read_limit("MONITOR_SX_WS_MARKETS", 256, 512)
 
 
 def make_subscription_handler(base_class, market_hash, on_book):

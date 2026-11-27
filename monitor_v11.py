@@ -1,4 +1,4 @@
-"""Trafulha V15 — custos verificados, decisões auditáveis e leituras paralelas.
+"""Trafulha V16 — futebol e hóquei com contratos explícitos na simulação.
 
 Nunca executa apostas reais. As operações Paper são hipóteses contabilísticas;
 os resultados dependem de confirmação oficial em ambas as plataformas.
@@ -40,9 +40,10 @@ from paper_reset_v14 import apply_requested_reset
 from parallel_books_v15 import ParallelBooks
 from market_costs_v15 import FeeProvider, FeeContext
 import decision_audit_v15 as decision_audit
+import market_contracts_v16 as contracts
 
 LOG = logging.getLogger("monitor_v11")
-APP_VERSION = "15.0.0"
+APP_VERSION = "16.0.0"
 CATALOG_GAMES = None
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -100,7 +101,7 @@ PAPER_RESULTS_ENABLED = os.getenv("PAPER_RESULTS_ENABLED", "1").strip().lower() 
 
 # Continua a usar os filtros conservadores de winner/moneyline do V11.
 bot.MAX_POLY_SERIES = min(120, max(10, int(os.getenv("MONITOR_POLY_SERIES", "60"))))
-bot.MAX_SX_PAGES = min(30, max(1, int(os.getenv("MONITOR_SX_PAGES", "12"))))
+bot.MAX_SX_PAGES = min(50, max(1, int(os.getenv("MONITOR_SX_PAGES", "30"))))
 bot.MAX_EVENTS_PER_SERIES = 150
 
 
@@ -628,6 +629,24 @@ def attempt_paper_entry(pair, poly_levels, sx_levels, t_poly, t_sx, fx,
     def discard():
         if live_candidates is not None:
             live_candidates.discard(pair["key"])
+
+    if pair["sx"]["sport"] in paper.CONTRACT_SPORTS:
+        if not contracts.validate_pair_contract(pair):
+            _audit_failure(audit, "contrato_nao_validado")
+            discard()
+            return None, "contrato_nao_validado"
+        fixture = paper.contract_fixture_key(pair)
+        if fixture is None:
+            _audit_failure(audit, "contrato_nao_validado")
+            discard()
+            return None, "contrato_nao_validado"
+        if paper_conn.execute("SELECT 1 FROM paper_v12_trades WHERE fixture_key=? AND status<>'RESET_ARCHIVED'",
+                              (fixture,)).fetchone():
+            _audit_failure(audit, "jogo_ja_registado")
+            discard()
+            return None, "jogo_ja_registado"
+        if audit is not None:
+            audit["contract_scope"] = pair["settlement_contract"].get("scope")
 
     existing = paper_conn.execute(
         "SELECT 1 FROM paper_v12_trades WHERE event_key=?",
@@ -1368,6 +1387,7 @@ def main(once=False):
     scheduler = ReactiveScheduler(
         max_hot_burst=WS_PRIORITY_MAX, normal_interval=INTERVAL / MAX_PAIRS,
         min_key_interval=WS_KEY_INTERVAL, ttl_seconds=WS_EVENT_TTL,
+        max_pending=512,
     )
     ws_feed = sx_hints.SXBookHints() if SX_WS_V12_ENABLED else None
     if ws_feed is not None and not ws_feed.start():
@@ -1423,7 +1443,7 @@ def main(once=False):
             )
             result_worker.start()
     LOG.info(
-        "REACTIVE V15 | até %d pares em leitura paralela; carteira num único escritor; "
+        "REACTIVE V16 | até %d pares em leitura paralela; carteira num único escritor; "
         "REST fresco nas duas fontes e recheck de 250ms preservados", BOOK_READ_WORKERS
     )
     LOG.info(

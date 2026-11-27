@@ -6,6 +6,8 @@ https://docs.polymarket.com/api-reference/markets/get-market-by-id
 https://docs.polymarket.com/market-data/market-details (version selects IDs)
 https://data-api.polymarket.com/v2/openapi.json (TokenRef: on-chain payout)
 https://docs.sx.bet/api-reference/get-markets-find
+https://docs.sx.bet/api-reference/get-fixture-status
+https://docs.sx.bet/api-reference/fixture-statuses
 https://github.com/sx-bet/sx-bet-api-docs/blob/main/source/includes/_markets.md
 
 SX outcome: 0=void, 1=outcomeOneName, 2=outcomeTwoName; reportedDate is
@@ -22,10 +24,12 @@ import time
 from urllib.parse import quote
 
 import paper_v12 as paper
+import market_contracts_v16 as contracts
 
 GAMMA = "https://gamma-api.polymarket.com/markets/"
 POLY_TOKENS = "https://data-api.polymarket.com/v2/tokens"
 SX_MARKETS = "https://api.sx.bet/markets/find"
+SX_FIXTURES = "https://api.sx.bet/fixture/status"
 MAX_PASS_SECONDS = 45.0
 REQUEST_TIMEOUT = 4.0
 RECHECK_SECONDS = 60
@@ -35,6 +39,10 @@ _DECIMAL_ID = re.compile(r"[0-9]+\Z")
 
 class PendingResult(Exception):
     """A source is missing or has not published a final result yet."""
+
+    def __init__(self, reason, evidence=None):
+        super().__init__(reason)
+        self.evidence = evidence
 
 
 class ReviewResult(Exception):
@@ -47,6 +55,67 @@ class ReviewResult(Exception):
 
 class PassDeadline(Exception):
     pass
+
+
+def _record_contract(record):
+    """Return the immutable opening contract, or preserve a legacy record.
+
+    Soccer/hockey can only have been opened with a V16 certificate. A missing
+    or malformed certificate therefore requires review, never legacy fallback.
+    """
+    raw = record.get("contract_evidence_json")
+    if raw is None and record.get("sport") not in {"soccer", "hockey"}:
+        return None
+    if not contracts.validate_record_contract(record):
+        raise ReviewResult("settlement_contract_invalid")
+    return json.loads(raw)
+
+
+def _changed_contract_evidence(contract, source, raw, source_url, now):
+    """Retain the changed rules/identity for review, alongside the frozen proof."""
+    fields = contracts.POLY_FIELDS if source == "poly" else contracts.SX_FIELDS
+    return {
+        "source_url": source_url, "observed_epoch": now, "resolved": False,
+        "reason": source + "_settlement_contract_changed",
+        "expected_source_fingerprint": contract[source]["source_fingerprint"],
+        "observed_source_fields": {key: raw.get(key) for key in fields},
+    }
+
+
+def _finished_fixture(contract, fetch, now):
+    """Require a normally finished fixture for V16's normal-result contract.
+
+    Official payouts can also follow an abandoned or awarded match. Check the
+    fixture on each pass, even before a payout exists, so an observed exception
+    is preserved as REVIEW_REQUIRED and cannot later become an automatic win.
+    """
+    event_id = contract["sx"]["event_id"]
+    evidence = {"source_url": SX_FIXTURES, "event_id": event_id,
+                "observed_epoch": now, "status": None}
+    response = fetch(SX_FIXTURES, {"sportXEventIds": event_id})
+    if not isinstance(response, dict) or response.get("status") != "success":
+        raise PendingResult("sx_fixture_response_unavailable", evidence)
+    data = response.get("data")
+    fixture = data.get(event_id) if isinstance(data, dict) else None
+    if not isinstance(fixture, dict):
+        raise PendingResult("sx_fixture_unavailable", evidence)
+    status = fixture.get("status")
+    evidence["status"] = status
+    if "sportXeventId" in fixture:
+        evidence["reported_event_id"] = fixture["sportXeventId"]
+        if fixture["sportXeventId"] != event_id:
+            raise ReviewResult("sx_fixture_event_mismatch", evidence)
+    labels = {1: "not_started", 2: "in_progress", 3: "finished",
+              4: "cancelled", 5: "postponed", 6: "interrupted",
+              7: "abandoned", 8: "coverage_lost", 9: "about_to_start"}
+    if type(status) is not int or status not in labels:
+        raise PendingResult("sx_fixture_status_unavailable", evidence)
+    evidence["status_label"] = labels[status]
+    if status in (4, 5, 6, 7):
+        raise ReviewResult("sx_fixture_exception_" + labels[status], evidence)
+    if status != 3:
+        raise PendingResult("sx_fixture_not_finished:" + labels[status], evidence)
+    return evidence
 
 
 def _array(value):
@@ -112,6 +181,7 @@ def _unique_match(rows, key, value, *, hash_key=False):
 
 
 def _poly_result(record, fetch, now):
+    contract = _record_contract(record)
     market_id = _decimal_id(record["poly_market"])
     metadata_url = GAMMA + quote(market_id, safe="")
     metadata = fetch(metadata_url)
@@ -119,6 +189,10 @@ def _poly_result(record, fetch, now):
         raise PendingResult("poly_gamma_metadata_unavailable")
     if str(_required(metadata, "id")) != market_id:
         raise ReviewResult("poly_gamma_market_mismatch")
+    if contract is not None and not contracts.verify_poly_source(contract, metadata):
+        raise ReviewResult("poly_settlement_contract_changed",
+                           _changed_contract_evidence(contract, "poly", metadata,
+                                                      metadata_url, now))
     condition = _hash(_required(metadata, "conditionId"))
     labels = [_source_label(x) for x in _array(metadata.get("outcomes"))]
     version = metadata.get("version")
@@ -188,12 +262,17 @@ def _poly_result(record, fetch, now):
 
 
 def _sx_result(record, fetch, now):
+    contract = _record_contract(record)
     market_hash = _hash(record["sx_market"])
     response = fetch(SX_MARKETS, {"marketHashes": market_hash})
     if not isinstance(response, dict) or response.get("status") != "success":
         raise PendingResult("sx_response_not_success")
     market = _unique_match(response.get("data"), "marketHash", market_hash,
                            hash_key=True)
+    if contract is not None and not contracts.verify_sx_source(contract, market):
+        raise ReviewResult("sx_settlement_contract_changed",
+                           _changed_contract_evidence(contract, "sx", market,
+                                                      SX_MARKETS, now))
     labels = [_source_label(market.get("outcomeOneName")),
               _source_label(market.get("outcomeTwoName"))]
     selected_label = _label(record["sx_side"])
@@ -342,14 +421,21 @@ def run_settlement_pass(conn, get_json=None, now_epoch=None, limit=10):
         evidence = {"method": "official_api", "observed_epoch": now}
         verdict, reason = "pending", "awaiting_both_official_results"
         recovered = {}
+        evidence_name = None
         try:
+            contract = _record_contract(record)
+            if contract is not None:
+                evidence["contract_digest"] = contract["digest"]
+                evidence_name = "fixture"
+                evidence["fixture"] = _finished_fixture(contract, fetch, now)
             for name, resolver in (("poly", _poly_result), ("sx", _sx_result)):
+                evidence_name = name
                 try:
                     source_evidence, recovered_id = resolver(record, fetch, now)
                     evidence[name] = source_evidence
                     recovered[name] = recovered_id
                 except PendingResult as exc:
-                    evidence[name] = {"resolved": False, "reason": str(exc)}
+                    evidence[name] = exc.evidence or {"resolved": False, "reason": str(exc)}
             # Legacy identifiers are restored only from exact, unique metadata.
             with conn:
                 if "poly" in recovered and record.get("poly_token_id") in (None, ""):
@@ -362,6 +448,9 @@ def run_settlement_pass(conn, get_json=None, now_epoch=None, limit=10):
                                  "WHERE id=? AND status='OPEN_CONDITIONAL' AND sx_outcome_one IS NULL",
                                  (recovered["sx"], trade_id))
             if all(evidence.get(name, {}).get("resolved") is True for name in ("poly", "sx")):
+                if (contract is not None
+                        and evidence["poly"]["won"] == evidence["sx"]["won"]):
+                    raise ReviewResult("contract_results_not_complementary")
                 _save_check(conn, trade_id, now, "verified", "both_official_results", evidence)
                 value = paper.settle_verified_outcomes(
                     conn, trade_id, evidence["poly"]["won"], evidence["sx"]["won"],
@@ -375,13 +464,17 @@ def run_settlement_pass(conn, get_json=None, now_epoch=None, limit=10):
                 continue
         except ReviewResult as exc:
             verdict, reason = "review", str(exc)
-            if exc.evidence is not None:
-                evidence[name] = exc.evidence
+            if exc.evidence is not None and evidence_name is not None:
+                evidence[evidence_name] = exc.evidence
             with conn:
                 conn.execute("UPDATE paper_v12_trades SET status='REVIEW_REQUIRED',note=? "
                              "WHERE id=? AND status='OPEN_CONDITIONAL'",
                              ("Resultados oficiais: " + reason, trade_id))
             counts["review"] += 1
+        except PendingResult as exc:
+            reason = str(exc)
+            if exc.evidence is not None and evidence_name is not None:
+                evidence[evidence_name] = exc.evidence
         except PassDeadline:
             counts["pending"] += 1
             _save_check(conn, trade_id, now, "pending", "pass_time_budget", evidence)

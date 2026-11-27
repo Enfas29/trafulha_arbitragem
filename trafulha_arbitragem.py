@@ -27,6 +27,8 @@ from urllib.parse import quote
 
 import requests
 
+import market_contracts_v16 as contracts
+
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
 POLY_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -61,20 +63,21 @@ POLY_MAX_REQUESTS_PER_REFRESH = min(400, max(10, int(
 )))
 DISCOVERY_STATS = {}
 _POLY_SERIES_CURSOR = 0
+_POLY_SERIES_OFFSETS = {}
 _MATCHED_POLY_SERIES = set()
 MAX_PAIRS_PER_SCAN = 25       # controla requests; aumenta gradualmente
 MAX_LIVE_AGE_H = 8
 MAX_FUTURE_H = 168            # jogos nos próximos 7 dias
 MAX_START_DIFF_H = 3
+# New explicit contracts must also satisfy the ledger's 30-minute identity gate.
+MAX_EXPLICIT_START_DIFF_S = 1800
 MAX_SNAPSHOT_GAP_S = 6
 DB_FILE = os.getenv("PAPER_DB", "paper_v11.sqlite3")
 
-# Só mercados binários de vencedor, nunca spreads/totais ou 1X2 com empate.
-# Tipo 52 = 12; tipo 226 = 12 incluindo prolongamento.
-ALLOWED_SX_TYPES = {52, 226}
-# Futebol e hóquei podem ter empate/regras diferentes: excluir até validar
-# contratos de liquidação nos dois lados. Continua a descobri-los nos catálogos.
-EXCLUDED_SETTLEMENT_SPORTS = {"soccer", "hockey"}
+# V16 also accepts a verified soccer proposition (SX type 1), not a bare
+# two-team 1X2 comparison. Hockey requires an explicit full-game contract.
+ALLOWED_SX_TYPES = {1, 52, 226}
+EXPLICIT_CONTRACT_SPORTS = {"soccer", "hockey"}
 
 LOG = logging.getLogger("paper_v11")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -182,6 +185,38 @@ def same_team(a, b):
     return len(small) == 1 and len(small[0]) >= 5 and small[0] == large[-1]
 
 
+# Only the NHL fixture matcher may use these six explicit short names.
+# Official club list checked 2026-11-27: https://www.nhl.com/info/teams/
+# Gamma's NHL event titles use the short names; SX uses the full club names.
+NHL_TEAM_ALIASES = {
+    "red wings": "detroit red wings",
+    "blue jackets": "columbus blue jackets",
+    "golden knights": "vegas golden knights",
+    "maple leafs": "toronto maple leafs",
+    "jets": "winnipeg jets",
+    "wild": "minnesota wild",
+}
+
+
+def _pair_team_matcher(sx_market):
+    """NHL aliases need both hockey and the frozen official NHL league label."""
+    contract = sx_market.get("contract")
+    source = contract.get("source_fields") if isinstance(contract, dict) else None
+    source = source if isinstance(source, dict) else {}
+    if (sx_market.get("sport") != "hockey"
+            or ascii_name(sx_market.get("league")) != "nhl"
+            or ascii_name(source.get("leagueLabel")) != "nhl"):
+        return same_team
+
+    def match_nhl(a, b):
+        if same_team(a, b):
+            return True
+        a, b = comparable(a), comparable(b)
+        return bool(a and b) and NHL_TEAM_ALIASES.get(a, a) == NHL_TEAM_ALIASES.get(b, b)
+
+    return match_nhl
+
+
 def parse_title(title):
     # Ex.: "NBA: Lakers vs Celtics", "Player A @ Player B"
     text = str(title).split(":", 1)[-1].strip()
@@ -225,6 +260,34 @@ def sport_family(label):
             return family
     # 'football' isolado é ambíguo; depende do sportId ou da liga.
     return name
+
+
+def poly_sport_family(metadata):
+    """Use Gamma's category tags instead of guessing an unfamiliar league.
+
+    /sports identifies Soccer with tag 100350 and Hockey with tag 100088;
+    individual /events responses expose the same IDs with their labels.
+    NHL's legacy sports row has its own tag, so its known code remains valid.
+    Conflicting category tags are not silently resolved to either sport.
+    """
+    raw = metadata.get("tags", "")
+    if isinstance(raw, list):
+        tags = {str(item.get("id")) if isinstance(item, dict) else str(item)
+                for item in raw}
+    else:
+        tags = set(re.findall(r"\d+", str(raw)))
+    tagged = {family for tag, family in (("100350", "soccer"),
+                                        ("100088", "hockey")) if tag in tags}
+    if len(tagged) > 1:
+        return "unknown"
+    if tagged:
+        return tagged.pop()
+    family = sport_family(metadata.get("sport"))
+    if family in {"basketball", "american_football", "tennis", "baseball",
+                  "cricket", "combat", "esports", "soccer", "hockey"}:
+        return family
+    named = sport_family(metadata.get("name"))
+    return named if named != "unknown" else family
 
 
 SX_SPORTS_BY_ID = None
@@ -327,11 +390,14 @@ def _select_poly_series(series):
 
     This is metadata selection, never a cache of old quotes or old markets.
     All returned markets are fetched anew in the current discovery pass.
+    Free slots are shared across sports before taking a second league from
+    any sport, so a large soccer catalogue cannot hide every hockey league.
     """
     global _POLY_SERIES_CURSOR
     priorities = {
         "basketball": 0, "american_football": 1, "tennis": 2,
-        "baseball": 3, "cricket": 4, "combat": 5, "esports": 6,
+        "soccer": 3, "hockey": 4,
+        "baseball": 5, "cricket": 6, "combat": 7, "esports": 8,
     }
     eligible = sorted(
         ((sid, sport) for sid, sport in series.items() if sport in priorities),
@@ -345,9 +411,31 @@ def _select_poly_series(series):
     anchored = {sid for sid, _ in anchors}
     rotating = [item for item in eligible if item[0] not in anchored]
     count = min(max(0, limit - len(anchors)), len(rotating))
-    offset = _POLY_SERIES_CURSOR % len(rotating) if rotating else 0
-    chosen = [rotating[(offset + i) % len(rotating)] for i in range(count)]
-    _POLY_SERIES_CURSOR = (offset + count) % len(rotating) if rotating else 0
+    if _POLY_SERIES_CURSOR == 0:
+        _POLY_SERIES_OFFSETS.clear()
+    by_sport = {}
+    for item in rotating:
+        by_sport.setdefault(item[1], []).append(item)
+    families = list(by_sport)
+    if families:
+        # Rotate the sport order too: even a budget smaller than the number
+        # of supported sports must eventually visit every family.
+        offset = _POLY_SERIES_CURSOR % len(families)
+        families = families[offset:] + families[:offset]
+    quotas = Counter()
+    while sum(quotas.values()) < count:
+        for family in families:
+            if quotas[family] < len(by_sport[family]):
+                quotas[family] += 1
+                if sum(quotas.values()) == count:
+                    break
+    chosen = []
+    for family in families:
+        items = by_sport[family]
+        offset = _POLY_SERIES_OFFSETS.get(family, 0) % len(items)
+        chosen.extend(items[(offset + i) % len(items)] for i in range(quotas[family]))
+        _POLY_SERIES_OFFSETS[family] = (offset + quotas[family]) % len(items)
+    _POLY_SERIES_CURSOR += 1
     return anchors + chosen, len(eligible)
 
 
@@ -372,18 +460,34 @@ def _poly_markets_from_event(event, family, sid, fetched_epoch, counts):
         if len(outs) != 2 or len(ids) != 2:
             counts["invalid_outcomes_or_assets"] += 1
             continue
-        if {ascii_name(x) for x in outs} == {"yes", "no"}:
-            counts["yes_no_not_equivalent"] += 1
-            continue
-        if not ((same_team(outs[0], teams[0]) and same_team(outs[1], teams[1]))
-                or (same_team(outs[1], teams[0]) and same_team(outs[0], teams[1]))):
-            counts["outcomes_not_participants"] += 1
-            continue
-        start = unix_time(m.get("gameStartTime") or event.get("startTime") or event.get("gameStartTime"))
-        if not start or m.get("id") is None:
-            counts["missing_start_or_id"] += 1
-            continue
-        result.append({
+        contract = None
+        if family in EXPLICIT_CONTRACT_SPORTS:
+            start = unix_time(m.get("gameStartTime") or event.get("startTime") or event.get("gameStartTime"))
+            if not start or m.get("id") is None:
+                counts["missing_start_or_id"] += 1
+                continue
+            if not (fetched_epoch - MAX_LIVE_AGE_H * 3600 <= start
+                    <= fetched_epoch + MAX_FUTURE_H * 3600):
+                counts["outside_discovery_window"] += 1
+                continue
+            try:
+                contract = contracts.classify_poly_market(m, event, family, teams, same_team)
+            except contracts.ContractError as exc:
+                counts[exc.reason] += 1
+                continue
+        else:
+            if {ascii_name(x) for x in outs} == {"yes", "no"}:
+                counts["yes_no_not_equivalent"] += 1
+                continue
+            if not ((same_team(outs[0], teams[0]) and same_team(outs[1], teams[1]))
+                    or (same_team(outs[1], teams[0]) and same_team(outs[0], teams[1]))):
+                counts["outcomes_not_participants"] += 1
+                continue
+            start = unix_time(m.get("gameStartTime") or event.get("startTime") or event.get("gameStartTime"))
+            if not start or m.get("id") is None:
+                counts["missing_start_or_id"] += 1
+                continue
+        normalized = {
             "id": str(m["id"]), "sport": family, "teams": teams,
             "event_id": str(event["id"]) if event.get("id") is not None else None,
             "event_live": event.get("live") is True,
@@ -397,7 +501,16 @@ def _poly_markets_from_event(event, family, sid, fetched_epoch, counts):
             "feesEnabled": m.get("feesEnabled"),
             "feeSchedule": m.get("feeSchedule"),
             "fees_fetched_epoch": fetched_epoch,
-        })
+        }
+        if contract is not None:
+            normalized.update(
+                contract=contract, question=m.get("question"),
+                description=m.get("description"),
+                resolutionSource=m.get("resolutionSource"),
+                groupItemTitle=m.get("groupItemTitle"),
+                negRisk=m.get("negRisk"), negRiskMarketID=m.get("negRiskMarketID"),
+            )
+        result.append(normalized)
     return result
 
 
@@ -416,7 +529,7 @@ def discover_poly():
     for row in metadata:
         if not isinstance(row, dict):
             continue
-        family = sport_family(row.get("sport") or row.get("name"))
+        family = poly_sport_family(row)
         for sid in re.findall(r"\d+", str(row.get("series", ""))):
             series[sid] = family
     selected, eligible_count = _select_poly_series(series)
@@ -427,16 +540,30 @@ def discover_poly():
     result, seen_events, seen_markets = [], set(), set()
     truncated_series, complete_series, failed_series = set(), set(), set()
     requests = 0
+    discovery_epoch = time.time()
     # Breadth-first: every selected series gets a first page before a busy
     # series can consume the entire budget with its following pages.
     while queue and requests < POLY_MAX_REQUESTS_PER_REFRESH:
         sid, family, offset, page_index = queue.popleft()
         requests += 1
         try:
-            events = get_json(POLY_GAMMA + "/events", {
+            params = {
                 "active": "true", "closed": "false", "series_id": sid,
                 "limit": MAX_EVENTS_PER_SERIES, "offset": offset,
-            })
+            }
+            if family in EXPLICIT_CONTRACT_SPORTS:
+                # Gamma documents end_date_min/max. startDate is not kickoff:
+                # do not filter on it. A 48h margin tolerates end-date shifts;
+                # the market's gameStartTime is still checked locally.
+                params.update(
+                    end_date_min=datetime.fromtimestamp(
+                        discovery_epoch - max(48, MAX_LIVE_AGE_H) * 3600,
+                        timezone.utc).isoformat(),
+                    end_date_max=datetime.fromtimestamp(
+                        discovery_epoch + (MAX_FUTURE_H + 48) * 3600,
+                        timezone.utc).isoformat(),
+                )
+            events = get_json(POLY_GAMMA + "/events", params)
             if not isinstance(events, list):
                 raise ValueError("Gamma events response invalid")
         except Exception as exc:
@@ -477,11 +604,13 @@ def discover_poly():
     stats.update(
         series_known=len(series), series_compatible=eligible_count,
         series_selected=len(selected), series_not_selected=eligible_count - len(selected),
+        series_selected_by_sport=dict(Counter(family for _, family in selected)),
         series_skipped_unsupported=len(series) - eligible_count,
         series_complete=len(complete_series), series_truncated=len(truncated_series),
         series_failed=len(failed_series), requests=requests,
         request_budget=POLY_MAX_REQUESTS_PER_REFRESH,
-        markets=len(result), complete=(not failed_series and not truncated_series
+        markets=len(result), markets_by_sport=dict(Counter(p["sport"] for p in result)),
+        complete=(not failed_series and not truncated_series
                                       and len(selected) == eligible_count),
     )
     _discovery_stats("poly", stats)
@@ -498,9 +627,10 @@ def discover_sx():
     seen_markets, used_keys = set(), set()
     counts = Counter()
     complete = False
+    discovery_epoch = time.time()
     try:
         for _ in range(MAX_SX_PAGES):
-            params = {"type": "52,226", "pageSize": 100, "onlyMainLine": "true"}
+            params = {"type": "1,52,226", "pageSize": 100, "onlyMainLine": "true"}
             if page_key:
                 params["paginationKey"] = page_key
             response = get_json(SX_API + "/markets/active", params)
@@ -525,15 +655,35 @@ def discover_sx():
                     counts["missing_game_time"] += 1
                     continue
                 seen_markets.add(m["marketHash"])
-                all_markets.append({
+                family = sx_sport_family(m)
+                teams = (m["teamOneName"], m["teamTwoName"])
+                contract = None
+                if family in EXPLICIT_CONTRACT_SPORTS:
+                    if not (discovery_epoch - MAX_LIVE_AGE_H * 3600 <= game
+                            <= discovery_epoch + MAX_FUTURE_H * 3600):
+                        counts["outside_discovery_window"] += 1
+                        continue
+                    try:
+                        contract = contracts.classify_sx_market(m, family, teams, same_team)
+                    except contracts.ContractError as exc:
+                        counts[exc.reason] += 1
+                        continue
+                elif m["type"] == 1:
+                    counts["unsupported_sx_proposition_sport"] += 1
+                    continue
+                normalized = {
                     "hash": m["marketHash"], "teams": (m["teamOneName"], m["teamTwoName"]),
                     "outcomes": (m.get("outcomeOneName", ""), m.get("outcomeTwoName", "")),
-                    "start": game, "sport": sx_sport_family(m),
+                    "start": game, "sport": family,
                     "type": m["type"], "league": m.get("leagueLabel", ""),
                     "event_id": m.get("sportXeventId"),
                     "sport_id": m.get("sportId"), "league_id": m.get("leagueId"),
                     "live_enabled": m.get("liveEnabled") is True,
-                })
+                }
+                if contract is not None:
+                    normalized.update(contract=contract,
+                                      outcomeVoidName=m.get("outcomeVoidName"))
+                all_markets.append(normalized)
             page_key = data.get("nextKey")
             if not page_key:
                 complete = True
@@ -547,7 +697,8 @@ def discover_sx():
         raise
     _discovery_stats("sx", {**dict(counts), "complete": complete,
                            "truncated": not complete, "page_limit": MAX_SX_PAGES,
-                           "markets": len(all_markets)})
+                           "markets": len(all_markets),
+                           "markets_by_sport": dict(Counter(m["sport"] for m in all_markets))})
     if not complete:
         LOG.warning("SX DISCOVERY: limite de %d páginas; há nextKey por consultar", MAX_SX_PAGES)
     LOG.info("SX Bet: %d mercados 2-way ativos", len(all_markets))
@@ -562,17 +713,21 @@ def pair_markets(poly, sx):
     for p in poly:
         by_sport.setdefault(p["sport"], []).append(p)
     for s in sx:
-        if s["sport"] in EXCLUDED_SETTLEMENT_SPORTS:
-            counts["excluded_settlement_sport"] += 1
-            continue
+        explicit_contract = s["sport"] in EXPLICIT_CONTRACT_SPORTS
+        match_team = _pair_team_matcher(s)
         a, b = s["teams"]
-        expected_type = 226 if s["sport"] in {"basketball", "american_football"} else 52
-        if s["type"] != expected_type:
-            counts["incompatible_sx_period_type"] += 1
-            continue
-        if not (same_team(s["outcomes"][0], a) and same_team(s["outcomes"][1], b)):
-            counts["sx_outcomes_not_participants"] += 1
-            continue
+        if explicit_contract:
+            if not isinstance(s.get("contract"), dict):
+                counts["sx_contract_unverified"] += 1
+                continue
+        else:
+            expected_type = 226 if s["sport"] in {"basketball", "american_football"} else 52
+            if s["type"] != expected_type:
+                counts["incompatible_sx_period_type"] += 1
+                continue
+            if not (same_team(s["outcomes"][0], a) and same_team(s["outcomes"][1], b)):
+                counts["sx_outcomes_not_participants"] += 1
+                continue
         same_sport = by_sport.get(s["sport"], [])
         if not same_sport:
             counts["no_poly_sport"] += 1
@@ -584,11 +739,73 @@ def pair_markets(poly, sx):
         named = []
         for p in same_start:
             x, y = p["teams"]
-            if ((same_team(a, x) and same_team(b, y)) or
-                    (same_team(a, y) and same_team(b, x))):
+            if ((match_team(a, x) and match_team(b, y)) or
+                    (match_team(a, y) and match_team(b, x))):
                 named.append(p)
         if not named:
             counts["no_poly_participant_match"] += 1
+            continue
+        if explicit_contract:
+            # Each proposition is binary, although soccer's state space also
+            # includes a draw. Only the contract module proves complements;
+            # No(home win) must never be replaced with away win.
+            candidates = []
+            for p in named:
+                if abs(p["start"] - s["start"]) > MAX_EXPLICIT_START_DIFF_S:
+                    counts["contract_start_difference_exceeds_30m"] += 1
+                    continue
+                if not isinstance(p.get("contract"), dict):
+                    counts["poly_contract_unverified"] += 1
+                    continue
+                team_mapping = {}
+                for poly_team_index, team in enumerate(p["teams"]):
+                    matches = [sx_team_index for sx_team_index, sx_team in enumerate(s["teams"])
+                               if match_team(team, sx_team)]
+                    if len(matches) == 1:
+                        team_mapping[poly_team_index] = matches[0]
+                if set(team_mapping) != {0, 1} or set(team_mapping.values()) != {0, 1}:
+                    counts["contract_participant_mapping_ambiguous"] += 1
+                    continue
+                selections, reasons = [], set()
+                for poly_index in (0, 1):
+                    for sx_target in (0, 1):
+                        try:
+                            proof = contracts.make_pair_contract(
+                                p, s, poly_index, sx_target, team_mapping)
+                        except contracts.ContractError as exc:
+                            reasons.add(exc.reason)
+                            continue
+                        selections.append((poly_index, sx_target, proof))
+                if selections:
+                    candidates.append((p, selections))
+                else:
+                    for reason in reasons:
+                        counts[reason] += 1
+            if len(candidates) != 1:
+                if candidates:
+                    counts["ambiguous_poly_markets"] += 1
+                continue
+            p, selections = candidates[0]
+            # A normal full-game binary complement has exactly two inverse
+            # selections. A malformed classifier must not create extra legs.
+            if (len(selections) != 2
+                    or {item[0] for item in selections} != {0, 1}
+                    or {item[1] for item in selections} != {0, 1}):
+                counts["contract_selections_not_binary"] += 1
+                continue
+            counts["matched_sx_market"] += 1
+            counts["matched_" + s["sport"]] += 1
+            if p.get("series_id"):
+                matched_series.add(str(p["series_id"]))
+            for poly_index, sx_target, proof in selections:
+                result.append({
+                    "poly": p, "sx": s,
+                    "poly_asset": p["assets"][poly_index],
+                    "poly_label": p["outcomes"][poly_index],
+                    "sx_target": sx_target, "sx_label": s["outcomes"][sx_target],
+                    "settlement_contract": proof,
+                    "key": f"{p['id']}:{s['hash']}:v16:{poly_index}:{sx_target}",
+                })
             continue
         candidates = []
         for p in named:
@@ -619,7 +836,8 @@ def pair_markets(poly, sx):
             counts["poly_outcomes_not_participants"] += 1
     _MATCHED_POLY_SERIES = matched_series
     stats = {**dict(counts), "poly_markets": len(poly), "sx_markets": len(sx),
-             "directions": len(result), "matched_series": len(matched_series)}
+             "directions": len(result), "matched_series": len(matched_series),
+             "directions_by_sport": dict(Counter(p["sx"]["sport"] for p in result))}
     DISCOVERY_STATS["matching"] = stats
     LOG.info("MATCHING_V15 | %s", json.dumps(stats, sort_keys=True, separators=(",", ":")))
     LOG.info("Matching confirmado por nome, desporto e hora: %d pares", len(result))

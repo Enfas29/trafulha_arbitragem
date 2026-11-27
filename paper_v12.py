@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 
 import bankroll_v14 as bankroll
 from market_costs_v15 import FeeContext
+import market_contracts_v16 as contracts
 
 INITIAL_CENTS = 100_000                 # 1.000 EUR em cada plataforma
 MIN_TRADE_CENTS = 500                  # mínimo de 5 EUR por operação
@@ -53,7 +54,9 @@ MAX_AUTO_PAPER_ROI = 0.10
 
 PAPER_DB = os.getenv("PAPER_V12_DB", "/data/paper_v12.sqlite3")
 ALLOWED_SPORTS = {"tennis", "basketball", "american_football",
-                  "baseball", "cricket", "esports", "combat"}
+                  "baseball", "cricket", "esports", "combat", "soccer", "hockey"}
+CONTRACT_SPORTS = frozenset({"soccer", "hockey"})
+MAX_CONTRACT_EVIDENCE_BYTES = 32_768
 # Observação: elegibilidade em paper não prova equivalência de liquidação.
 # Variável antiga mantida apenas para compatibilidade das configurações.
 # Nunca autoriza novas operações LIVE_NAO_CONFIRMADO.
@@ -62,7 +65,7 @@ PAPER_LIVE_ENABLED = os.getenv("PAPER_LIVE_ENABLED", "1").strip().lower() in {"1
 MAX_LIVE_EVIDENCE_SECONDS = 3.0
 MAX_ENTRY_EVIDENCE_BYTES = 8192
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 MIGRATION_RESERVE_BYTES = 32 * 1024 * 1024
 LOG = logging.getLogger("paper_v13")
 TRADE_COLUMNS_V13 = {
@@ -81,6 +84,8 @@ TRADE_COLUMNS_V13 = {
     "poly_net_payout_cents": "INTEGER",
     "sx_net_payout_cents": "INTEGER",
     "sx_payout_fee_cents": "INTEGER",
+    "contract_evidence_json": "TEXT",
+    "fixture_key": "TEXT",
 }
 
 
@@ -464,6 +469,9 @@ def open_database(path=PAPER_DB):
         for name, kind in TRADE_COLUMNS_V13.items():
             if name not in existing_columns:
                 conn.execute(f"ALTER TABLE paper_v12_trades ADD COLUMN {name} {kind}")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS paper_v16_fixture_once "
+                     "ON paper_v12_trades(fixture_key) WHERE fixture_key IS NOT NULL "
+                     "AND status<>'RESET_ARCHIVED'")
         for name in ("poly", "sx"):
             conn.execute(
                 "INSERT OR IGNORE INTO paper_v12_wallets(platform, free_cents) VALUES (?,?)",
@@ -517,6 +525,23 @@ def allocation_budget(conn):
         {"poly": free_poly, "sx": free_sx},
         {"poly": reserved_poly, "sx": reserved_sx},
     )
+
+
+def contract_fixture_key(pair):
+    """One virtual operation per new-sport fixture, across its propositions."""
+    sport = pair.get("sx", {}).get("sport")
+    if sport not in CONTRACT_SPORTS:
+        return None
+    if not contracts.validate_pair_contract(pair):
+        return None
+    value = pair["sx"].get("event_id")
+    if type(value) not in (str, int) or isinstance(value, bool):
+        return None
+    ident = str(value)
+    if (not ident or len(ident) > 256 or ident != ident.strip()
+            or any(ord(char) < 32 or ord(char) == 127 for char in ident)):
+        return None
+    return sport + ":sx:" + ident
 
 
 def event_key(pair):
@@ -583,6 +608,13 @@ def _live_evidence_valid(pair, evidence, valid_until_mono):
         return False
     if evidence.get("method") != "official_live_v1":
         return False
+    if pair.get("sx", {}).get("sport") in CONTRACT_SPORTS:
+        if (not contracts.validate_pair_contract(pair)
+                or evidence.get("contract_digest") != pair["settlement_contract"]["digest"]):
+            return False
+        if (pair["settlement_contract"]["scope"] == "soccer_regulation_90"
+                and not contracts.soccer_live_period_is_regulation(evidence.get("period"))):
+            return False
     try:
         identities = {
             "pair_key": pair["key"],
@@ -679,6 +711,9 @@ def _entry_guard_valid(pair, stage, valid_until_mono, live_evidence=None):
     ``None`` preserves pre-game legacy/manual fixtures. Confirmed live always
     requires official evidence and a monotonic final-book deadline.
     """
+    if (pair.get("sx", {}).get("sport") in CONTRACT_SPORTS
+            and not contracts.validate_pair_contract(pair)):
+        return False
     if stage == "LIVE_CONFIRMADO":
         return _live_evidence_valid(pair, live_evidence, valid_until_mono)
     if stage != "PRE_JOGO":
@@ -767,6 +802,23 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
     Não marca como REAL_EXECUTED nem como garantia de arbitragem.
     """
     evidence_json = None
+    contract_json = None
+    fixture = None
+    if pair.get("sx", {}).get("sport") in CONTRACT_SPORTS:
+        if not contracts.validate_pair_contract(pair):
+            return None
+        try:
+            contract_json = json.dumps(pair["settlement_contract"], ensure_ascii=False,
+                                       sort_keys=True, separators=(",", ":"), allow_nan=False)
+            if len(contract_json.encode("utf-8")) > MAX_CONTRACT_EVIDENCE_BYTES:
+                return None
+            # Freeze the exact certificate used by every in-transaction check.
+            pair = {**pair, "settlement_contract": json.loads(contract_json)}
+            fixture = contract_fixture_key(pair)
+            if fixture is None:
+                return None
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            return None
     if stage == "LIVE_CONFIRMADO":
         live_evidence, evidence_json = _freeze_live_evidence(live_evidence)
     if not _entry_guard_valid(pair, stage, valid_until_mono, live_evidence):
@@ -781,7 +833,8 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
         return None
     if pair["poly"].get("sport") != pair["sx"].get("sport"):
         return None
-    if str(pair["poly_label"]).strip().lower() == str(pair["sx_label"]).strip().lower():
+    if (contract_json is None
+            and str(pair["poly_label"]).strip().lower() == str(pair["sx_label"]).strip().lower()):
         return None
     if not _valid_shadow_amounts(quote):
         return None
@@ -816,6 +869,11 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
         if conn.execute("SELECT 1 FROM paper_v12_trades WHERE event_key=?", (eid,)).fetchone():
             conn.rollback()
             return None
+        if fixture is not None and conn.execute(
+                "SELECT 1 FROM paper_v12_trades WHERE fixture_key=? AND status<>'RESET_ARCHIVED'",
+                (fixture,)).fetchone():
+            conn.rollback()
+            return None
         # Recompute under the writer lock: a quote selected before another
         # operation/settlement cannot consume the newly protected reserve.
         allocation = allocation_budget(conn)
@@ -840,8 +898,8 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
             conditional_payout_cents, conditional_profit_cents, status, note,
             game_start_epoch, poly_token_id, sx_outcome_one, entry_evidence_json,
             bankroll_evidence_json, fee_evidence_json, poly_net_payout_cents,
-            sx_net_payout_cents, sx_payout_fee_cents
-          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'OPEN_CONDITIONAL',?,?,?,?,?,?,?,?,?,?)
+            sx_net_payout_cents, sx_payout_fee_cents, contract_evidence_json, fixture_key
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'OPEN_CONDITIONAL',?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             eid, now_epoch, pair["sx"]["sport"],
             " vs ".join(pair["sx"]["teams"]), str(pair["poly"]["id"]),
@@ -855,6 +913,7 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
             game_start, poly_token_id, sx_outcome_one, evidence_json, bankroll_evidence,
             fee_evidence_json, quote.poly_net_payout_cents, quote.sx_net_payout_cents,
             quote.sx_payout_fee_cents if fee_context is not None else None,
+            contract_json, fixture,
         ))
         trade_id = result.lastrowid
         if opening_odds is not None:
@@ -934,6 +993,29 @@ def format_wallets(conn):
     )
 
 
+def _display_contract(record):
+    """Keep official outcome labels unchanged; only enrich their presentation."""
+    try:
+        data = dict(record)
+        raw = data.get("contract_evidence_json")
+        if raw and contracts.validate_record_contract(data):
+            contract = json.loads(raw)
+            return contract if isinstance(contract, dict) else {}
+    except (TypeError, ValueError, KeyError):
+        pass
+    return {}
+
+
+def _selection_display(record, platform, contract=None):
+    contract = _display_contract(record) if contract is None else contract
+    raw = record[platform + "_side"]
+    display = contract.get(platform + "_display")
+    if isinstance(display, str) and display.strip():
+        display = " ".join(display.split())[:300]
+        return f"{display} [{raw}]"
+    return raw
+
+
 def format_open_message(conn, trade_id, odds_poly=None, odds_sx=None,
                         demo=False, game_start=None):
     """Mensagem enviada apenas para uma OPERAÇÃO VIRTUAL efetivamente registada."""
@@ -964,6 +1046,18 @@ def format_open_message(conn, trade_id, odds_poly=None, odds_sx=None,
             # A legacy/invalid audit field cannot invent a displayed policy.
             bankroll_lines = []
     phase = "EM DIRETO confirmado" if record["stage"] == "LIVE_CONFIRMADO" else record["stage"]
+    contract = _display_contract(record)
+    contract_lines = []
+    if contract:
+        scope = {
+            "soccer_regulation_90": "90 minutos e compensação; inclui o empate",
+            "hockey_full_game_ot_so": "Jogo completo, incluindo prolongamento e desempate",
+        }.get(contract.get("scope"), "Âmbito guardado na operação")
+        contract_lines = [
+            f"📋 Regras comparadas: {scope}.",
+            "ℹ️ Margem condicional à resolução normal nas duas plataformas.",
+            "ℹ️ Anulações, adiamentos e resultados excecionais podem seguir regras diferentes; exigem revisão.",
+        ]
     fee_lines = []
     if record["fee_evidence_json"]:
         fee_lines = [
@@ -1002,14 +1096,15 @@ def format_open_message(conn, trade_id, odds_poly=None, odds_sx=None,
         f"📅 Início previsto: {game_time}",
         f"🕒 Registo: {time.strftime('%d/%m/%Y %H:%M:%S UTC', time.gmtime(record['created_epoch']))}",
         f"🏷️ Modalidade: {record['sport']} | fase: {phase}",
+        *contract_lines,
         *live_lines,
         "",
         "1️⃣ POLYMARKET",
-        f"Equipa: {record['poly_side']}{odds(odds_poly)}",
+        f"{'Seleção' if contract else 'Equipa'}: {_selection_display(record, 'poly', contract)}{odds(odds_poly)}",
         f"Valor retirado: {eur(record['poly_debit_cents'])}",
         "",
         "2️⃣ SX BET",
-        f"Equipa: {record['sx_side']}{odds(odds_sx)}",
+        f"{'Seleção' if contract else 'Equipa'}: {_selection_display(record, 'sx', contract)}{odds(odds_sx)}",
         f"Valor retirado: {eur(record['sx_debit_cents'])}",
         "",
         "ℹ️ Odds indicadas: melhor nível de compra REST, NÃO execução confirmada.",
@@ -1051,7 +1146,7 @@ def _settlement_message(record, balances_after, balances_before=None, demo=False
         f"🕒 Liquidação: {_portugal_time(record['settled_epoch'])}",
     ]
     if winner_platform in ("poly", "sx"):
-        winner = record["poly_side"] if poly_won else record["sx_side"]
+        winner = _selection_display(record, "poly" if poly_won else "sx")
         platform = "POLYMARKET" if poly_won else "SX BET"
         loser = "SX BET" if poly_won else "POLYMARKET"
         lines.extend([
@@ -1277,6 +1372,23 @@ def _validate_resolution_evidence(record, poly_won, sx_won, evidence, allow_manu
         return
     if evidence.get("method") != "official_api":
         raise ValueError("O fecho automático exige resultados confirmados nas duas fontes oficiais")
+    if record["sport"] in CONTRACT_SPORTS:
+        if not contracts.validate_record_contract(dict(record)):
+            raise ValueError("Contrato guardado inválido; revisão necessária")
+        contract = json.loads(record["contract_evidence_json"])
+        if (evidence.get("contract_digest") != contract["digest"]
+                or poly_won == sx_won):
+            raise ValueError("Resultados ou prova divergem do contrato normal; revisão necessária")
+        fixture = evidence.get("fixture")
+        if not isinstance(fixture, dict):
+            raise ValueError("Conclusão normal do jogo não confirmada; revisão necessária")
+        fixture_url = urlparse(str(fixture.get("source_url") or ""))
+        if (type(fixture.get("status")) is not int or fixture["status"] != 3
+                or str(fixture.get("event_id")) != str(contract["sx"]["event_id"])
+                or fixture_url.scheme != "https" or fixture_url.hostname != "api.sx.bet"
+                or fixture_url.path != "/fixture/status"
+                or fixture_url.username or fixture_url.password or fixture_url.fragment):
+            raise ValueError("Conclusão normal do jogo não confirmada; revisão necessária")
     poly, sx = evidence.get("poly"), evidence.get("sx")
     if not isinstance(poly, dict) or not isinstance(sx, dict):
         raise ValueError("Prova das duas plataformas obrigatória")

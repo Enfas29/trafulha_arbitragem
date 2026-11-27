@@ -1,5 +1,7 @@
 # Trafulha Paper V15
 
+Histórico da V15. Futebol e hóquei foram acrescentados na [V16](README_V16.md).
+
 Versão de 27/11/2026. Mantém o ponto de entrada `python monitor_v11.py`,
 as duas carteiras virtuais e a política de banca V14. Não cria ordens nem
 movimenta dinheiro real. Esta atualização **não pede nem repete um reset**.

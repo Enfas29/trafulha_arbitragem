@@ -21,6 +21,8 @@ import threading
 import time
 from urllib.parse import quote
 
+import market_contracts_v16 as contracts
+
 
 GAMMA_EVENTS = "https://gamma-api.polymarket.com/events/"
 SX_MARKETS = "https://api.sx.bet/markets/find"
@@ -29,6 +31,7 @@ SX_METADATA = "https://api.sx.bet/metadata/obv3"
 REQUEST_TIMEOUT = 2.0
 EVIDENCE_TTL = 3.0
 METHOD = "official_live_v1"
+CONTRACT_SPORTS = {"soccer", "hockey"}
 
 # Global limits also apply when callers overlap. Four slots must be reserved
 # before submitting a group, so timed-out HTTP workers cannot create a queue.
@@ -135,9 +138,15 @@ def _catalogue(pair):
         "sx_market_hash": _identifier(sx.get("hash"), "missing_sx_market_hash"),
         "sx_side": _label(pair.get("sx_label"), "missing_sx_side"),
     }
-    _require(isinstance(poly.get("type"), str)
-             and poly["type"].strip().lower() == "moneyline", "poly_type_mismatch")
-    _require(type(sx.get("type")) is int and sx["type"] in (52, 226), "sx_type_mismatch")
+    contract = pair.get("settlement_contract")
+    if (contract is not None or poly.get("sport") in CONTRACT_SPORTS
+            or sx.get("sport") in CONTRACT_SPORTS):
+        _require(contracts.validate_pair_contract(pair), "settlement_contract_invalid")
+        result["contract_digest"] = contract["digest"]
+    else:
+        _require(isinstance(poly.get("type"), str)
+                 and poly["type"].strip().lower() == "moneyline", "poly_type_mismatch")
+        _require(type(sx.get("type")) is int and sx["type"] in (52, 226), "sx_type_mismatch")
     _require(sx.get("live_enabled") is True, "sx_catalogue_live_not_enabled")
     _require(type(pair.get("sx_target")) is int and pair["sx_target"] in (0, 1),
              "invalid_sx_target")
@@ -193,7 +202,7 @@ def _parallel_gets(requests, get_json):
     return result
 
 
-def _check_poly(event, identity, catalogue):
+def _check_poly(event, identity, catalogue, contract=None):
     _require(isinstance(event, dict), "poly_event_unavailable")
     _source_id(event.get("id"), identity["poly_event_id"], "poly_event_mismatch")
     _require(event.get("live") is True, "poly_not_live")
@@ -215,10 +224,21 @@ def _check_poly(event, identity, catalogue):
                  and period.strip().casefold() not in
                  {"final", "finished", "suspended", "postponed", "cancelled", "canceled"},
                  "poly_period_not_live")
+    if contract is not None and contract["scope"] == "soccer_regulation_90":
+        # The soccer contracts end at regulation, even if the fixture itself
+        # continues into extra time or a penalty shootout. Missing/unknown
+        # periods cannot prove regulation; clock minutes alone are ambiguous.
+        _require(str(status or "").strip().casefold() != "penaltyshootout"
+                 and contracts.soccer_live_period_is_regulation(period),
+                 "poly_scope_period_not_live")
     market = _one(event.get("markets"), "id", identity["poly_market_id"],
                   "poly_market_mismatch")
-    _require(isinstance(market.get("sportsMarketType"), str)
-             and market["sportsMarketType"].strip().lower() == "moneyline", "poly_type_mismatch")
+    if contract is not None:
+        _require(contracts.verify_poly_source(contract, market),
+                 "poly_settlement_contract_changed")
+    else:
+        _require(isinstance(market.get("sportsMarketType"), str)
+                 and market["sportsMarketType"].strip().lower() == "moneyline", "poly_type_mismatch")
     for field, expected in (("active", True), ("closed", False), ("acceptingOrders", True)):
         _require(market.get(field) is expected, "poly_market_not_open")
     for field, expected in (("archived", False), ("enableOrderBook", True)):
@@ -243,9 +263,12 @@ def _check_poly(event, identity, catalogue):
     return _integer(market.get("secondsDelay"), "poly_delay_unknown") * 1000
 
 
-def _check_sx(response, fixtures, identity, catalogue):
+def _check_sx(response, fixtures, identity, catalogue, contract=None):
     markets = _success(response, "sx_market_response_invalid")
     market = _one(markets, "marketHash", identity["sx_market_hash"], "sx_market_mismatch")
+    if contract is not None:
+        _require(contracts.verify_sx_source(contract, market),
+                 "sx_settlement_contract_changed")
     _source_id(market.get("sportXeventId"), identity["sx_event_id"], "sx_event_mismatch")
     _require(type(market.get("type")) is int and market["type"] == catalogue["type"],
              "sx_type_mismatch")
@@ -329,8 +352,10 @@ def fetch_live_snapshot(pair, get_json=None, clock=time.monotonic, wall=time.tim
         ("sx_metadata", SX_METADATA, None),
     ), get_json)
     epoch = _number(wall(), "invalid_wall_clock", positive=True)
-    poly_delay = _check_poly(responses["poly"], identity, pair["poly"])
-    sx_market = _check_sx(responses["sx_market"], responses["sx_fixture"], identity, pair["sx"])
+    contract = pair.get("settlement_contract")
+    poly_delay = _check_poly(responses["poly"], identity, pair["poly"], contract)
+    sx_market = _check_sx(responses["sx_market"], responses["sx_fixture"], identity,
+                          pair["sx"], contract)
     sx_delay = _sx_delay(responses["sx_metadata"], sx_market, epoch)
     checked = _number(clock(), "invalid_monotonic_clock")
     deadline = started + EVIDENCE_TTL

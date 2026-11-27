@@ -27,6 +27,13 @@ _LISBON = ZoneInfo("Europe/Lisbon")
 
 # These are *observed reasons*, not guesses derived from an indicative ROI.
 REASON_LABELS = {
+    "contrato_nao_validado": "Regras e seleções sem equivalência normal confirmada",
+    "jogo_ja_registado": "Já existe uma operação virtual neste jogo",
+    "settlement_contract_invalid": "Certificado do contrato inválido",
+    "live_contrato_invalido": "Prova de direto não corresponde ao contrato",
+    "poly_settlement_contract_changed": "Regras ou identidade Polymarket alteradas",
+    "sx_settlement_contract_changed": "Regras ou identidade SX alteradas",
+    "poly_scope_period_not_live": "Período abrangido pelo contrato já terminou",
     "cambio_invalido": "Câmbio indisponível ou inválido",
     "sem_liquidez": "Sem liquidez numa das plataformas",
     "reserva_banca_insuficiente": "Reserva ou exposição não permite o montante mínimo",
@@ -148,6 +155,7 @@ _CODE_FIELDS = frozenset({
     "failure_stage", "provider_reason", "exception_type", "phase", "step",
     "reason", "cost_status", "fee_status", "cost_reason", "validation_reason",
     "fee_source", "source", "reset_request_id", "bankroll_cycle", "cycle_id",
+    "contract_scope",
 })
 _BOOL_FIELDS = frozenset({"verified", "fees_enabled", "taker_only", "stale"})
 _BOOK_FIELDS = frozenset({

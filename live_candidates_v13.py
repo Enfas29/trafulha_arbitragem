@@ -18,13 +18,15 @@ import math
 import re
 import time
 
+import market_contracts_v16 as contracts
+
 
 BACKOFF_SECONDS = 2.0
 MAX_EVIDENCE_AGE_SECONDS = 3.0
 _SAFE_REASON = re.compile(r"[a-z][a-z0-9_]{0,95}\Z")
 _SAFE_EXCEPTION = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,79}\Z")
 _IDENTITY_FIELDS = ("key", "poly", "sx", "poly_asset", "sx_target",
-                    "poly_label", "sx_label")
+                    "poly_label", "sx_label", "settlement_contract")
 _EVIDENCE_FIELDS = (
     "method", "pair_key", "poly_event_id", "poly_market_id", "poly_asset_id",
     "poly_side", "sx_event_id", "sx_market_hash", "sx_target", "sx_side",
@@ -255,6 +257,13 @@ class LiveCandidates:
                     or raw["sx_fixture_status"] != 2 or raw["sx_status"] != "ACTIVE"):
                 raise _InvalidEvidence()
             pair = state.pair
+            contract = pair.get("settlement_contract")
+            if (contract is not None or pair["poly"].get("sport") in {"soccer", "hockey"}
+                    or pair["sx"].get("sport") in {"soccer", "hockey"}):
+                if (not contracts.validate_pair_contract(pair)
+                        or raw.get("contract_digest") != contract["digest"]):
+                    raise _InvalidEvidence("live_contrato_invalido")
+                evidence["contract_digest"] = raw["contract_digest"]
             for field, expected in (
                     ("poly_event_id", pair["poly"]["event_id"]),
                     ("poly_market_id", pair["poly"]["id"]),

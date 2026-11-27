@@ -14,7 +14,7 @@ from feed_coverage_v15 import read_limit, select_identifiers
 LOG = logging.getLogger("poly_ws_v12")
 URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 # Local load bound, not a claim about the exchange's maximum allowance.
-MAX_ASSETS = read_limit("MONITOR_POLY_WS_ASSETS", 256, 512)
+MAX_ASSETS = read_limit("MONITOR_POLY_WS_ASSETS", 512, 512)
 
 
 class PolyBookHints:
