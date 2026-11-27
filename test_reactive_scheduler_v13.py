@@ -236,6 +236,141 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(scheduler.metrics["ttl"], 1)
         self.assertEqual(scheduler.choose(now=100.2)[0]["key"], "0")
 
+    def test_urgency_preempts_older_background_without_changing_receipts(self):
+        ranks = {"0": 2, "1": 1, "2": 0}
+        scheduler = ReactiveScheduler(pairs(3), priority=lambda pair: ranks[pair["key"]])
+        scheduler.ingest({"p0": 10.0, "p1": 11.0, "p2": 12.0}, now=12.0)
+        selected = [scheduler.choose(now=12.1) for _ in range(3)]
+        self.assertEqual([item[0]["key"] for item in selected], ["2", "1", "0"])
+        self.assertEqual([item[1] for item in selected],
+                         [(12.0, {"POLY"}), (11.0, {"POLY"}), (10.0, {"POLY"})])
+        self.assertEqual([item[2] for item in selected], ["ws", "ws", "ws"])
+
+    def test_same_urgency_preserves_fifo_and_stable_key_ties(self):
+        scheduler = ReactiveScheduler(pairs(4), priority=lambda pair: 1)
+        scheduler.ingest({"p3": 10.0, "p2": 10.0, "p1": 10.1}, now=10.2)
+        self.assertEqual([scheduler.choose(now=10.2)[0]["key"] for _ in range(3)],
+                         ["2", "3", "1"])
+
+    def test_priority_updates_without_rebuild_and_skips_inflight_work(self):
+        ranks, calls = {"0": 0, "1": 2, "2": 2}, []
+        def priority(pair):
+            calls.append(pair["key"])
+            return ranks[pair["key"]]
+        scheduler = ReactiveScheduler(pairs(3), priority=priority)
+        scheduler.ingest({"p0": 10.0, "p1": 10.0, "p2": 10.0}, now=10.0)
+        self.assertEqual(scheduler.choose(now=10.1)[0]["key"], "0")
+        self.assertCountEqual(calls, ["0", "1", "2"])
+        calls.clear()
+        scheduler.ingest({"p0": 10.2}, now=10.2)
+        ranks["2"] = 0  # The game started; no catalog refresh is required.
+        self.assertEqual(scheduler.choose(now=10.3)[0]["key"], "2")
+        self.assertCountEqual(calls, ["1", "2"])
+        self.assertEqual(scheduler.pending["0"], (10.2, {"POLY"}))
+
+    def test_priority_failures_fall_back_to_background_without_stopping_scanner(self):
+        for invalid in (None, -1, True, "0", 0.0, float("nan"), RuntimeError("not logged")):
+            with self.subTest(invalid=invalid):
+                def priority(pair):
+                    if pair["key"] == "1":
+                        return 1
+                    if isinstance(invalid, Exception):
+                        raise invalid
+                    return invalid
+                scheduler = ReactiveScheduler(pairs(2), priority=priority)
+                scheduler.ingest({"p0": 10.0, "p1": 11.0}, now=11.0)
+                self.assertEqual(scheduler.choose(now=11.1)[0]["key"], "1")
+                self.assertEqual(scheduler.choose(now=11.1)[0]["key"], "0")
+                self.assertGreater(scheduler.metrics["priority_error"], 0)
+        scheduler = ReactiveScheduler(pairs(1), priority="not callable")
+        scheduler.ingest({"p0": 10.0}, now=10.0)
+        self.assertEqual(scheduler.choose(now=10.0)[0]["key"], "0")
+        self.assertEqual(scheduler.metrics["priority_error"], 1)
+
+    def test_priority_rotation_covers_quiet_and_continuously_updated_background(self):
+        scheduler = ReactiveScheduler(
+            pairs(4), max_hot_burst=2, normal_interval=0, min_key_interval=0,
+            priority=lambda pair: 0 if pair["key"] == "0" else 2)
+        rotations, selected = [], []
+        for tick in range(24):
+            now = 10.0 + tick / 10
+            # One urgent game, two background games with continuous hints,
+            # and one quiet game. Every class must retain normal coverage.
+            scheduler.ingest({"p0": now, "p1": now, "p2": now}, now=now)
+            pair, event, kind = scheduler.choose(now=now)
+            selected.append(kind)
+            if kind == "rotation":
+                rotations.append(pair["key"])
+            scheduler.completed(pair["key"], now=now)
+        self.assertEqual(selected[:3], ["ws", "ws", "rotation"])
+        self.assertEqual(rotations[:4], ["0", "1", "2", "3"])
+        self.assertEqual(set(rotations), {"0", "1", "2", "3"})
+        self.assertEqual(scheduler.coverage(now=12.4)["unvisited"], 0)
+
+    def test_ready_live_proof_precedes_urgency_without_changing_its_deadline(self):
+        calls = []
+        def priority(pair):
+            calls.append(pair["key"])
+            return 0 if pair["key"] == "0" else 2
+        scheduler = ReactiveScheduler(pairs(3), priority=priority)
+        scheduler.ingest({"p0": 90.0, "p1": 91.0}, now=100.0)
+        scheduler.ingest_ready({"2": 92.0}, {"2": 100.5}, now=100.0)
+        item = scheduler.choose(now=100.1)
+        self.assertEqual((item[0]["key"], item[1], item[2]),
+                         ("2", (92.0, {"LIVE"}), "live"))
+        self.assertEqual(calls, [])
+        scheduler.completed("2", now=100.2)
+        scheduler.ingest_ready({"2": 92.0}, {"2": 100.5}, now=100.6)
+        self.assertNotIn("2", scheduler.pending)
+        self.assertEqual(scheduler.choose(now=100.6)[0]["key"], "0")
+
+    def test_high_priority_does_not_resurrect_expired_hints(self):
+        scheduler = ReactiveScheduler(pairs(2), ttl_seconds=5,
+                                      priority=lambda pair: int(pair["key"]))
+        scheduler.ingest({"p0": 10.0}, now=10.0)
+        scheduler.ingest({"p1": 16.0}, now=16.0)
+        self.assertNotIn("0", scheduler.pending)
+        self.assertEqual(scheduler.metrics["ttl"], 1)
+        item = scheduler.choose(now=16.1)
+        self.assertEqual((item[0]["key"], item[1], item[2]),
+                         ("1", (16.0, {"POLY"}), "ws"))
+
+    def test_expiry_counts_by_priority_reconcile_with_total_ttl(self):
+        ranks = {"0": 0, "1": 1, "2": 2, "3": 9}
+        scheduler = ReactiveScheduler(pairs(4), ttl_seconds=5,
+                                      priority=lambda pair: ranks[pair["key"]])
+        scheduler.ingest({"p0": 10.0, "p1": 10.0, "p2": 10.0, "p3": 10.0}, now=10.0)
+        scheduler.ingest(now=16.0)
+        # Also include a stale incoming WS hint and an already-expired LIVE
+        # proof; they must not disappear from the priority breakdown.
+        scheduler.ingest({"p0": 10.0}, now=16.0)
+        scheduler.ingest_ready({"1": 10.0}, {"1": 15.9}, now=16.0)
+        self.assertEqual(scheduler.metrics["ttl"], 6)
+        self.assertEqual(scheduler.metrics["ttl_priority_0"], 2)
+        self.assertEqual(scheduler.metrics["ttl_priority_1"], 2)
+        self.assertEqual(scheduler.metrics["ttl_priority_2"], 1)
+        self.assertEqual(scheduler.metrics["ttl_priority_other"], 1)
+        self.assertFalse(scheduler.pending)
+        legacy = ReactiveScheduler(pairs(1), ttl_seconds=5)
+        legacy.ingest({"p0": 10.0}, now=16.0)
+        self.assertEqual(legacy.metrics["ttl"], 1)
+        self.assertFalse(any(key.startswith("ttl_priority_") for key in legacy.metrics))
+
+    def test_overflow_drops_background_before_current_games_and_ready_proofs(self):
+        ranks = {"0": 0, "1": 1, "2": 2, "3": 2, "4": 2}
+        scheduler = ReactiveScheduler(pairs(5), max_pending=3,
+                                      priority=lambda pair: ranks[pair["key"]])
+        scheduler.ingest({"p0": 10.0, "p1": 10.1, "p2": 10.2}, now=20.0)
+        scheduler.ingest_ready({"4": 9.0}, {"4": 22.5}, now=20.0)
+        self.assertEqual(set(scheduler.pending), {"0", "1", "4"})
+        self.assertEqual(scheduler._ready_expiries, {"4": 22.5})
+        scheduler.ingest({"p3": 20.1}, now=20.1)
+        self.assertEqual(set(scheduler.pending), {"0", "1", "4"})
+        self.assertEqual(scheduler.metrics["overflow"], 2)
+        item = scheduler.choose(now=20.2)
+        self.assertEqual((item[0]["key"], item[1], item[2]),
+                         ("4", (9.0, {"LIVE"}), "live"))
+
 
 if __name__ == "__main__":
     unittest.main()

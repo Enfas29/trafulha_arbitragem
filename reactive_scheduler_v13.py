@@ -14,12 +14,16 @@ from collections import Counter, defaultdict
 
 class ReactiveScheduler:
     def __init__(self, pairs=(), max_hot_burst=4, normal_interval=0.8,
-                 min_key_interval=0.25, ttl_seconds=20, max_pending=256):
+                 min_key_interval=0.25, ttl_seconds=20, max_pending=256,
+                 priority=None):
         self.max_hot_burst = max(1, int(max_hot_burst))
         self.normal_interval = self._nonnegative(normal_interval)
         self.min_key_interval = self._nonnegative(min_key_interval)
         self.ttl_seconds = self._nonnegative(ttl_seconds)
         self.max_pending = max(1, int(max_pending))
+        # Optional urgency is scheduling metadata, never evidence that a game
+        # is live or a quote is safe to trade. Smaller integers go first.
+        self.priority = priority
         self.pending = {}  # key -> (first local receipt, set of sources)
         # A finished live check is actionable for its own short proof lifetime.
         # Its original timestamp still includes the official betting delay.
@@ -99,10 +103,20 @@ class ReactiveScheduler:
         expired = [key for key, (stamp, _) in self.pending.items()
                    if (now > self._ready_expiries[key] if key in self._ready_expiries
                        else now - stamp > self.ttl_seconds)]
+        self._count_ttl(expired)
         for key in expired:
             del self.pending[key]
             self._ready_expiries.pop(key, None)
-        self.metrics["ttl"] += len(expired)
+
+    def _count_ttl(self, keys):
+        """Count real drops by current urgency, without replacing total TTL."""
+        keys = tuple(keys)
+        self.metrics["ttl"] += len(keys)
+        if self.priority is not None:
+            for key in keys:
+                rank = self._priority(self.by_key[key])
+                group = str(rank) if rank in (0, 1, 2) else "other"
+                self.metrics["ttl_priority_" + group] += 1
 
     def ingest(self, poly_events=None, sx_events=None, now=None):
         """Coalesce identifier hints, retaining the first unprocessed receipt.
@@ -135,7 +149,7 @@ class ReactiveScheduler:
                     self.metrics["unknown"] += 1
                     continue
                 if now - stamp > self.ttl_seconds:
-                    self.metrics["ttl"] += len(keys)
+                    self._count_ttl(keys)
                     continue
                 for key in sorted(keys):
                     previous = self.pending.get(key)
@@ -152,9 +166,17 @@ class ReactiveScheduler:
     def _enforce_cap(self):
         excess = len(self.pending) - self.max_pending
         if excess > 0:
-            # Prefer recent actionable hints if bursts exceed the hard cap.
-            oldest = sorted(self.pending,
-                            key=lambda key: (self.pending[key][0], key))
+            # Legacy FIFO keeps recent hints. With urgency, remove background
+            # before near/current games, and preserve ready LIVE proofs until
+            # no ordinary hint remains. Keep the same receipt-based tie break.
+            def eviction_order(key):
+                stamp = self.pending[key][0]
+                if self.priority is None:
+                    return stamp, key
+                if key in self._ready_expiries:
+                    return 1, 0, stamp, key
+                return 0, -self._priority(self.by_key[key]), stamp, key
+            oldest = sorted(self.pending, key=eviction_order)
             for key in oldest[:excess]:
                 del self.pending[key]
                 self._ready_expiries.pop(key, None)
@@ -192,7 +214,7 @@ class ReactiveScheduler:
                 self.metrics["unknown"] += 1
                 continue
             if deadline <= now:
-                self.metrics["ttl"] += 1
+                self._count_ttl((key,))
                 continue
             previous = self.pending.get(key)
             if previous is None:
@@ -212,6 +234,21 @@ class ReactiveScheduler:
         return (key not in self._inflight
                 and (last is None or now >= last + self.min_key_interval))
 
+    def _priority(self, pair):
+        if self.priority is None:
+            return 0
+        try:
+            value = self.priority(pair)
+            if type(value) is not int or value < 0:
+                raise ValueError("Invalid scheduling priority")
+            return value
+        except Exception:
+            # A malformed candidate or failed classifier must not stop the
+            # scanner or elevate an unknown game above current live work.
+            # Keep the reason count; never log an arbitrary callback payload.
+            self.metrics["priority_error"] += 1
+            return 2
+
     def _rotation_candidate(self, now):
         first_hot = None
         for step in range(len(self.pairs)):
@@ -220,6 +257,11 @@ class ReactiveScheduler:
             key = pair["key"]
             if not self._eligible(key, now):
                 continue
+            if self.priority is not None:
+                # The reserved rotation must also visit background games
+                # whose continuous hints never win the urgency queue. A
+                # preference for hint-free games could starve them forever.
+                return index, pair
             if key not in self.pending:
                 return index, pair
             if first_hot is None:
@@ -241,7 +283,12 @@ class ReactiveScheduler:
         return pair, event, kind
 
     def choose(self, now=None):
-        """Dispatch one direction, preserving FIFO hints and normal coverage."""
+        """Dispatch by urgency then FIFO, preserving normal coverage.
+
+        Ready LIVE proofs retain their existing deadline priority and the
+        reserved rotation still runs at the same burst/interval boundaries.
+        Without an urgency callback this is the original FIFO policy.
+        """
         now = self._now(now)
         self._expire(now)
         if not self.pairs:
@@ -250,10 +297,14 @@ class ReactiveScheduler:
                         self._ready_expiries,
                         key=lambda key: (self._ready_expiries[key], key))
                      if self._eligible(key, now)), None)
-        hot = live if live is not None else next((self.by_key[key]
-                    for key in sorted(self.pending,
-                                      key=lambda key: (self.pending[key][0], key))
-                    if self._eligible(key, now)), None)
+        hot = live
+        if hot is None:
+            # Evaluate urgency once per eligible pending direction, in O(n).
+            # Do not cache ranks: a fixture can start between catalog refreshes.
+            key = min((key for key in self.pending if self._eligible(key, now)),
+                      key=lambda key: (self._priority(self.by_key[key]),
+                                       self.pending[key][0], key), default=None)
+            hot = self.by_key[key] if key is not None else None
         normal_due = self._next_normal is None or now >= self._next_normal
         # Spare capacity belongs to rotation. The normal interval controls its
         # reserved quota only while eligible WS work is competing for service.

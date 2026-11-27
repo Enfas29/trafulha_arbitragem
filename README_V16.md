@@ -136,3 +136,25 @@ regressões V12 a V15.
 Regras concretas inspecionadas: mercados Gamma `7202037`, `7202038`
 (futebol), `6474596` (NHL) e `7360020` (Liiga).
 Custos, feeds e diagnóstico anteriores: [V15](README_V15.md).
+
+## V16.0.1 — prioridade após medir o catálogo maior
+
+A primeira implantação encontrou 113 jogos e 370 direções. Todos couberam
+nos feeds, mas tratar os sinais pela mesma ordem elevou a fila para cerca
+de 20 segundos. A V16.0.1 dá prioridade aos jogos na janela de direto e,
+de seguida, aos que começam nas próximas duas horas. Jogos declarados
+terminados ou sem horário válido ficam em fundo, assim como os já iniciados
+que não permitem direto na SX.
+Os horários servem apenas para ordenar consultas: não confirmam direto
+nem permitem dispensar qualquer regra de entrada.
+
+As provas LIVE prontas conservam a prioridade que já tinham. A quota de
+rotação continua ativa e visita o catálogo em ordem circular, mesmo que
+os mercados de fundo recebam sinais constantes. O limite de pedidos,
+os tempos de frescura e os timestamps originais não são alterados.
+
+Os logs mantêm a latência global e acrescentam `priority_decisions` para
+`active_window`, `starts_soon` e `background`, com contagens, mediana e p95
+da fila e da decisão. As expirações também são separadas por prioridade.
+Uma melhoria no grupo urgente não deve ser apresentada como redução da
+latência de todo o catálogo: as consultas de fundo terão uma cadência menor.

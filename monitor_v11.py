@@ -43,7 +43,7 @@ import decision_audit_v15 as decision_audit
 import market_contracts_v16 as contracts
 
 LOG = logging.getLogger("monitor_v11")
-APP_VERSION = "16.0.0"
+APP_VERSION = "16.0.1"
 CATALOG_GAMES = None
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -337,9 +337,36 @@ def select_pairs(pairs):
     )
 
 
+def pair_dispatch_priority(pair, now_epoch=None):
+    """Prioritize analysis by schedule; this is never proof of a live game."""
+    try:
+        poly, sx = pair["poly"], pair["sx"]
+        if poly.get("event_ended") is True:
+            return 2
+        now = time.time() if now_epoch is None else now_epoch
+        start = sx.get("start")
+        if (type(now) not in (int, float) or type(start) not in (int, float)
+                or not math.isfinite(now) or not math.isfinite(start) or start <= 0):
+            return 2
+        age = now - start
+        if sx.get("live_enabled") is True and (
+                (poly.get("event_live") is True and -2 * 3600 <= age <= bot.MAX_LIVE_AGE_H * 3600)
+                or 0 <= age <= bot.MAX_LIVE_AGE_H * 3600):
+            return 0
+        if -2 * 3600 <= age < 0 and poly.get("event_live") is not True:
+            return 1
+    except (KeyError, TypeError, AttributeError):
+        pass
+    return 2
+
+
+PRIORITY_LABELS = ("active_window", "starts_soon", "background")
+
+
 _BOOK_POOL = ThreadPoolExecutor(max_workers=2 * BOOK_READ_WORKERS + 2,
                                 thread_name_prefix="books-v15")
 LATENCIES = LatencyMetrics()
+PRIORITY_LATENCIES = {name: LatencyMetrics() for name in PRIORITY_LABELS}
 _BOOK_BACKOFF_LOCK = threading.Lock()
 _BOOK_BACKOFF_UNTIL = 0.0
 
@@ -922,9 +949,14 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
                                   if book_completed is not None else None),
                     "decision": max(0, decided-received_mono)*1000,
                     "sources": sources,
+                    "priority_group": PRIORITY_LABELS[pair_dispatch_priority(pair)],
                 })
     for timing in ws_latencies:
         LATENCIES.record_decision(
+            timing["queue"], timing["rest"], timing["decision"],
+            sources=timing["sources"],
+        )
+        PRIORITY_LATENCIES[timing["priority_group"]].record_decision(
             timing["queue"], timing["rest"], timing["decision"],
             sources=timing["sources"],
         )
@@ -1174,17 +1206,22 @@ def update_health(conn, checked, priced, now_epoch=None):
     )
 
 
+def catalog_games_by_sport(pairs):
+    unique = {
+        (p["sx"]["sport"], p["sx"]["start"],
+         tuple(sorted(bot.ascii_name(team) for team in p["sx"]["teams"])))
+        for p in pairs
+    }
+    return dict(sorted(Counter(sport for sport, _start, _teams in unique).items()))
+
+
 def catalog_snapshot():
     """Construir metadados completos; não toca no catálogo em utilização."""
     poly = bot.discover_poly()
     sx = bot.discover_sx()
     pairs = select_pairs(bot.pair_markets(poly, sx))
     stats = dict(Counter(p["sx"]["sport"] for p in pairs))
-    games = len({
-        (p["sx"]["sport"], p["sx"]["start"],
-         tuple(sorted(bot.ascii_name(team) for team in p["sx"]["teams"])))
-        for p in pairs
-    })
+    games = sum(catalog_games_by_sport(pairs).values())
     return pairs, games, len(poly), len(sx), stats
 
 
@@ -1196,6 +1233,7 @@ def accept_catalog(snapshot):
         "CATALOGO | Poly=%d SX=%d jogos=%d direções=%d | desportos=%s",
         poly_count, sx_count, games, len(pairs), stats,
     )
+    LOG.info("CATALOGO_MODALIDADES | jogos=%s", catalog_games_by_sport(pairs))
     return pairs
 
 
@@ -1388,6 +1426,7 @@ def main(once=False):
         max_hot_burst=WS_PRIORITY_MAX, normal_interval=INTERVAL / MAX_PAIRS,
         min_key_interval=WS_KEY_INTERVAL, ttl_seconds=WS_EVENT_TTL,
         max_pending=512,
+        priority=pair_dispatch_priority,
     )
     ws_feed = sx_hints.SXBookHints() if SX_WS_V12_ENABLED else None
     if ws_feed is not None and not ws_feed.start():
@@ -1567,6 +1606,12 @@ def main(once=False):
                 last_batch_log = started
             if started - last_metrics >= METRICS_INTERVAL:
                 metrics = LATENCIES.snapshot()
+                metrics["priority_decisions"] = {}
+                for label, collector in PRIORITY_LATENCIES.items():
+                    group = collector.snapshot()
+                    metrics["priority_decisions"][label] = {
+                        name: group[name] for name in ("decision_calls", "queue", "decision")
+                    }
                 metrics["pending_events"] = len(scheduler.pending)
                 metrics["queue_drops"] = dict(scheduler.metrics)
                 metrics["coverage"] = scheduler.coverage()
