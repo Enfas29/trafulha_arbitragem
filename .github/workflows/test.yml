@@ -1,9 +1,14 @@
 
-name: Testar Robô V11
+name: Validar Trafulha Paper V13
 
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
+      - v13-speed-storage
+      - v13-paper-refresh-20261127
+  pull_request:
     branches:
       - main
 
@@ -72,3 +77,15 @@ jobs:
 
       - name: Testar auditoria de varios jogos e futebol 1X2 (offline)
         run: python auditoria_jogos_v12.py --self-test
+
+      - name: Testar paralelismo e retencao V13 (offline)
+        run: python test_speed_storage_v13.py
+
+      - name: Testar migração, carteiras e avisos persistentes V13 (offline)
+        run: python test_paper_lifecycle_v13.py
+
+      - name: Testar resultados oficiais V13 com dados fictícios (offline)
+        run: python test_paper_results_v13.py
+
+      - name: Testar isolamento do worker de resultados (offline)
+        run: python test_paper_service_v13.py

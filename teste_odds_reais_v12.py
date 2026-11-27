@@ -111,7 +111,7 @@ def make_snapshot(pair, poly_levels, sx_levels, poly_time, sx_time, fx):
 
 def format_eur(value):
     """Formato português: 8,89 € em vez de 8.89€."""
-    return f"{float(value):.2f}".replace(".", ",") + " €"
+    return f"{float(value):,.2f}".translate(str.maketrans(",.", ".,")) + " €"
 
 
 def format_odd(value):

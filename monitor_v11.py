@@ -1,7 +1,7 @@
-"""V11 Monitor — acompanhamento contínuo, histórico SQLite e sinais de leitura.
+"""Trafulha V13.1 — monitorização e contabilidade exclusivamente virtual.
 
-Nunca executa apostas reais ou virtuais. Os candidatos são hipotéticos e
-precisam de confirmação de regras de liquidação, taxas e execução.
+Nunca executa apostas reais. As operações Paper são hipóteses contabilísticas;
+os resultados dependem de confirmação oficial em ambas as plataformas.
 Início: python monitor_v11.py
 Teste local: python monitor_v11.py --self-test
 Teste das APIs (uma passagem): python monitor_v11.py --once
@@ -11,11 +11,13 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import shutil
 import sqlite3
 import sys
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,8 +26,11 @@ import paper_v12 as paper
 import sx_ws_v12 as sx_hints
 import poly_ws_v12 as poly_hints
 import ws_priority_v12 as ws_priority
+from paper_service_v13 import PaperLifecycleWorker
 
 LOG = logging.getLogger("monitor_v11")
+APP_VERSION = "13.1.0"
+CATALOG_GAMES = None
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 DB = os.getenv("MONITOR_DB", "monitor_v11.sqlite3")
@@ -43,10 +48,10 @@ STORAGE_FREE_FLOOR = 32 * 1024 * 1024
 INTERVAL = max(10, int(os.getenv("MONITOR_INTERVAL_SECONDS", "20")))
 CATALOG_INTERVAL = max(180, int(os.getenv("MONITOR_CATALOG_SECONDS", "600")))
 MAX_PAIRS = min(60, max(1, int(os.getenv("MONITOR_PAIRS_PER_PASS", "15"))))
-# Reação a eventos WS: 2s entre ciclos para evitar tempestades de pedidos REST.
+# Reação a eventos WS: intervalo conservador de 1s; medir carga e 429.
 # NÃO é promessa de execução <10s, nem habilita apostas reais/virtuais LIVE.
 WS_REACT_GAP_SECONDS = min(10.0, max(
-    1.0, float(os.getenv("MONITOR_WS_REACT_GAP_SECONDS", "2.0"))
+    1.0, float(os.getenv("MONITOR_WS_REACT_GAP_SECONDS", "1.0"))
 ))
 # Quantos eventos WS entram à frente dos restantes mercados em cada scan.
 WS_PRIORITY_MAX = min(6, max(1, int(os.getenv("MONITOR_WS_PRIORITY_MAX", "4"))))
@@ -68,6 +73,7 @@ MIN_ROI = paper.MIN_NET_ROI    # Usar mesmo ROI do Paper V12, nunca o limiar leg
 PAPER_V12_ENABLED = os.getenv("PAPER_V12_ENABLED", "0").strip().lower() in {"1", "true", "yes"}
 SX_WS_V12_ENABLED = os.getenv("SX_WS_V12_ENABLED", "0").strip().lower() in {"1", "true", "yes"}
 POLY_WS_V12_ENABLED = os.getenv("POLY_WS_V12_ENABLED", "0").strip().lower() in {"1", "true", "yes"}
+PAPER_RESULTS_ENABLED = os.getenv("PAPER_RESULTS_ENABLED", "1").strip().lower() in {"1", "true", "yes"}
 
 # Continua a usar os filtros conservadores de winner/moneyline do V11.
 bot.MAX_POLY_SERIES = min(120, max(10, int(os.getenv("MONITOR_POLY_SERIES", "60"))))
@@ -172,6 +178,29 @@ def hypothetical_100_eur(poly_levels, sx_levels, fx: float):
     )
 
 
+def connection_free_bytes(conn):
+    path = conn.execute("PRAGMA database_list").fetchone()[2]
+    return shutil.disk_usage(Path(path).resolve().parent if path else Path.cwd()).free
+
+
+def prune_observations(conn, now=None):
+    """Limpeza limitada de histórico; SQLite reutiliza páginas libertadas."""
+    cutoff = datetime.fromtimestamp(
+        (time.time() if now is None else now) - OBSERVATION_RETENTION_HOURS * 3600,
+        tz=timezone.utc,
+    ).isoformat(timespec="seconds")
+    boundary = conn.execute("SELECT id FROM observations ORDER BY id DESC LIMIT 1 OFFSET ?", (OBSERVATION_MAX_ROWS,)).fetchone()
+    removed = 0
+    for _ in range(5):
+        with conn:
+            count = conn.execute("DELETE FROM observations WHERE id IN (SELECT id FROM observations WHERE observed_at < ? OR id <= ? ORDER BY id LIMIT 2000)", (cutoff, boundary[0] if boundary else -1)).rowcount
+        removed += count
+        if count < 2000:
+            break
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    return removed
+
+
 def insert_observation(conn, pair, stage, poly_levels, sx_levels, skew, fx):
     quote = normalize_quote(poly_levels, sx_levels) if skew <= MAX_SKEW else None
     hypothetical = hypothetical_100_eur(poly_levels, sx_levels, fx) if quote else None
@@ -195,7 +224,7 @@ def insert_observation(conn, pair, stage, poly_levels, sx_levels, skew, fx):
     ).fetchone()
     if last and last[0] >= cutoff:
         return quote, hypothetical
-    if shutil.disk_usage(Path(DB).expanduser().resolve().parent).free < STORAGE_FREE_FLOOR:
+    if connection_free_bytes(conn) < STORAGE_FREE_FLOOR:
         LOG.warning("STORAGE | disco com menos de 32MiB livres: observação ignorada")
         return quote, hypothetical
     with conn:
@@ -274,6 +303,17 @@ def select_pairs(pairs):
     )
 
 
+_BOOK_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="books-v13")
+
+
+def fetch_books(pair):
+    """Duas leituras independentes, simultâneas; nunca reutilizar preços."""
+    poly = _BOOK_POOL.submit(bot.poly_book, pair["poly_asset"])
+    sx = _BOOK_POOL.submit(bot.sx_book, pair["sx"]["hash"], pair["sx_target"])
+    wait((poly, sx))  # terminar ambas mesmo quando uma falha
+    return poly.result(), sx.result()
+
+
 def fast_preview(pairs, priority_cache, fx, limit=FAST_PREVIEW_LIMIT):
     """Pré-análise imediata de sinais WebSocket antes do scanner completo.
 
@@ -306,8 +346,7 @@ def fast_preview(pairs, priority_cache, fx, limit=FAST_PREVIEW_LIMIT):
         margin = None
         rest_ms = None
         try:
-            poly_levels, t_poly = bot.poly_book(pair["poly_asset"])
-            sx_levels, t_sx = bot.sx_book(sx["hash"], pair["sx_target"])
+            (poly_levels, t_poly), (sx_levels, t_sx) = fetch_books(pair)
             rest_ms = round(1000 * (time.monotonic() - started_mono))
             if abs(t_poly - t_sx) > MAX_SKEW:
                 status = "snapshots_desfasados"
@@ -356,8 +395,7 @@ def confirm_paper_snapshot(pair, first_poly, first_sx, t_poly, t_sx, fx,
                   min(price for price, _ in first_sx))
     sleep_fn(0.25)
     try:
-        second_poly, p_time = bot.poly_book(pair["poly_asset"])
-        second_sx, s_time = bot.sx_book(pair["sx"]["hash"], pair["sx_target"])
+        (second_poly, p_time), (second_sx, s_time) = fetch_books(pair)
     except Exception as exc:
         LOG.warning("PAPER_RECHECK | rejeitado=%s | erro REST %s",
                     pair["key"][:36], type(exc).__name__)
@@ -418,6 +456,7 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
     book_max_ms = 0.0
     best = None
     now = time.time()
+    paper_reasons = Counter()
 
     for pair in window:
         sx = pair["sx"]
@@ -439,8 +478,7 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
         book_started = time.monotonic()
         book_completed = None
         try:
-            poly_levels, t_poly = bot.poly_book(pair["poly_asset"])
-            sx_levels, t_sx = bot.sx_book(sx["hash"], pair["sx_target"])
+            (poly_levels, t_poly), (sx_levels, t_sx) = fetch_books(pair)
             book_completed = time.monotonic()
             book_max_ms = max(book_max_ms, 1000 * (book_completed - book_started))
             stage = "APOS_INICIO_NAO_CONFIRMADO" if start <= now else "PRE_JOGO"
@@ -470,17 +508,35 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
                     # quando a primeira leitura sugerir entrada elegível.
                     if (stage == "PRE_JOGO"
                             or paper.ALLOW_LIVE_UNVERIFIED):
-                        validated = confirm_paper_snapshot(
-                            pair, poly_levels, sx_levels, t_poly, t_sx,
-                            fx, paper_conn
-                        )
+                        existing = paper_conn.execute(
+                            "SELECT 1 FROM paper_v12_trades WHERE event_key=?",
+                            (paper.event_key(pair),),
+                        ).fetchone()
+                        if existing:
+                            paper_reasons["ja_registada"] += 1
+                            validated = None
+                        else:
+                            validated = confirm_paper_snapshot(
+                                pair, poly_levels, sx_levels, t_poly, t_sx,
+                                fx, paper_conn
+                            )
                         if validated:
                             final_poly, final_sx, final_skew = validated
                             booked = paper.try_paper_entry(
                                 paper_conn, pair, final_poly, final_sx, fx,
                                 paper_stage, final_skew
                             )
+                        if not existing and not booked:
+                            reason = (
+                                "abaixo_margem" if quote[2] < 100 * paper.MIN_NET_ROI
+                                else "margem_anomala" if quote[2] >= 100 * paper.MAX_AUTO_PAPER_ROI
+                                else "validacao_sem_registo"
+                            )
+                            paper_reasons[reason] += 1
+                    else:
+                        paper_reasons["fase_nao_confirmada"] += 1
                     if booked:
+                        paper_reasons["registada"] += 1
                         shadow_id, shadow_quote = booked
                         LOG.info(
                             "PAPER V12 #%d | %s | %.2f EUR | "
@@ -496,6 +552,8 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
                             LOG.info("PAPER_ALERT | enviado #%d | Telegram confirmado", shadow_id)
                         else:
                             LOG.warning("PAPER_ALERT | pendente #%d | Telegram não confirmou; retry automático", shadow_id)
+            elif paper_conn is not None:
+                paper_reasons["sem_cotacao_valida"] += 1
         except Exception as exc:
             book_max_ms = max(book_max_ms, 1000 * (time.monotonic() - book_started))
             LOG.warning(
@@ -541,6 +599,8 @@ def scan_pass(conn, pairs, offset: int, fx: float, paper_conn=None,
         round(1000 * (time.monotonic() - scan_started)),
         round(book_max_ms), hot_checked,
     )
+    if paper_conn is not None:
+        LOG.info("PAPER_DIAGNOSTICO | %s", dict(paper_reasons))
     return {"checked": checked, "priced": priced, "positive": positive,
             "signals": signals, "next_offset": new_offset, "best": best}
 
@@ -580,8 +640,11 @@ def format_summary(stats, catalog_count, window_hours=6, fx_available=False):
     best = f"{stats['best']:+.2f}%" if stats["best"] is not None else "N/D"
     potentials = str(stats["potential_signals"]) if fx_available else "N/D (sem câmbio)"
     return "\n".join([
-        f"📊 MONITOR V11 · ÚLTIMAS {window_hours:g}H",
+        f"📊 TRAFULHA V{APP_VERSION} · ÚLTIMAS {window_hours:g}H",
         f"🏟️ Confrontos analisados: {stats['unique']}",
+        (f"📚 Catálogo: {CATALOG_GAMES} jogos · {catalog_count} comparações"
+         if CATALOG_GAMES is not None else
+         f"📚 Direções comparáveis no catálogo: {catalog_count}"),
         f"📚 Odds válidas: {stats['priced']}/{stats['records']}",
         f"📈 Melhor margem indicativa (<10%, não validada): {best}",
         f"⚠️ Leituras anómalas (>=10%, excluídas): {stats.get('suspicious', 0)}",
@@ -622,7 +685,7 @@ def send_summary(conn, catalog_count, startup=False, now_epoch=None, paper_conn=
         message += (
             f"\n🧪 Paper: ROI mínimo configurado {100 * paper.MIN_NET_ROI:.2f}%"
             f"\n🧾 Paper: {totals['open_trades']} abertas · "
-            f"{totals['settled']} liquidadas"
+            f"{totals['settled']} liquidadas · {totals['requires_review']} em revisão"
             f"\n💰 Polymarket: {paper.eur(int(round(totals['poly_free_eur'] * 100)))} livres"
             f"\n💰 SX Bet: {paper.eur(int(round(totals['sx_free_eur'] * 100)))} livres"
             f"\n🔒 Em operações abertas: {paper.eur(int(round(totals['exposure_eur'] * 100)))}"
@@ -703,13 +766,19 @@ def update_health(conn, checked, priced, now_epoch=None):
 
 
 def catalog():
+    global CATALOG_GAMES
     poly = bot.discover_poly()
     sx = bot.discover_sx()
     pairs = select_pairs(bot.pair_markets(poly, sx))
     stats = dict(Counter(p["sx"]["sport"] for p in pairs))
+    CATALOG_GAMES = len({
+        (p["sx"]["sport"], p["sx"]["start"],
+         tuple(sorted(bot.ascii_name(team) for team in p["sx"]["teams"])))
+        for p in pairs
+    })
     LOG.info(
-        "CATALOGO | Poly=%d SX=%d direções=%d | desportos=%s",
-        len(poly), len(sx), len(pairs), stats,
+        "CATALOGO | Poly=%d SX=%d jogos=%d direções=%d | desportos=%s",
+        len(poly), len(sx), CATALOG_GAMES, len(pairs), stats,
     )
     return pairs
 
@@ -747,7 +816,7 @@ def self_test():
         bot.sx_book = lambda hash_, target: (seen.append("sx") or
                                              [(0.51, 200)], time.time())
         assert fast_preview(sample, PendingOnly(), fx=0.91) == 1
-        assert seen == ["poly", "sx"]
+        assert sorted(seen) == ["poly", "sx"]
     finally:
         bot.poly_book, bot.sx_book = old_poly_fn, old_sx_fn
 
@@ -859,6 +928,7 @@ def websocket_reaction_pause(elapsed_seconds, wake_received, min_gap=WS_REACT_GA
 
 
 def main(once=False):
+    LOG.info("TRAFULHA | versao=%s | execucao_real=INEXISTENTE", APP_VERSION)
     # Modo de manutenção: permite montar /data para backup sem tentar
     # abrir SQLite cheia. Não apaga nem altera qualquer base de dados.
     if os.getenv("TRAFLUHA_STORAGE_MAINTENANCE", "0").strip().lower() in {"1", "true", "yes"}:
@@ -882,6 +952,17 @@ def main(once=False):
             "de oportunidades desativados; só se guarda o histórico."
         )
 
+    # Bloquear arranque com volume cheio, antes de abrir ou alterar SQLite.
+    storage_paths = [Path(DB).expanduser().resolve().parent]
+    if PAPER_V12_ENABLED and fx > 0:
+        storage_paths.append(Path(paper.PAPER_DB).expanduser().resolve().parent)
+    mount_path = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+    if mount_path:
+        persistent_root = Path(mount_path).resolve()
+        if any(not path.is_relative_to(persistent_root) for path in storage_paths):
+            raise SystemExit("As bases SQLite devem permanecer no volume persistente do Railway")
+    if any(shutil.disk_usage(path if path.exists() else path.parent).free < STORAGE_FREE_FLOOR for path in storage_paths):
+        raise SystemExit("STORAGE | menos de 32MiB livres; arranque bloqueado, bases preservadas")
     conn = open_database(DB)
     priority_cache = ws_priority.PriorityCache(
         max_priority=WS_PRIORITY_MAX, ttl_seconds=WS_EVENT_TTL
@@ -894,6 +975,7 @@ def main(once=False):
     if poly_feed is not None:
         poly_feed.start()
     paper_conn = paper.open_database() if PAPER_V12_ENABLED and fx > 0 else None
+    result_worker = None
     if PAPER_V12_ENABLED and paper_conn is None:
         LOG.warning("PAPER V12 pediu ativação, mas EUR_PER_USD inválido/ausente: desativado.")
     if paper_conn is not None:
@@ -901,6 +983,20 @@ def main(once=False):
                  "1000 EUR virtuais por plataforma, "
                  "máximo 100 EUR total por operação, sem apostas reais.",
                  100 * paper.MIN_NET_ROI)
+        balances = paper.paper_summary(paper_conn)
+        LOG.info(
+            "PAPER_ESTADO | abertas=%d | liquidadas=%d | revisao=%d | "
+            "saldo_poly=%.2f | saldo_sx=%.2f | exclusivamente_virtual",
+            balances["open_trades"], balances["settled"],
+            balances["requires_review"], balances["poly_free_eur"], balances["sx_free_eur"],
+        )
+        if PAPER_RESULTS_ENABLED and not once:
+            result_worker = PaperLifecycleWorker(
+                paper.PAPER_DB,
+                interval_seconds=int(os.getenv("PAPER_RESULTS_INTERVAL_SECONDS", "60")),
+                batch_size=int(os.getenv("PAPER_RESULTS_BATCH_SIZE", "5")),
+            )
+            result_worker.start()
     LOG.info(
         "FAST PREVIEW V12.1: %s; objetivo de calculo <1s; "
         "REST obrigatorio nas duas fontes, SEM operacoes/alertas.",
@@ -916,9 +1012,22 @@ def main(once=False):
     pairs, cursor = [], 0
     last_catalog = 0.0
     iteration = 0
+    last_prune = 0.0
     try:
         while True:
             started = time.monotonic()
+            if any(shutil.disk_usage(path).free < STORAGE_FREE_FLOOR for path in storage_paths):
+                raise SystemExit("STORAGE | reserva de 32MiB atingida; parar com erro explícito e preservar bases")
+            if result_worker is not None and not result_worker.thread.is_alive():
+                raise RuntimeError("Worker de resultados parou; reiniciar serviço para recuperar")
+            if started - last_prune >= 60 or last_prune == 0:
+                try:
+                    removed = prune_observations(conn)
+                    if removed:
+                        LOG.info("STORAGE | %d leituras antigas eliminadas", removed)
+                except sqlite3.Error as exc:
+                    LOG.warning("STORAGE | falha na limpeza: %s", type(exc).__name__)
+                last_prune = started
             if last_catalog == 0.0 or started - last_catalog >= CATALOG_INTERVAL:
                 try:
                     pairs = catalog()
@@ -947,7 +1056,7 @@ def main(once=False):
                 priority_cache=priority_cache
             )
             cursor = result["next_offset"]
-            if paper_conn is not None and iteration % 12 == 0:
+            if paper_conn is not None and result_worker is None and iteration % 12 == 0:
                 try:
                     retried = paper.retry_pending_open_notices(paper_conn)
                     if retried:
@@ -963,36 +1072,6 @@ def main(once=False):
             if once or report_due(conn):
                 send_summary(conn, len(pairs), startup=(iteration == 1),
                              paper_conn=paper_conn)
-
-            # Retenção limitada a 12h/25k linhas (configurável) em vez de
-            # 30 dias sem limite. A limpeza histórica antiga deve ser
-            # feita APÓS backup e recuperação de espaço com
-            # recuperar_espaco_v12.py; aqui apenas manutenção incremental.
-            if iteration % 100 == 0 and shutil.disk_usage(
-                Path(DB).expanduser().resolve().parent
-            ).free >= STORAGE_FREE_FLOOR:
-                cutoff = datetime.fromtimestamp(
-                    time.time() - OBSERVATION_RETENTION_HOURS * 3600,
-                    tz=timezone.utc
-                ).isoformat(timespec="seconds")
-                try:
-                    excess_id = conn.execute(
-                        "SELECT id FROM observations ORDER BY id DESC "
-                        "LIMIT 1 OFFSET ?", (OBSERVATION_MAX_ROWS,)
-                    ).fetchone()
-                    boundary = excess_id[0] if excess_id else -1
-                    with conn:
-                        conn.execute(
-                            "DELETE FROM observations WHERE id IN ("
-                            "SELECT id FROM observations "
-                            "WHERE observed_at < ? OR id <= ? "
-                            "ORDER BY id LIMIT 2000)",
-                            (cutoff, boundary)
-                        )
-                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                except sqlite3.Error as exc:
-                    LOG.warning("STORAGE | limpeza de observações falhou: %s",
-                                type(exc).__name__)
 
             if once:
                 print("✅ Passagem única concluída; só leitura, sem apostas.")
@@ -1013,9 +1092,9 @@ def main(once=False):
                     if remaining <= 0:
                         break
                     # Antes dormia 1s e forçava 8s mínimos mesmo após WS.
-                    # Agora: reação em ~100ms (mais a duração das APIs REST),
-                    # com um mínimo de 2s entre scans acionados pelo WS.
-                    time.sleep(min(0.1, remaining))
+                    # Poll a cada 50ms quando o scanner está ocioso; não é SLA.
+                    # Intervalo mínimo configurável entre ciclos WS.
+                    time.sleep(min(0.05, remaining))
                 elapsed = time.monotonic() - started
                 pause = websocket_reaction_pause(elapsed, wake_received)
                 if pause > 0:
@@ -1023,6 +1102,8 @@ def main(once=False):
     except KeyboardInterrupt:
         LOG.info("Monitor interrompido.")
     finally:
+        if result_worker is not None:
+            result_worker.stop()
         if ws_feed is not None:
             ws_feed.stop()
         if poly_feed is not None:
@@ -1030,6 +1111,10 @@ def main(once=False):
         conn.close()
         if paper_conn is not None:
             paper_conn.close()
+
+
+def handle_shutdown(_signum, _frame):
+    raise KeyboardInterrupt
 
 
 if __name__ == "__main__":
@@ -1040,4 +1125,5 @@ if __name__ == "__main__":
     if args.self_test:
         self_test()
     else:
+        signal.signal(signal.SIGTERM, handle_shutdown)
         main(once=args.once)

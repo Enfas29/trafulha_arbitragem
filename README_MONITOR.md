@@ -1,5 +1,9 @@
 # Monitor V11 — instruções
 
+> **Versão atual:** [Trafulha Paper V13.1](README_V13.md).
+> Este documento descreve a primeira versão; a retenção, WebSockets e
+> ciclo de vida da simulação foram atualizados na V13.1.
+
 O monitor_v11.py é um **monitor só de leitura** para a Polymarket e SX Bet.
 
 - Guarda cada observação na base de dados SQLite; mantém até 30 dias.
