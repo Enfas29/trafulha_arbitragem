@@ -1,8 +1,8 @@
 # Monitor V11 — instruções
 
-> **Versão atual:** [Trafulha Paper V14](README_V13.md).
+> **Versão atual:** [Trafulha Paper V15](README_V15.md).
 > Este documento descreve a primeira versão; a retenção, WebSockets e
-> ciclo de vida, direto confirmado e banca proporcional estão documentados na V14.
+> ciclo de vida, direto confirmado, banca, custos e cobertura estão documentados na V15.
 
 O monitor_v11.py é um **monitor só de leitura** para a Polymarket e SX Bet.
 

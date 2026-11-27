@@ -12,11 +12,14 @@ import threading
 import time
 
 import requests
+from feed_coverage_v15 import read_limit, select_identifiers
 
 LOG = logging.getLogger("sx_ws_v12")
 SX_WS = "wss://realtime.sx.bet/connection/websocket"
 SX_TOKEN_URL = "https://api.sx.bet/user/realtime-token-v3/api-key"
-MAX_WATCHED = 12
+# SX documents 512 channels/connection; leave ample headroom by default.
+# https://docs.sx.bet/developers/realtime-reference
+MAX_WATCHED = read_limit("MONITOR_SX_WS_MARKETS", 128, 512)
 
 
 def make_subscription_handler(base_class, market_hash, on_book):
@@ -37,7 +40,7 @@ def make_subscription_handler(base_class, market_hash, on_book):
 
 
 class SXBookHints:
-    def __init__(self, key=None):
+    def __init__(self, key=None, max_watched=None):
         self.key = key if key is not None else os.getenv("SX_API_KEY", "")
         self.wake = threading.Event()
         self.lock = threading.Lock()
@@ -46,11 +49,28 @@ class SXBookHints:
         self.running = False
         self.last_message_epoch = None
         self.received_events = 0
+        self.max_watched = MAX_WATCHED if max_watched is None else max_watched
+        if type(self.max_watched) is not int or not 1 <= self.max_watched <= 512:
+            raise ValueError("SX WS suporta até 512 subscrições por conexão")
+        self._selection_cursor = 0
+        self.available_markets = 0
 
     def update(self, hashes):
-        chosen = tuple(dict.fromkeys(str(h) for h in hashes if h))[:MAX_WATCHED]
+        chosen, cursor, count = select_identifiers(hashes, self.max_watched, self._selection_cursor)
         with self.lock:
-            self.watched = chosen
+            # Reordering the same catalogue must not reconnect the socket.
+            if set(chosen) != set(self.watched):
+                self.watched = chosen
+            self._selection_cursor = cursor
+            self.available_markets = count
+        LOG.info("WS_COVERAGE_V15 | SX | disponíveis=%d | selecionados=%d | omitidos=%d | limite=%d",
+                 count, len(chosen), count - len(chosen), self.max_watched)
+
+    def coverage(self):
+        with self.lock:
+            return {"available": self.available_markets, "selected": len(self.watched),
+                    "omitted": max(0, self.available_markets - len(self.watched)),
+                    "limit": self.max_watched}
 
     def signal(self, market_hash):
         first_event = False

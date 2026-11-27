@@ -9,14 +9,16 @@ import logging
 import os
 import threading
 import time
+from feed_coverage_v15 import read_limit, select_identifiers
 
 LOG = logging.getLogger("poly_ws_v12")
 URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-MAX_ASSETS = 24
+# Local load bound, not a claim about the exchange's maximum allowance.
+MAX_ASSETS = read_limit("MONITOR_POLY_WS_ASSETS", 256, 512)
 
 
 class PolyBookHints:
-    def __init__(self):
+    def __init__(self, max_assets=None):
         self.wake = threading.Event()
         self.lock = threading.Lock()
         self.assets = ()
@@ -28,6 +30,11 @@ class PolyBookHints:
         self._close_thread = None
         self._closing_socket = None
         self._close_pending = None
+        self.max_assets = MAX_ASSETS if max_assets is None else max_assets
+        if type(self.max_assets) is not int or not 1 <= self.max_assets <= 512:
+            raise ValueError("Limite local Poly WS deve estar entre 1 e 512")
+        self._selection_cursor = 0
+        self.available_assets = 0
 
     def _request_close_locked(self, ws):
         """Coalesce reconnect requests; caller holds ``self.lock``.
@@ -65,12 +72,24 @@ class PolyBookHints:
                     self._closing_socket = None
 
     def update(self, assets):
-        selection = tuple(dict.fromkeys(str(a) for a in assets if a))[:MAX_ASSETS]
+        selection, cursor, count = select_identifiers(assets, self.max_assets, self._selection_cursor)
         with self.lock:
-            changed = selection != self.assets
-            self.assets = selection
+            # The same membership in a different catalogue order needs no
+            # reconnect. Real membership changes retain the non-blocking close.
+            changed = set(selection) != set(self.assets)
             if changed:
+                self.assets = selection
                 self._request_close_locked(self.socket)
+            self._selection_cursor = cursor
+            self.available_assets = count
+        LOG.info("WS_COVERAGE_V15 | Poly | disponíveis=%d | selecionados=%d | omitidos=%d | limite=%d",
+                 count, len(selection), count - len(selection), self.max_assets)
+
+    def coverage(self):
+        with self.lock:
+            return {"available": self.available_assets, "selected": len(self.assets),
+                    "omitted": max(0, self.available_assets - len(self.assets)),
+                    "limit": self.max_assets}
 
     def mark(self, asset):
         asset = str(asset)
