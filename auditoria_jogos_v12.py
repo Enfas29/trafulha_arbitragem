@@ -192,17 +192,19 @@ def gamma_market_category(m, teams):
     equipas entre parênteses corresponda ao evento inteiro.
     """
     raw_item = str(m.get("groupItemTitle") or "").strip()
-    item = category(raw_item, teams)
-    if item is None:
-        # Apenas o rótulo do mercado, nunca o título geral do evento.
-        match = re.fullmatch(
-            r"(?:draw|tie|empate)\s*\(\s*(.+?)\s*\)\s*",
-            raw_item, re.I,
-        )
-        if match:
-            opponents = bot.parse_title(match.group(1))
-            if opponents and match_teams(*opponents, *teams):
-                item = "draw"
+    # Interpretar primeiro o rótulo estruturado: os nomes entre parênteses
+    # identificam o confronto e não a seleção do mercado.
+    match = re.fullmatch(
+        r"(?:draw|tie|empate)\s*\(\s*(.+?)\s*\)\s*",
+        raw_item, re.I,
+    )
+    if match:
+        opponents = bot.parse_title(match.group(1))
+        if not opponents or not match_teams(*opponents, *teams):
+            return None
+        item = "draw"
+    else:
+        item = category(raw_item, teams)
 
     question = explicit_question_category(m.get("question"), teams)
     title = explicit_question_category(m.get("title"), teams)

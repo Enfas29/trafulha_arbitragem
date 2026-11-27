@@ -87,8 +87,11 @@ class SXBookHints:
             raise RuntimeError("SX_API_KEY não configurada")
         def request():
             response = requests.get(
-                SX_TOKEN_URL, headers={"x-sx-api-key": self.key}, timeout=12
+                SX_TOKEN_URL, headers={"x-sx-api-key": self.key}, timeout=12,
+                allow_redirects=False,
             )
+            if 300 <= response.status_code < 400:
+                raise ValueError("Redirecionamento inesperado do serviço SX")
             response.raise_for_status()
             return response.json()["token"]
         return await asyncio.to_thread(request)

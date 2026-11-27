@@ -1,3 +1,7 @@
+> **Versão atual:** [Trafulha Paper V13.1](README_V13.md).
+> O texto abaixo é o registo histórico V12; os estados de disco e os
+> procedimentos de liquidação descritos referem-se às datas indicadas.
+
 ## Recuperação de armazenamento Railway — 24 nov 2026
 
 **Causa confirmada nos deploy logs:** `sqlite3.OperationalError:
