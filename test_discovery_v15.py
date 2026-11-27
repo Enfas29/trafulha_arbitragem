@@ -109,7 +109,7 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_rotate_compatible_series_and_preserve_matched_anchor(self):
         series = {str(i): "tennis" for i in range(101, 108)}
-        series["999"] = "soccer"
+        series["999"] = "handball"
         bot._MATCHED_POLY_SERIES = {"101"}
         seen = set()
         for _ in range(5):
@@ -187,7 +187,7 @@ class DiscoveryTests(unittest.TestCase):
         result = bot.pair_markets([p], [s, excluded, mismatch])
         self.assertEqual(len(result), 2)
         self.assertEqual(bot._MATCHED_POLY_SERIES, {"101"})
-        self.assertEqual(bot.DISCOVERY_STATS["matching"]["excluded_settlement_sport"], 1)
+        self.assertEqual(bot.DISCOVERY_STATS["matching"]["sx_contract_unverified"], 1)
         self.assertEqual(bot.DISCOVERY_STATS["matching"]["no_poly_participant_match"], 1)
         self.assertEqual(bot.pair_markets([p, {**p, "id": "p2"}], [s]), [])
         self.assertEqual(bot.DISCOVERY_STATS["matching"]["ambiguous_poly_markets"], 1)

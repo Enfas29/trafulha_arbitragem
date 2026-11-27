@@ -1,5 +1,5 @@
 
-name: Validar Trafulha Paper V15
+name: Validar Trafulha Paper V16
 
 on:
   workflow_dispatch:
@@ -12,6 +12,7 @@ on:
       - v13-live-paper-20261127
       - v14-bankroll-reset-20261127
       - v15-opportunities-20261127
+      - v16-sports-20261127
   pull_request:
     branches:
       - main
@@ -126,3 +127,11 @@ jobs:
           python test_ws_coverage_v15.py
           python test_parallel_books_v15.py
           python test_monitor_opportunities_v15.py
+
+      - name: Testar futebol, hóquei e contratos de resultado V16 (offline)
+        run: |
+          python test_market_contracts_v16.py
+          python test_discovery_v16.py
+          python test_live_contracts_v16.py
+          python test_results_contracts_v16.py
+          python test_paper_contracts_v16.py

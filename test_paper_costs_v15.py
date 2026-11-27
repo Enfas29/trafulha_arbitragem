@@ -172,7 +172,7 @@ class PaperCostTests(unittest.TestCase):
                 self.assertEqual(paper.settle_normal(conn, 7, "sx", verified=True), 5)
                 self.assertEqual(paper.trade_details(conn, 7)["sx_credit_cents"], 9000)
                 self.assertEqual(paper.free_balances(conn), {"poly": 54321, "sx": 76890})
-                self.assertEqual(conn.execute("SELECT MAX(version) FROM paper_v13_migrations").fetchone()[0], 16)
+                self.assertEqual(conn.execute("SELECT MAX(version) FROM paper_v13_migrations").fetchone()[0], paper.SCHEMA_VERSION)
                 backups = list((Path(directory) / "backups").glob("*.sqlite3"))
                 self.assertEqual(len(backups), 1)
                 with sqlite3.connect(backups[0]) as backup:
