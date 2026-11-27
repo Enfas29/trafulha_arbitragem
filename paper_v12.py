@@ -324,6 +324,7 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
             odds_poly, odds_sx = opening_odds
             frozen_message = format_open_message(
                 conn, trade_id, odds_poly=odds_poly, odds_sx=odds_sx,
+                game_start=pair["sx"].get("start"),
             )
             conn.execute(
                 "INSERT INTO paper_v12_open_notifications(trade_id, message) "
@@ -385,7 +386,7 @@ def format_wallets(conn):
 
 
 def format_open_message(conn, trade_id, odds_poly=None, odds_sx=None,
-                        demo=False):
+                        demo=False, game_start=None):
     """Mensagem enviada apenas para uma OPERAÇÃO VIRTUAL efetivamente registada."""
     record = trade_details(conn, trade_id)
     if record is None or record["status"] != "OPEN_CONDITIONAL":
@@ -393,10 +394,19 @@ def format_open_message(conn, trade_id, odds_poly=None, odds_sx=None,
     def odds(value):
         return f" | odd {value:.2f}".replace(".", ",") if value is not None else ""
 
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    game_time = "não disponível"
+    if game_start:
+        try:
+            game_time = datetime.fromtimestamp(float(game_start), ZoneInfo("Europe/Lisbon")).strftime("%d/%m/%Y %H:%M (Portugal)")
+        except (ValueError, TypeError, OSError, OverflowError):
+            pass
     balances = free_balances(conn)
     message = [
         f"🧪 {'DEMONSTRAÇÃO FICTÍCIA' if demo else 'APOSTA VIRTUAL'} #{trade_id}",
         f"🏟️ {record['event']}",
+        f"📅 Início previsto: {game_time}",
         f"🕒 Registo: {time.strftime('%d/%m/%Y %H:%M:%S UTC', time.gmtime(record['created_epoch']))}",
         f"🏷️ Modalidade: {record['sport']} | fase: {record['stage']}",
         "",
