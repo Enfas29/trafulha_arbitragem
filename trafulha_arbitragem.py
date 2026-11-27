@@ -44,6 +44,9 @@ MIN_NET_ROI = 0.015              # 1,5% após buffers
 POLY_FEE_BUFFER = 0.010        # estimativa prudente; não é taxa oficial
 SX_FEE_BUFFER = 0.010          # estimativa prudente; não é taxa oficial
 SCANNER_SECONDS = 10          # fallback REST, mais rápido com sinais WS
+BOOK_TIMEOUT_SECONDS = min(7.0, max(1.0, float(
+    os.getenv("MONITOR_BOOK_TIMEOUT_SECONDS", "2.0")
+)))
 CATALOG_SECONDS = 240        # atualizar novas partidas/mercados
 MAX_SX_PAGES = 30
 MAX_POLY_SERIES = 70
@@ -455,7 +458,7 @@ def pair_markets(poly, sx):
 
 
 def poly_book(asset):
-    data = get_json(POLY_CLOB + "/book", {"token_id": asset}, timeout=7)
+    data = get_json(POLY_CLOB + "/book", {"token_id": asset}, timeout=BOOK_TIMEOUT_SECONDS)
     asks = []
     for level in data.get("asks", []):
         try:
@@ -475,7 +478,7 @@ def sx_book(market_hash, target):
     """
     raw = get_json(SX_API + "/orderbook-v3/snapshot/market", {
         "marketHash": market_hash,
-    }, timeout=7)
+    }, timeout=BOOK_TIMEOUT_SECONDS)
     data = raw["data"]
     other_side = "outcomeTwo" if target == 0 else "outcomeOne"
     levels = []

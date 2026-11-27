@@ -8,6 +8,7 @@ on:
       - main
       - v13-speed-storage
       - v13-paper-refresh-20261127
+      - v13-speed-safe-20261127
   pull_request:
     branches:
       - main
@@ -89,3 +90,12 @@ jobs:
 
       - name: Testar isolamento do worker de resultados (offline)
         run: python test_paper_service_v13.py
+
+      - name: Testar fila reativa, frescura e isolamento V13.2 (offline)
+        run: |
+          python test_reactive_scheduler_v13.py
+          python test_latency_metrics_v13.py
+          python test_monitor_workers_v13.py
+          python test_monitor_reactive_v13.py
+          python test_paper_freshness_v13.py
+          python test_poly_refresh_v13.py

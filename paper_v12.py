@@ -432,13 +432,38 @@ def _portugal_time(value):
             return "não disponível"
 
 
+def _entry_guard_valid(pair, stage, valid_until_mono):
+    """A guarded live observation must remain fresh until its virtual commit.
+
+    ``None`` preserves legacy/manual fixtures. Production supplies a monotonic
+    deadline derived from the older of its two final REST snapshots.
+    """
+    if valid_until_mono is None:
+        return True
+    if isinstance(valid_until_mono, (str, bytes, bool)):
+        return False
+    try:
+        deadline = float(valid_until_mono)
+        if not math.isfinite(deadline) or time.monotonic() > deadline:
+            return False
+        if stage == "PRE_JOGO":
+            start = float(pair["sx"]["start"])
+            if not math.isfinite(start) or start <= time.time():
+                return False
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    return True
+
+
 def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
-                      opening_odds=None):
+                      opening_odds=None, *, valid_until_mono=None):
     """Duas pernas virtuais numa única transação SQLite. Nunca faz apostas.
 
     Uma única simulação por par de mercados, mesmo que a direção mude.
     Não marca como REAL_EXECUTED nem como garantia de arbitragem.
     """
+    if not _entry_guard_valid(pair, stage, valid_until_mono):
+        return None
     if stage not in {"PRE_JOGO", "LIVE_NAO_CONFIRMADO"}:
         return None
     if stage == "LIVE_NAO_CONFIRMADO" and not ALLOW_LIVE_UNVERIFIED:
@@ -469,6 +494,13 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
     sx_outcome_one = int(sx_target == 0) if type(sx_target) is int and sx_target in (0, 1) else None
     try:
         conn.execute("BEGIN IMMEDIATE")
+        # A busy SQLite writer can outlive an otherwise fresh quote. Check
+        # after obtaining the lock, before any debit or outbox insert.
+        if not _entry_guard_valid(pair, stage, valid_until_mono):
+            conn.rollback()
+            return None
+        if valid_until_mono is not None:
+            now_epoch = int(time.time())
         if conn.execute("SELECT 1 FROM paper_v12_trades WHERE event_key=?", (eid,)).fetchone():
             conn.rollback()
             return None
@@ -518,6 +550,11 @@ def book_shadow_trade(conn, pair, quote, stage, now_epoch=None,
                 "INSERT INTO paper_v12_open_notifications(trade_id, message) "
                 "VALUES (?,?)", (trade_id, frozen_message),
             )
+        # Formatting/writing the operation can also cross the freshness or
+        # pre-game boundary. Roll back both wallets, the trade and its notice.
+        if not _entry_guard_valid(pair, stage, valid_until_mono):
+            conn.rollback()
+            return None
         conn.commit()
         return trade_id
     except Exception:
@@ -974,8 +1011,11 @@ def flag_exception(conn, trade_id, reason):
         raise ValueError("Operação não aberta ou inexistente")
 
 
-def try_paper_entry(conn, pair, poly_levels, sx_levels, fx, stage, skew):
+def try_paper_entry(conn, pair, poly_levels, sx_levels, fx, stage, skew,
+                    *, valid_until_mono=None):
     """Um candidato de paper: NÃO chama nenhuma API de escrita."""
+    if not _entry_guard_valid(pair, stage, valid_until_mono):
+        return None
     if skew > MAX_SNAPSHOT_GAP_SECONDS:
         return None
     if pair["sx"]["sport"] not in ALLOWED_SPORTS:
@@ -1000,6 +1040,7 @@ def try_paper_entry(conn, pair, poly_levels, sx_levels, fx, stage, skew):
     trade_id = book_shadow_trade(
         conn, pair, quote, stage,
         opening_odds=(1.0 / best_poly, 1.0 / best_sx),
+        valid_until_mono=valid_until_mono,
     )
     return (trade_id, quote) if trade_id is not None else None
 
